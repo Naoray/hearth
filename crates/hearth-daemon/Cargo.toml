@@ -1,0 +1,21 @@
+[package]
+name = "hearth-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hearth daemon — process supervisor with Unix socket API"
+
+[[bin]]
+name = "hearth-daemon"
+path = "src/main.rs"
+
+[dependencies]
+hearth-lib = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+signal-hook = { workspace = true }
+signal-hook-tokio = { workspace = true }

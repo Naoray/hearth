@@ -1,0 +1,18 @@
+[package]
+name = "hearth-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hearth CLI — thin client for the hearth daemon"
+
+[[bin]]
+name = "hearth"
+path = "src/main.rs"
+
+[dependencies]
+hearth-lib = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+opener = "0.7"
