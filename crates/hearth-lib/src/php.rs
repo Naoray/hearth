@@ -129,3 +129,63 @@ impl PhpManager {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_versions_includes_hearth_cache() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let php_dir = tmp.path().join("php");
+
+        // Create version directories with php binary
+        std::fs::create_dir_all(php_dir.join("8.3")).unwrap();
+        std::fs::write(php_dir.join("8.3/php"), "").unwrap();
+        std::fs::create_dir_all(php_dir.join("8.4")).unwrap();
+        std::fs::write(php_dir.join("8.4/php"), "").unwrap();
+
+        let manager = PhpManager::new(tmp.path().to_path_buf());
+        let versions = manager.installed_versions();
+
+        // Should include our mock versions (may also include system Herd/Homebrew)
+        assert!(versions.contains(&"8.3".to_string()));
+        assert!(versions.contains(&"8.4".to_string()));
+    }
+
+    #[test]
+    fn hearth_cache_dir_without_binary_excluded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let php_dir = tmp.path().join("php");
+
+        // Dir without php binary should not appear from Hearth cache
+        std::fs::create_dir_all(php_dir.join("99.9")).unwrap();
+        // No php binary inside
+
+        let manager = PhpManager::new(tmp.path().to_path_buf());
+        let versions = manager.installed_versions();
+
+        assert!(!versions.contains(&"99.9".to_string()));
+    }
+
+    #[test]
+    fn hearth_cache_takes_priority_over_later_sources() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let php_dir = tmp.path().join("php");
+
+        // Hearth cache entry
+        std::fs::create_dir_all(php_dir.join("8.4")).unwrap();
+        std::fs::write(php_dir.join("8.4/php"), "hearth-version").unwrap();
+
+        let manager = PhpManager::new(tmp.path().to_path_buf());
+        let versions_with_paths = manager.installed_versions_with_paths();
+
+        // The 8.4 entry should point to our Hearth cache, not Herd/Homebrew
+        if let Some((_, path)) = versions_with_paths.iter().find(|(v, _)| v == "8.4") {
+            assert!(
+                path.starts_with(tmp.path()),
+                "8.4 should resolve from Hearth cache, got: {path:?}"
+            );
+        }
+    }
+}
