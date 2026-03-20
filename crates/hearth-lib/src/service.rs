@@ -39,6 +39,24 @@ impl std::fmt::Display for ServiceKind {
     }
 }
 
+impl std::str::FromStr for ServiceKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "nginx" => Ok(Self::Nginx),
+            "php-fpm" | "phpfpm" | "php" => Ok(Self::PhpFpm),
+            "dnsmasq" | "dns" => Ok(Self::Dnsmasq),
+            "mysql" => Ok(Self::Mysql),
+            "redis" => Ok(Self::Redis),
+            "postgresql" | "postgres" | "pg" => Ok(Self::Postgresql),
+            "mailpit" | "mail" => Ok(Self::Mailpit),
+            "dump-server" | "dump" => Ok(Self::DumpServer),
+            _ => Err(format!("unknown service: {s}")),
+        }
+    }
+}
+
 /// Current state of a managed service
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServiceState {
@@ -96,6 +114,54 @@ impl CircuitBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_kind_from_str_valid() {
+        assert_eq!("nginx".parse::<ServiceKind>().unwrap(), ServiceKind::Nginx);
+        assert_eq!("php-fpm".parse::<ServiceKind>().unwrap(), ServiceKind::PhpFpm);
+        assert_eq!("php".parse::<ServiceKind>().unwrap(), ServiceKind::PhpFpm);
+        assert_eq!("dnsmasq".parse::<ServiceKind>().unwrap(), ServiceKind::Dnsmasq);
+        assert_eq!("dns".parse::<ServiceKind>().unwrap(), ServiceKind::Dnsmasq);
+        assert_eq!("mysql".parse::<ServiceKind>().unwrap(), ServiceKind::Mysql);
+        assert_eq!("redis".parse::<ServiceKind>().unwrap(), ServiceKind::Redis);
+        assert_eq!("postgresql".parse::<ServiceKind>().unwrap(), ServiceKind::Postgresql);
+        assert_eq!("postgres".parse::<ServiceKind>().unwrap(), ServiceKind::Postgresql);
+        assert_eq!("pg".parse::<ServiceKind>().unwrap(), ServiceKind::Postgresql);
+        assert_eq!("mailpit".parse::<ServiceKind>().unwrap(), ServiceKind::Mailpit);
+        assert_eq!("mail".parse::<ServiceKind>().unwrap(), ServiceKind::Mailpit);
+        assert_eq!("dump-server".parse::<ServiceKind>().unwrap(), ServiceKind::DumpServer);
+        assert_eq!("dump".parse::<ServiceKind>().unwrap(), ServiceKind::DumpServer);
+    }
+
+    #[test]
+    fn service_kind_from_str_case_insensitive() {
+        assert_eq!("NGINX".parse::<ServiceKind>().unwrap(), ServiceKind::Nginx);
+        assert_eq!("Nginx".parse::<ServiceKind>().unwrap(), ServiceKind::Nginx);
+    }
+
+    #[test]
+    fn service_kind_from_str_unknown() {
+        assert!("foobar".parse::<ServiceKind>().is_err());
+    }
+
+    #[test]
+    fn service_kind_display_round_trips() {
+        let kinds = [
+            ServiceKind::Nginx,
+            ServiceKind::PhpFpm,
+            ServiceKind::Dnsmasq,
+            ServiceKind::Mysql,
+            ServiceKind::Redis,
+            ServiceKind::Postgresql,
+            ServiceKind::Mailpit,
+            ServiceKind::DumpServer,
+        ];
+        for kind in kinds {
+            let name = kind.to_string();
+            let parsed: ServiceKind = name.parse().unwrap();
+            assert_eq!(parsed, kind);
+        }
+    }
 
     #[test]
     fn circuit_breaker_trips_after_max_failures() {

@@ -62,24 +62,130 @@ impl PhpManager {
         Ok(())
     }
 
-    /// List installed PHP versions (those with binaries in the config dir).
-    pub fn installed_versions(&self) -> Vec<String> {
-        let php_dir = self.config_dir.join("php");
-        if !php_dir.exists() {
-            return Vec::new();
-        }
+    /// Discover all installed PHP versions across all sources.
+    ///
+    /// Returns `(version, path)` pairs, scanning:
+    /// 1. Hearth cache (`~/.config/hearth/php/*/php`)
+    /// 2. Herd binaries (`~/Library/Application Support/Herd/bin/php*`)
+    /// 3. Homebrew (`/opt/homebrew/opt/php@*/bin/php`)
+    pub fn installed_versions_with_paths(&self) -> Vec<(String, std::path::PathBuf)> {
+        use std::collections::BTreeMap;
+        let mut found: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
 
-        let mut versions = Vec::new();
+        // 1. Hearth cache (highest priority)
+        let php_dir = self.config_dir.join("php");
         if let Ok(entries) = std::fs::read_dir(&php_dir) {
             for entry in entries.flatten() {
-                if entry.path().join("php").exists() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        versions.push(name.to_string());
+                let bin = entry.path().join("php");
+                if bin.exists()
+                    && let Some(name) = entry.file_name().to_str()
+                {
+                    found.insert(name.to_string(), bin);
+                }
+            }
+        }
+
+        // 2. Herd binaries
+        if let Some(herd_bin) = dirs::home_dir()
+            .map(|h| h.join("Library/Application Support/Herd/bin"))
+            && let Ok(entries) = std::fs::read_dir(&herd_bin)
+        {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                // Match "php84", "php83", etc. (not "php84-fpm")
+                if let Some(digits) = name.strip_prefix("php")
+                    && digits.len() == 2
+                    && digits.chars().all(|c| c.is_ascii_digit())
+                    && entry.path().is_file()
+                {
+                    let version = format!("{}.{}", &digits[..1], &digits[1..]);
+                    found.entry(version).or_insert_with(|| entry.path());
+                }
+            }
+        }
+
+        // 3. Homebrew
+        let brew_opt = std::path::Path::new("/opt/homebrew/opt");
+        if let Ok(entries) = std::fs::read_dir(brew_opt) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(version) = name.strip_prefix("php@") {
+                    let bin = entry.path().join("bin/php");
+                    if bin.exists() {
+                        found.entry(version.to_string()).or_insert(bin);
                     }
                 }
             }
         }
-        versions.sort();
-        versions
+
+        found.into_iter().collect()
+    }
+
+    /// List installed PHP versions (version strings only).
+    pub fn installed_versions(&self) -> Vec<String> {
+        self.installed_versions_with_paths()
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_versions_includes_hearth_cache() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let php_dir = tmp.path().join("php");
+
+        // Create version directories with php binary
+        std::fs::create_dir_all(php_dir.join("8.3")).unwrap();
+        std::fs::write(php_dir.join("8.3/php"), "").unwrap();
+        std::fs::create_dir_all(php_dir.join("8.4")).unwrap();
+        std::fs::write(php_dir.join("8.4/php"), "").unwrap();
+
+        let manager = PhpManager::new(tmp.path().to_path_buf());
+        let versions = manager.installed_versions();
+
+        // Should include our mock versions (may also include system Herd/Homebrew)
+        assert!(versions.contains(&"8.3".to_string()));
+        assert!(versions.contains(&"8.4".to_string()));
+    }
+
+    #[test]
+    fn hearth_cache_dir_without_binary_excluded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let php_dir = tmp.path().join("php");
+
+        // Dir without php binary should not appear from Hearth cache
+        std::fs::create_dir_all(php_dir.join("99.9")).unwrap();
+        // No php binary inside
+
+        let manager = PhpManager::new(tmp.path().to_path_buf());
+        let versions = manager.installed_versions();
+
+        assert!(!versions.contains(&"99.9".to_string()));
+    }
+
+    #[test]
+    fn hearth_cache_takes_priority_over_later_sources() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let php_dir = tmp.path().join("php");
+
+        // Hearth cache entry
+        std::fs::create_dir_all(php_dir.join("8.4")).unwrap();
+        std::fs::write(php_dir.join("8.4/php"), "hearth-version").unwrap();
+
+        let manager = PhpManager::new(tmp.path().to_path_buf());
+        let versions_with_paths = manager.installed_versions_with_paths();
+
+        // The 8.4 entry should point to our Hearth cache, not Herd/Homebrew
+        if let Some((_, path)) = versions_with_paths.iter().find(|(v, _)| v == "8.4") {
+            assert!(
+                path.starts_with(tmp.path()),
+                "8.4 should resolve from Hearth cache, got: {path:?}"
+            );
+        }
     }
 }

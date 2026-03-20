@@ -51,3 +51,21 @@ pub fn default_services(config: &HearthConfig) -> Vec<ManagedService> {
         ),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::HearthConfig;
+
+    #[test]
+    fn default_services_contains_expected_kinds() {
+        let config = HearthConfig::default();
+        let services = default_services(&config);
+
+        let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
+        assert!(kinds.contains(&ServiceKind::Nginx));
+        assert!(kinds.contains(&ServiceKind::Dnsmasq));
+        assert!(kinds.contains(&ServiceKind::PhpFpm));
+        assert_eq!(services.len(), 3);
+    }
+}
