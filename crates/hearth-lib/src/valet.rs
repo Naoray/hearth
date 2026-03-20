@@ -89,10 +89,11 @@ impl ValetCli {
         Ok(())
     }
 
-    /// Park the current directory.
-    pub fn park() -> anyhow::Result<String> {
+    /// Park a directory (all subdirectories become sites).
+    pub fn park(path: &str) -> anyhow::Result<String> {
         let output = Command::new("valet")
             .arg("park")
+            .current_dir(path)
             .output()
             .context("Failed to run valet park")?;
 

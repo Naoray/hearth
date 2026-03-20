@@ -78,3 +78,76 @@ pub struct PhpVersionInfo {
 pub fn socket_path() -> std::path::PathBuf {
     crate::config_dir().join("hearth.sock")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_serde_round_trip() {
+        let cases: Vec<DaemonRequest> = vec![
+            DaemonRequest::Start,
+            DaemonRequest::Stop,
+            DaemonRequest::Ping,
+            DaemonRequest::Status,
+            DaemonRequest::Sites,
+            DaemonRequest::PhpList,
+            DaemonRequest::Restart { service: None },
+            DaemonRequest::Restart { service: Some("nginx".to_string()) },
+            DaemonRequest::Link { path: "/tmp/site".to_string(), name: Some("mysite".to_string()) },
+            DaemonRequest::Unlink { name: "mysite".to_string() },
+            DaemonRequest::Park { path: "/home/sites".to_string() },
+            DaemonRequest::PhpSwitch { version: "8.3".to_string() },
+            DaemonRequest::PhpConfig { version: "active".to_string(), key: "memory_limit".to_string(), value: "512M".to_string() },
+            DaemonRequest::Secure { name: "mysite".to_string() },
+            DaemonRequest::Unsecure { name: "mysite".to_string() },
+        ];
+
+        for request in cases {
+            let json = serde_json::to_string(&request).unwrap();
+            let deserialized: DaemonRequest = serde_json::from_str(&json).unwrap();
+            // Verify round-trip produces valid JSON
+            let json2 = serde_json::to_string(&deserialized).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn response_serde_round_trip() {
+        let cases: Vec<DaemonResponse> = vec![
+            DaemonResponse::Pong,
+            DaemonResponse::Ok { message: None },
+            DaemonResponse::Ok { message: Some("done".to_string()) },
+            DaemonResponse::Error { message: "failed".to_string() },
+            DaemonResponse::Status {
+                services: vec![ServiceStatus {
+                    name: "nginx".to_string(),
+                    state: "Running".to_string(),
+                    pid: Some(1234),
+                }],
+            },
+            DaemonResponse::Sites {
+                sites: vec![SiteInfo {
+                    name: "mysite".to_string(),
+                    path: "/tmp/site".to_string(),
+                    secured: true,
+                    php_version: Some("8.4".to_string()),
+                }],
+            },
+            DaemonResponse::PhpVersions {
+                versions: vec![PhpVersionInfo {
+                    version: "8.4".to_string(),
+                    path: "/usr/bin/php".to_string(),
+                    active: true,
+                }],
+            },
+        ];
+
+        for response in cases {
+            let json = serde_json::to_string(&response).unwrap();
+            let deserialized: DaemonResponse = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&deserialized).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+}

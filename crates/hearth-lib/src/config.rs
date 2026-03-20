@@ -64,4 +64,66 @@ impl HearthConfig {
         std::fs::write(&path, content)?;
         Ok(())
     }
+
+    /// Save to a specific path (useful for testing).
+    pub fn save_to(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string_pretty(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
+    /// Load from a specific path (useful for testing).
+    pub fn load_from(path: &std::path::Path) -> anyhow::Result<Self> {
+        if path.exists() {
+            let content = std::fs::read_to_string(path)?;
+            Ok(toml::from_str(&content)?)
+        } else {
+            Ok(Self::default())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_has_sane_values() {
+        let config = HearthConfig::default();
+        assert_eq!(config.tld, "test");
+        assert_eq!(config.default_php, "8.4");
+        assert_eq!(config.dns_port, 5354);
+        assert_eq!(config.dump_port, 9912);
+        assert!(config.parked_paths.is_empty());
+    }
+
+    #[test]
+    fn round_trip_save_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let mut config = HearthConfig::default();
+        config.default_php = "8.3".to_string();
+        config.parked_paths.push(PathBuf::from("/home/sites"));
+
+        config.save_to(&config_path).unwrap();
+        let loaded = HearthConfig::load_from(&config_path).unwrap();
+
+        assert_eq!(loaded.default_php, "8.3");
+        assert_eq!(loaded.parked_paths, vec![PathBuf::from("/home/sites")]);
+        assert_eq!(loaded.tld, "test");
+    }
+
+    #[test]
+    fn load_missing_file_returns_defaults() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("nonexistent.toml");
+
+        let config = HearthConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.tld, "test");
+        assert_eq!(config.default_php, "8.4");
+    }
 }

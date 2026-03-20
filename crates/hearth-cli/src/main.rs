@@ -148,8 +148,9 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Commands::Dump => {
-            // TODO: connect to dump server relay and stream output
-            println!("Dump server relay not yet implemented");
+            let config = hearth_lib::config::HearthConfig::load()?;
+            println!("Connecting to dump server on port {}...", config.dump_port);
+            hearth_lib::dump::stream_dumps(config.dump_port).await?;
             return Ok(());
         }
     };

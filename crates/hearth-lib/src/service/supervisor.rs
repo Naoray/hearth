@@ -115,6 +115,12 @@ pub struct ServiceSupervisor {
     health_interval: Duration,
 }
 
+impl Default for ServiceSupervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServiceSupervisor {
     pub fn new() -> Self {
         Self {
@@ -162,6 +168,16 @@ impl ServiceSupervisor {
             svc.stop()?;
         }
         Ok(())
+    }
+
+    /// Replace a service's command configuration (e.g., for PHP version switch).
+    /// The service must be stopped before reconfiguring.
+    pub fn reconfigure_service(&mut self, kind: ServiceKind, command: String, args: Vec<String>) {
+        if let Some(svc) = self.services.get_mut(&kind) {
+            svc.command = command;
+            svc.args = args;
+            svc.circuit_breaker.reset();
+        }
     }
 
     /// Run one health check pass. Returns services that crashed.

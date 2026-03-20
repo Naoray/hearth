@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dump;
 pub mod php;
 pub mod service;
 pub mod site;

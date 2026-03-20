@@ -19,3 +19,4 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 signal-hook = { workspace = true }
 signal-hook-tokio = { workspace = true }
+dirs = { workspace = true }
