@@ -241,3 +241,106 @@ impl Drop for ServiceSupervisor {
         let _ = self.stop_all();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_supervisor_with_service() -> ServiceSupervisor {
+        let mut sup = ServiceSupervisor::new();
+        // Use `true` as a harmless command that exits immediately
+        let svc = ManagedService::new(ServiceKind::Nginx, "true".to_string(), vec![]);
+        sup.register(svc);
+        sup
+    }
+
+    #[test]
+    fn start_service_errors_on_unregistered() {
+        let mut sup = ServiceSupervisor::new();
+        let result = sup.start_service(ServiceKind::DumpServer);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not registered")
+        );
+    }
+
+    #[test]
+    fn stop_service_errors_on_unregistered() {
+        let mut sup = ServiceSupervisor::new();
+        let result = sup.stop_service(ServiceKind::Redis);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not registered")
+        );
+    }
+
+    #[test]
+    fn start_service_succeeds_for_registered() {
+        let mut sup = make_supervisor_with_service();
+        let result = sup.start_service(ServiceKind::Nginx);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn stop_service_succeeds_for_registered() {
+        let mut sup = make_supervisor_with_service();
+        // Start then stop
+        sup.start_service(ServiceKind::Nginx).unwrap();
+        let result = sup.stop_service(ServiceKind::Nginx);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn reconfigure_service_updates_command() {
+        let mut sup = make_supervisor_with_service();
+        sup.reconfigure_service(
+            ServiceKind::Nginx,
+            "/usr/sbin/nginx-new".to_string(),
+            vec!["-g".to_string(), "daemon off;".to_string()],
+        );
+        let svc = sup.services.get(&ServiceKind::Nginx).unwrap();
+        assert_eq!(svc.command, "/usr/sbin/nginx-new");
+        assert_eq!(svc.args, vec!["-g", "daemon off;"]);
+    }
+
+    #[test]
+    fn reconfigure_unregistered_service_is_noop() {
+        let mut sup = ServiceSupervisor::new();
+        // Should not panic
+        sup.reconfigure_service(
+            ServiceKind::Redis,
+            "redis-server".to_string(),
+            vec![],
+        );
+        assert!(sup.services.is_empty());
+    }
+
+    #[test]
+    fn status_returns_registered_services() {
+        let sup = make_supervisor_with_service();
+        let status = sup.status();
+        assert_eq!(status.len(), 1);
+        assert!(status.contains_key(&ServiceKind::Nginx));
+        assert!(matches!(
+            status[&ServiceKind::Nginx],
+            ServiceState::Stopped
+        ));
+    }
+
+    #[test]
+    fn register_replaces_existing_service() {
+        let mut sup = ServiceSupervisor::new();
+        let svc1 = ManagedService::new(ServiceKind::Nginx, "nginx-old".to_string(), vec![]);
+        sup.register(svc1);
+        let svc2 = ManagedService::new(ServiceKind::Nginx, "nginx-new".to_string(), vec![]);
+        sup.register(svc2);
+        assert_eq!(sup.services.len(), 1);
+        assert_eq!(sup.services[&ServiceKind::Nginx].command, "nginx-new");
+    }
+}
