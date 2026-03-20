@@ -153,21 +153,23 @@ impl ServiceSupervisor {
         Ok(())
     }
 
-    /// Start a specific service.
+    /// Start a specific service. Returns an error if the service is not registered.
     pub fn start_service(&mut self, kind: ServiceKind) -> anyhow::Result<()> {
-        if let Some(svc) = self.services.get_mut(&kind) {
-            svc.circuit_breaker.reset();
-            svc.start()?;
-        }
-        Ok(())
+        let svc = self
+            .services
+            .get_mut(&kind)
+            .ok_or_else(|| anyhow::anyhow!("service {kind} is not registered"))?;
+        svc.circuit_breaker.reset();
+        svc.start()
     }
 
-    /// Stop a specific service.
+    /// Stop a specific service. Returns an error if the service is not registered.
     pub fn stop_service(&mut self, kind: ServiceKind) -> anyhow::Result<()> {
-        if let Some(svc) = self.services.get_mut(&kind) {
-            svc.stop()?;
-        }
-        Ok(())
+        let svc = self
+            .services
+            .get_mut(&kind)
+            .ok_or_else(|| anyhow::anyhow!("service {kind} is not registered"))?;
+        svc.stop()
     }
 
     /// Replace a service's command configuration (e.g., for PHP version switch).

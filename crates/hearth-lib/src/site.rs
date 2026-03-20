@@ -18,11 +18,12 @@ pub struct Site {
 /// - Integration with Anvil worktrees
 pub struct SiteManager {
     valet_home: PathBuf,
+    tld: String,
 }
 
 impl SiteManager {
-    pub fn new(valet_home: PathBuf) -> Self {
-        Self { valet_home }
+    pub fn new(valet_home: PathBuf, tld: String) -> Self {
+        Self { valet_home, tld }
     }
 
     /// List all linked sites by reading Valet's Nginx config directory.
@@ -89,8 +90,9 @@ impl SiteManager {
             return None;
         }
 
-        // Valet names isolation files as "{site}.test" or just "{site}"
-        for suffix in &[".test", ""] {
+        // Valet names isolation files as "{site}.{tld}" or just "{site}"
+        let tld_suffix = format!(".{}", self.tld);
+        for suffix in &[tld_suffix.as_str(), ""] {
             let iso_file = isolate_dir.join(format!("{site_name}{suffix}"));
             if iso_file.exists()
                 && let Ok(content) = std::fs::read_to_string(&iso_file)
@@ -140,7 +142,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         setup_mock_valet(tmp.path());
 
-        let manager = SiteManager::new(tmp.path().to_path_buf());
+        let manager = SiteManager::new(tmp.path().to_path_buf(), "test".to_string());
         let sites = manager.list_sites().unwrap();
 
         assert_eq!(sites.len(), 2); // .hidden should be excluded
@@ -153,7 +155,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         setup_mock_valet(tmp.path());
 
-        let manager = SiteManager::new(tmp.path().to_path_buf());
+        let manager = SiteManager::new(tmp.path().to_path_buf(), "test".to_string());
         let sites = manager.list_sites().unwrap();
 
         let alpha = sites.iter().find(|s| s.name == "alpha").unwrap();
@@ -167,7 +169,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         setup_mock_valet(tmp.path());
 
-        let manager = SiteManager::new(tmp.path().to_path_buf());
+        let manager = SiteManager::new(tmp.path().to_path_buf(), "test".to_string());
         let sites = manager.list_sites().unwrap();
 
         let alpha = sites.iter().find(|s| s.name == "alpha").unwrap();
@@ -182,7 +184,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         setup_mock_valet(tmp.path());
 
-        let manager = SiteManager::new(tmp.path().to_path_buf());
+        let manager = SiteManager::new(tmp.path().to_path_buf(), "test".to_string());
         let sites = manager.list_sites().unwrap();
 
         let alpha = sites.iter().find(|s| s.name == "alpha").unwrap();
@@ -192,7 +194,7 @@ mod tests {
     #[test]
     fn list_sites_empty_when_no_nginx_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let manager = SiteManager::new(tmp.path().to_path_buf());
+        let manager = SiteManager::new(tmp.path().to_path_buf(), "test".to_string());
         let sites = manager.list_sites().unwrap();
         assert!(sites.is_empty());
     }

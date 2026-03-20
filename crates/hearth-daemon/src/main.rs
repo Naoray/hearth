@@ -48,12 +48,13 @@ async fn main() -> anyhow::Result<()> {
     let valet_home = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".config/valet");
+    let tld = config.tld.clone();
 
     let state = Arc::new(Mutex::new(DaemonState {
         supervisor,
-        config,
-        site_manager: SiteManager::new(valet_home),
+        site_manager: SiteManager::new(valet_home, tld),
         php_manager: PhpManager::new(hearth_lib::config_dir()),
+        config,
     }));
 
     // Remove stale socket
@@ -319,8 +320,16 @@ async fn process_request(
             }
 
             // Restart PHP-FPM to pick up INI changes
-            let _ = s.supervisor.stop_service(hearth_lib::service::ServiceKind::PhpFpm);
-            let _ = s.supervisor.start_service(hearth_lib::service::ServiceKind::PhpFpm);
+            if let Err(e) = s.supervisor.stop_service(hearth_lib::service::ServiceKind::PhpFpm) {
+                return DaemonResponse::Error {
+                    message: format!("INI updated but php-fpm stop failed: {e}"),
+                };
+            }
+            if let Err(e) = s.supervisor.start_service(hearth_lib::service::ServiceKind::PhpFpm) {
+                return DaemonResponse::Error {
+                    message: format!("INI updated but php-fpm restart failed: {e}"),
+                };
+            }
 
             DaemonResponse::Ok {
                 message: Some(format!("Set {key}={value} for PHP {resolved_version} and restarted php-fpm")),
