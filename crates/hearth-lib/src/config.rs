@@ -105,8 +105,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
 
-        let mut config = HearthConfig::default();
-        config.default_php = "8.3".to_string();
+        let mut config = HearthConfig {
+            default_php: "8.3".to_string(),
+            ..HearthConfig::default()
+        };
         config.parked_paths.push(PathBuf::from("/home/sites"));
 
         config.save_to(&config_path).unwrap();
