@@ -198,4 +198,50 @@ mod tests {
         let sites = manager.list_sites().unwrap();
         assert!(sites.is_empty());
     }
+
+    #[test]
+    fn isolation_uses_configured_tld() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Setup site
+        let nginx_dir = tmp.path().join("Nginx");
+        std::fs::create_dir_all(&nginx_dir).unwrap();
+        std::fs::write(nginx_dir.join("mysite"), "").unwrap();
+
+        // Isolation file uses custom TLD ".dev"
+        let isolate_dir = tmp.path().join("Isolate");
+        std::fs::create_dir_all(&isolate_dir).unwrap();
+        std::fs::write(isolate_dir.join("mysite.dev"), "8.2\n").unwrap();
+
+        // With matching TLD: should find isolation
+        let manager = SiteManager::new(tmp.path().to_path_buf(), "dev".to_string());
+        let sites = manager.list_sites().unwrap();
+        let site = sites.iter().find(|s| s.name == "mysite").unwrap();
+        assert_eq!(site.php_version.as_deref(), Some("8.2"));
+
+        // With non-matching TLD: should NOT find isolation
+        let manager2 = SiteManager::new(tmp.path().to_path_buf(), "test".to_string());
+        let sites2 = manager2.list_sites().unwrap();
+        let site2 = sites2.iter().find(|s| s.name == "mysite").unwrap();
+        assert_eq!(site2.php_version, None);
+    }
+
+    #[test]
+    fn isolation_fallback_to_bare_filename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let nginx_dir = tmp.path().join("Nginx");
+        std::fs::create_dir_all(&nginx_dir).unwrap();
+        std::fs::write(nginx_dir.join("legacy"), "").unwrap();
+
+        // Isolation file without TLD suffix (bare name)
+        let isolate_dir = tmp.path().join("Isolate");
+        std::fs::create_dir_all(&isolate_dir).unwrap();
+        std::fs::write(isolate_dir.join("legacy"), "7.4\n").unwrap();
+
+        let manager = SiteManager::new(tmp.path().to_path_buf(), "test".to_string());
+        let sites = manager.list_sites().unwrap();
+        let site = sites.iter().find(|s| s.name == "legacy").unwrap();
+        assert_eq!(site.php_version.as_deref(), Some("7.4"));
+    }
 }
