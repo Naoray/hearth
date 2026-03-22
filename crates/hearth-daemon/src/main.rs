@@ -34,13 +34,13 @@ async fn main() -> anyhow::Result<()> {
     let config = HearthConfig::load().context("Failed to load config")?;
 
     // Ensure directories exist
-    let _config_dir = hearth_lib::config_dir();
+    let config_dir = hearth_lib::config_dir();
     std::fs::create_dir_all(hearth_lib::run_dir())?;
     std::fs::create_dir_all(hearth_lib::log_dir())?;
 
     // Build supervisor with default services
     let mut supervisor = ServiceSupervisor::new();
-    for svc in default_services(&config) {
+    for svc in default_services(&config, &config_dir) {
         supervisor.register(svc);
     }
 
