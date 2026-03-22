@@ -116,28 +116,66 @@ async fn handle_dump_subscriber(
     Ok(())
 }
 
-/// Connect to the dump relay and stream output to stdout.
+/// Format a dump line with a dim timestamp prefix.
+pub fn format_dump_line(line: &str) -> String {
+    let now = chrono::Local::now();
+    format!("\x1b[2m[{}]\x1b[0m {}", now.format("%H:%M:%S"), line)
+}
+
+/// Connect to the dump relay and stream output to stdout with timestamps.
 ///
-/// Used by `hearth dump` CLI command. Connects to the relay port
-/// (dump_port + 1) to receive broadcast dump data.
+/// Auto-reconnects if the daemon restarts. Used by `hearth dump` CLI command.
+/// Runs indefinitely — exits on Ctrl+C or irrecoverable error.
 pub async fn stream_dumps(port: u16) -> anyhow::Result<()> {
     let addr = dump_addr(relay_port(port));
-    let stream = TcpStream::connect(addr).await?;
-    let (reader, _) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
 
-    while reader.read_line(&mut line).await? > 0 {
-        print!("{}", line);
-        line.clear();
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                eprintln!("Listening for dumps on port {}...", port);
+                let (reader, _) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+
+                loop {
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            print!("{}", format_dump_line(line.trim_end()));
+                            println!();
+                            line.clear();
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "dump stream read error");
+                            break;
+                        }
+                    }
+                }
+
+                eprintln!("Connection lost, reconnecting...");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to connect to dump relay");
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_dump_line_prepends_timestamp() {
+        let line = "some dump output";
+        let formatted = format_dump_line(line);
+        // Should match pattern: \x1b[2m[HH:MM:SS]\x1b[0m some dump output
+        assert!(formatted.contains(line));
+        assert!(formatted.starts_with("\x1b[2m["));
+        assert!(formatted.contains("]\x1b[0m "));
+    }
 
     #[test]
     fn dump_addr_returns_loopback() {
