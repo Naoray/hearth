@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -36,8 +38,11 @@ enum Commands {
         /// Site name to unlink
         name: String,
     },
-    /// Park the current directory (all subdirectories become sites)
-    Park,
+    /// Park a directory so all subdirectories become sites (defaults to current directory)
+    Park {
+        /// Directory to park (defaults to current directory)
+        path: Option<PathBuf>,
+    },
     /// List all linked sites
     Sites,
 
@@ -69,6 +74,9 @@ enum Commands {
 
     /// Stream dump server output
     Dump,
+
+    /// Start MCP stdio bridge (for IDE integration)
+    Mcp,
 
     /// First-time setup (installs Valet, configures DNS, trusts CA)
     Install,
@@ -117,8 +125,11 @@ async fn main() -> anyhow::Result<()> {
             name,
         },
         Commands::Unlink { name } => DaemonRequest::Unlink { name },
-        Commands::Park => DaemonRequest::Park {
-            path: std::env::current_dir()?.to_string_lossy().to_string(),
+        Commands::Park { path } => DaemonRequest::Park {
+            path: path
+                .unwrap_or(std::env::current_dir()?)
+                .to_string_lossy()
+                .to_string(),
         },
         Commands::Sites => DaemonRequest::Sites,
         Commands::Secure { name } => DaemonRequest::Secure { name },
@@ -152,6 +163,12 @@ async fn main() -> anyhow::Result<()> {
             println!("Connecting to dump server on port {}...", config.dump_port);
             hearth_lib::dump::stream_dumps(config.dump_port).await?;
             return Ok(());
+        }
+        Commands::Mcp => {
+            let config = hearth_lib::config::HearthConfig::load()?;
+            let mcp_url = format!("http://127.0.0.1:{}/mcp", config.mcp_port);
+            eprintln!("Hearth MCP stdio bridge → {}", mcp_url);
+            return run_mcp_bridge(&mcp_url).await;
         }
     };
 
@@ -309,5 +326,44 @@ async fn run_laravel(command: LaravelCommands) -> anyhow::Result<()> {
             println!("Laravel installer updated.");
         }
     }
+    Ok(())
+}
+
+/// Stdio-to-HTTP bridge for MCP clients that only support stdio transport.
+///
+/// Reads JSON-RPC from stdin, POSTs to the daemon's Streamable HTTP endpoint,
+/// writes responses to stdout. Exits on stdin EOF.
+async fn run_mcp_bridge(mcp_url: &str) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin);
+    let mut line = String::new();
+
+    while reader.read_line(&mut line).await? > 0 {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            line.clear();
+            continue;
+        }
+
+        match client
+            .post(mcp_url)
+            .header("Content-Type", "application/json")
+            .body(trimmed.to_string())
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let body = resp.text().await.unwrap_or_default();
+                println!("{}", body);
+            }
+            Err(e) => {
+                eprintln!("MCP bridge error: {}", e);
+            }
+        }
+
+        line.clear();
+    }
+
     Ok(())
 }
