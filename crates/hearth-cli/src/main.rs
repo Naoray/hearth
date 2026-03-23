@@ -202,7 +202,7 @@ async fn send_to_daemon(request: DaemonRequest) -> anyhow::Result<DaemonResponse
 
     let stream = UnixStream::connect(&socket_path)
         .await
-        .context("Daemon not running. Start with: hearth-daemon")?;
+        .context("Daemon not running. Start with: hearth daemon start")?;
 
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
