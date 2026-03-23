@@ -101,5 +101,3 @@ Key ports (all configurable):
 ## Design Docs
 
 - Full design document: `~/.gstack/projects/home/krishankonig-unknown-design-20260319-130500.md`
-- Phase 2 spec: `docs/superpowers/specs/2026-03-22-phase2-mcp-dev-services-design.md`
-- Phase 2 plan: `docs/superpowers/plans/2026-03-22-phase2-mcp-dev-services.md`
