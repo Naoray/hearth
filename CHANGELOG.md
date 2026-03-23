@@ -2,7 +2,7 @@
 
 All notable changes to Hearth will be documented in this file.
 
-## [Unreleased]
+## [0.2.0] - 2026-03-23
 
 ### Added
 - In-process MCP server with 8 tools for IDE integration (status, sites, php list/switch/config, site link/unlink, service restart)
