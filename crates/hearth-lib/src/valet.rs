@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Output};
 
 use anyhow::Context;
 use tracing::{info, warn};
@@ -12,6 +12,22 @@ use tracing::{info, warn};
 /// In a future phase, Valet can be replaced with native Rust implementations
 /// (strangler fig pattern).
 pub struct ValetCli;
+
+/// Filter PHP deprecation warnings from stderr.
+///
+/// Valet's PHP code triggers deprecation warnings on PHP 8.4+ (implicit
+/// nullable parameters). These are harmless noise — strip them so users
+/// only see real errors.
+fn filter_stderr(output: &Output) -> String {
+    let stderr = filter_stderr(&output);
+    stderr
+        .lines()
+        .filter(|line| !line.starts_with("Deprecated:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
 
 impl ValetCli {
     /// Check if Valet is installed and available.
@@ -37,7 +53,7 @@ impl ValetCli {
             .context("Failed to run composer. Is Composer installed?")?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = filter_stderr(&output);
             anyhow::bail!("Valet installation failed: {}", stderr);
         }
 
@@ -48,7 +64,7 @@ impl ValetCli {
             .context("Failed to run valet install")?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = filter_stderr(&output);
             warn!("valet install had issues: {}", stderr);
         }
 
@@ -67,7 +83,7 @@ impl ValetCli {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = filter_stderr(&output);
             anyhow::bail!("valet link failed: {}", stderr);
         }
 
@@ -90,7 +106,7 @@ impl ValetCli {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = filter_stderr(&output);
             anyhow::bail!("valet link failed: {}", stderr);
         }
 
@@ -105,7 +121,7 @@ impl ValetCli {
             .context("Failed to run valet unlink")?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = filter_stderr(&output);
             anyhow::bail!("valet unlink failed: {}", stderr);
         }
 
@@ -122,7 +138,7 @@ impl ValetCli {
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = filter_stderr(&output);
             anyhow::bail!("valet park failed: {}", stderr);
         }
 
@@ -137,7 +153,7 @@ impl ValetCli {
             .context("Failed to run valet secure")?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = filter_stderr(&output);
             anyhow::bail!("valet secure failed: {}", stderr);
         }
 
@@ -152,7 +168,7 @@ impl ValetCli {
             .context("Failed to run valet unsecure")?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = filter_stderr(&output);
             anyhow::bail!("valet unsecure failed: {}", stderr);
         }
 
@@ -168,7 +184,7 @@ impl ValetCli {
             .context("Failed to run valet isolate")?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = filter_stderr(&output);
             anyhow::bail!("valet isolate failed: {}", stderr);
         }
 
