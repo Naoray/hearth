@@ -385,7 +385,12 @@ async fn daemon_stop() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    // Send SIGTERM
+    // Gracefully stop all supervised services before killing the daemon
+    if let Ok(_) = send_to_daemon(DaemonRequest::Stop).await {
+        println!("Services stopped.");
+    }
+
+    // Send SIGTERM to the daemon process
     let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
     nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM)
         .context(format!("Failed to send SIGTERM to daemon (PID {})", pid))?;
