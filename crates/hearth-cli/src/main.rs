@@ -333,6 +333,13 @@ async fn run_laravel(command: LaravelCommands) -> anyhow::Result<()> {
 ///
 /// Reads JSON-RPC from stdin, POSTs to the daemon's Streamable HTTP endpoint,
 /// writes responses to stdout. Exits on stdin EOF.
+///
+/// Known limitation: uses `resp.text().await` which reads the full response body.
+/// MCP Streamable HTTP can use SSE for server-to-client streaming — if the server
+/// ever sends multi-event SSE streams (e.g., streaming tool results), this bridge
+/// will buffer the entire stream before writing to stdout. Current tools all return
+/// single-event responses, so this works fine for now. To support SSE streaming,
+/// read the response as a byte stream and forward line-by-line.
 async fn run_mcp_bridge(mcp_url: &str) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     let stdin = tokio::io::stdin();
