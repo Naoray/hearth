@@ -27,7 +27,7 @@ hearth-daemon (always-on, owns all processes via process groups)
 | `download.rs` | GitHub Release downloader (tar.gz/zip) |
 | `dump.rs` | VarDumper TCP relay with broadcast + timestamped CLI streaming |
 | `php.rs` + `php/resolver.rs` | PHP version management + binary resolution chain |
-| `site.rs` | Lazy site enumeration from Valet's Nginx configs |
+| `site.rs` | Multi-home site enumeration (reads from both Valet and Herd config dirs) |
 | `valet.rs` | Valet CLI wrapper (link, unlink, park, secure, unsecure) |
 | `socket.rs` | `DaemonRequest`/`DaemonResponse` protocol types |
 
@@ -44,6 +44,8 @@ hearth-daemon (always-on, owns all processes via process groups)
 9. DaemonState uses per-field `Arc<Mutex<T>>` (not a single outer mutex) so MCP tools can hold individual references.
 10. Lock ordering convention: `config → php_manager → site_manager → supervisor`. Always acquire in this order to prevent deadlocks.
 11. Mailpit registered conditionally — only if binary is found on disk.
+12. Herd coexistence: when Herd.app is detected via `pgrep`, nginx/php-fpm/dnsmasq are skipped. Hearth only manages its own services.
+13. Site enumeration reads from multiple valet home dirs (`~/.config/valet` + `~/Library/Application Support/Herd/config/valet`), deduplicates by name.
 
 ## Build & Run
 
@@ -63,7 +65,7 @@ brew install hearth
 ## Testing
 
 ```bash
-cargo test                     # Unit tests (all crates, 51 tests)
+cargo test                     # Unit tests (all crates, 55 tests)
 cargo test -p hearth-lib       # Library tests only
 ./scripts/smoke-test.sh        # End-to-end: daemon, CLI, dump server, MCP endpoint
 ```

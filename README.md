@@ -21,15 +21,24 @@ cargo install --path crates/hearth-daemon
 ## Quick start
 
 ```bash
-hearth install          # one-time setup (DNS resolver, CA trust, Valet)
+brew install naoray/tap/hearth
 hearth-daemon &         # start the supervisor daemon
-hearth start            # bring up nginx, php-fpm, dnsmasq
-
-cd ~/Code/my-app
-hearth link             # myapp.test is live
-hearth secure my-app    # now with SSL
-hearth php use 8.3      # switch PHP, FPM restarts automatically
+hearth start            # bring up services (skips nginx/php-fpm/dnsmasq if Herd is running)
+hearth sites            # list all sites (reads from both Valet and Herd)
+hearth mcp              # MCP stdio bridge for IDE integration
 ```
+
+### Works alongside Herd
+
+Hearth detects Herd and skips the services Herd already manages (nginx, php-fpm, dnsmasq). You get Hearth's features without conflicts:
+
+- `hearth mcp` — MCP server without the orphan process leak
+- `hearth dump` — VarDumper streaming with timestamps
+- `hearth sites` — list all sites from both Valet and Herd
+- `hearth php list / config` — PHP version management
+- `hearth mail` — Mailpit UI
+
+When you're ready to replace Herd entirely, Hearth can manage all services directly (Phase 3+).
 
 ## What it does
 
@@ -53,9 +62,9 @@ Hearth is a thin CLI talking to an always-on daemon over a Unix socket. The daem
 
 ```
 hearth-daemon
-  ├── nginx          (process group)
-  ├── php-fpm        (process group)
-  ├── dnsmasq        (process group, port 5354)
+  ├── nginx          (process group, skipped if Herd running)
+  ├── php-fpm        (process group, skipped if Herd running)
+  ├── dnsmasq        (process group, skipped if Herd running)
   ├── mailpit        (process group, if installed)
   ├── dump server    (tokio task)
   └── MCP server     (tokio task, port 9900)
