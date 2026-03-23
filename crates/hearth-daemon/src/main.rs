@@ -420,7 +420,18 @@ async fn process_request(
                 }
             };
 
-            // Lock supervisor (last in ordering — no other locks needed)
+            // Lock ordering: config first, then supervisor
+            {
+                let mut cfg = state.config.lock().await;
+                cfg.default_php = version.clone();
+                if let Err(e) = cfg.save() {
+                    return DaemonResponse::Error {
+                        message: format!("failed to save config: {e}"),
+                    };
+                }
+            }
+            // Drop config lock before acquiring supervisor
+
             let mut sup = state.supervisor.lock().await;
 
             // Stop current PHP-FPM
@@ -443,18 +454,6 @@ async fn process_request(
             if let Err(e) = sup.start_service(hearth_lib::service::ServiceKind::PhpFpm) {
                 return DaemonResponse::Error {
                     message: format!("failed to start php-fpm {version}: {e}"),
-                };
-            }
-
-            // Drop supervisor lock before acquiring config lock
-            drop(sup);
-
-            // Update config
-            let mut cfg = state.config.lock().await;
-            cfg.default_php = version.clone();
-            if let Err(e) = cfg.save() {
-                return DaemonResponse::Error {
-                    message: format!("switched but failed to save config: {e}"),
                 };
             }
 

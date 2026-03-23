@@ -178,54 +178,35 @@ impl HearthMcpServer {
         Parameters(params): Parameters<PhpSwitchParams>,
     ) -> Result<String, String> {
         let version = &params.version;
+        let config_dir = crate::config_dir();
 
-        // Validate the requested version exists
-        let fpm_path = {
-            let pm = self.php_manager.lock().await;
-            let versions = pm.installed_versions_with_paths();
-            let found = versions.iter().find(|(v, _)| v == version);
-            match found {
-                Some((_, path)) => {
-                    // Derive the fpm binary path from the php binary path
-                    // e.g., .../php -> .../php-fpm  or .../bin/php -> .../sbin/php-fpm
-                    let parent = path.parent().unwrap_or(path);
-                    let fpm = parent.join("php-fpm");
-                    if fpm.exists() {
-                        fpm.to_string_lossy().to_string()
-                    } else {
-                        // Fall back to a generic php-fpm command
-                        "php-fpm".to_string()
-                    }
-                }
-                None => {
-                    let available: Vec<String> =
-                        versions.iter().map(|(v, _)| v.clone()).collect();
-                    return Err(format!(
-                        "PHP {version} is not installed. Available versions: {}",
-                        if available.is_empty() {
-                            "none".to_string()
-                        } else {
-                            available.join(", ")
-                        }
-                    ));
-                }
-            }
-        };
-        // Drop php_manager lock before acquiring supervisor lock
+        // Resolve the php-fpm binary using the same resolver as the daemon
+        let fpm_binary =
+            crate::php::resolver::resolve_phpfpm_binary(version, &config_dir).ok_or_else(|| {
+                format!("PHP {version} php-fpm binary not found")
+            })?;
 
-        // Update config
+        // Lock ordering: config first, then supervisor
         {
             let mut cfg = self.config.lock().await;
             cfg.default_php = version.clone();
+            cfg.save()
+                .map_err(|e| format!("Failed to save config: {e}"))?;
         }
 
-        // Stop php-fpm, reconfigure, restart
+        // Stop php-fpm, reconfigure with full args, restart
         let mut sup = self.supervisor.lock().await;
         let _ = sup.stop_service(ServiceKind::PhpFpm);
         sup.reconfigure_service(
             ServiceKind::PhpFpm,
-            fpm_path,
-            vec!["--nodaemonize".to_string()],
+            fpm_binary.to_string_lossy().to_string(),
+            vec![
+                "--nodaemonize".to_string(),
+                format!(
+                    "--fpm-config={}",
+                    config_dir.join("fpm/php-fpm.conf").display()
+                ),
+            ],
         );
         sup.start_service(ServiceKind::PhpFpm)
             .map_err(|e| format!("Failed to start php-fpm {version}: {e}"))?;
@@ -239,13 +220,13 @@ impl HearthMcpServer {
         &self,
         Parameters(params): Parameters<SiteLinkParams>,
     ) -> Result<String, String> {
-        // Run valet link in a blocking task since it calls an external process
+        // Run valet link in a blocking task since it calls an external process.
+        // Uses link_in() with Command::current_dir() instead of set_current_dir()
+        // to avoid mutating global process state (safe for concurrent MCP requests).
         let name = params.name.clone();
         let path = params.path.clone();
         let result = tokio::task::spawn_blocking(move || {
-            // Set current dir before calling valet link
-            let _guard = std::env::set_current_dir(&path);
-            ValetCli::link(name.as_deref())
+            ValetCli::link_in(&path, name.as_deref())
         })
         .await
         .map_err(|e| format!("Task join error: {e}"))?;
@@ -484,8 +465,8 @@ mod tests {
 
         let err = result.expect_err("should return an error for nonexistent PHP version");
         assert!(
-            err.contains("not installed"),
-            "should mention not installed, got: {err}"
+            err.contains("not found"),
+            "should mention not found, got: {err}"
         );
     }
 
