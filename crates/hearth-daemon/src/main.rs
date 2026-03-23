@@ -5,21 +5,32 @@ use anyhow::Context;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use hearth_lib::config::HearthConfig;
+use hearth_lib::mcp::HearthMcpServer;
 use hearth_lib::php::PhpManager;
 use hearth_lib::service::manager::default_services;
 use hearth_lib::service::supervisor::ServiceSupervisor;
 use hearth_lib::site::SiteManager;
 use hearth_lib::socket::{DaemonRequest, DaemonResponse};
 
+use rmcp::transport::StreamableHttpServerConfig;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::StreamableHttpService;
+
 /// Shared state accessible by all daemon request handlers.
+///
+/// Each field is individually wrapped in `Arc<Mutex<T>>` so that the MCP
+/// server can hold cloned references without locking the entire state.
+///
+/// Lock ordering convention (when multiple locks are needed):
+///   `config` -> `php_manager` -> `site_manager` -> `supervisor`
 struct DaemonState {
-    supervisor: ServiceSupervisor,
-    config: HearthConfig,
-    site_manager: SiteManager,
-    php_manager: PhpManager,
+    supervisor: Arc<Mutex<ServiceSupervisor>>,
+    config: Arc<Mutex<HearthConfig>>,
+    site_manager: Arc<Mutex<SiteManager>>,
+    php_manager: Arc<Mutex<PhpManager>>,
 }
 
 #[tokio::main]
@@ -34,13 +45,13 @@ async fn main() -> anyhow::Result<()> {
     let config = HearthConfig::load().context("Failed to load config")?;
 
     // Ensure directories exist
-    let _config_dir = hearth_lib::config_dir();
+    let config_dir = hearth_lib::config_dir();
     std::fs::create_dir_all(hearth_lib::run_dir())?;
     std::fs::create_dir_all(hearth_lib::log_dir())?;
 
     // Build supervisor with default services
     let mut supervisor = ServiceSupervisor::new();
-    for svc in default_services(&config) {
+    for svc in default_services(&config, &config_dir) {
         supervisor.register(svc);
     }
 
@@ -50,12 +61,16 @@ async fn main() -> anyhow::Result<()> {
         .join(".config/valet");
     let tld = config.tld.clone();
 
-    let state = Arc::new(Mutex::new(DaemonState {
-        supervisor,
-        site_manager: SiteManager::new(valet_home, tld),
-        php_manager: PhpManager::new(hearth_lib::config_dir()),
-        config,
-    }));
+    // Capture ports before wrapping config in Arc<Mutex<>>
+    let dump_port = config.dump_port;
+    let mcp_port = config.mcp_port;
+
+    let state = Arc::new(DaemonState {
+        supervisor: Arc::new(Mutex::new(supervisor)),
+        config: Arc::new(Mutex::new(config)),
+        site_manager: Arc::new(Mutex::new(SiteManager::new(valet_home, tld))),
+        php_manager: Arc::new(Mutex::new(PhpManager::new(hearth_lib::config_dir()))),
+    });
 
     // Remove stale socket
     let socket_path = hearth_lib::socket::socket_path();
@@ -76,7 +91,6 @@ async fn main() -> anyhow::Result<()> {
     std::fs::write(&pid_path, std::process::id().to_string())?;
 
     // Spawn dump server
-    let dump_port = state.lock().await.config.dump_port;
     tokio::spawn(async move {
         if let Err(e) = hearth_lib::dump::run_dump_server(dump_port).await {
             error!(error = %e, "dump server failed");
@@ -84,12 +98,59 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Spawn health check loop
-    let health_state = state.clone();
+    let health_supervisor = Arc::clone(&state.supervisor);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let mut s = health_state.lock().await;
-            s.supervisor.health_check();
+            let mut sup = health_supervisor.lock().await;
+            sup.health_check();
+        }
+    });
+
+    // Spawn MCP Streamable HTTP server
+    let mcp_supervisor = Arc::clone(&state.supervisor);
+    let mcp_site_manager = Arc::clone(&state.site_manager);
+    let mcp_php_manager = Arc::clone(&state.php_manager);
+    let mcp_config = Arc::clone(&state.config);
+    tokio::spawn(async move {
+        let mcp_server_config = StreamableHttpServerConfig::default();
+
+        let sup = mcp_supervisor;
+        let sm = mcp_site_manager;
+        let pm = mcp_php_manager;
+        let cfg = mcp_config;
+
+        let service: StreamableHttpService<HearthMcpServer, LocalSessionManager> =
+            StreamableHttpService::new(
+                move || {
+                    Ok(HearthMcpServer::new(
+                        Arc::clone(&sup),
+                        Arc::clone(&sm),
+                        Arc::clone(&pm),
+                        Arc::clone(&cfg),
+                    ))
+                },
+                Arc::new(LocalSessionManager::default()),
+                mcp_server_config,
+            );
+
+        let router = axum::Router::new().nest_service("/mcp", service);
+
+        let bind_addr = format!("127.0.0.1:{mcp_port}");
+        match tokio::net::TcpListener::bind(&bind_addr).await {
+            Ok(tcp_listener) => {
+                info!(port = mcp_port, "MCP Streamable HTTP server listening");
+                if let Err(e) = axum::serve(tcp_listener, router).await {
+                    error!(error = %e, "MCP server stopped with error");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    port = mcp_port,
+                    error = %e,
+                    "failed to bind MCP server — MCP tools unavailable"
+                );
+            }
         }
     });
 
@@ -97,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                let st = state.clone();
+                let st = Arc::clone(&state);
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(stream, st).await {
                         error!(error = %e, "client handler error");
@@ -113,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn handle_client(
     stream: tokio::net::UnixStream,
-    state: Arc<Mutex<DaemonState>>,
+    state: Arc<DaemonState>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -136,14 +197,14 @@ async fn handle_client(
 
 async fn process_request(
     request: DaemonRequest,
-    state: &Arc<Mutex<DaemonState>>,
+    state: &Arc<DaemonState>,
 ) -> DaemonResponse {
     match request {
         DaemonRequest::Ping => DaemonResponse::Pong,
 
         DaemonRequest::Start => {
-            let mut s = state.lock().await;
-            match s.supervisor.start_all() {
+            let mut sup = state.supervisor.lock().await;
+            match sup.start_all() {
                 Ok(()) => DaemonResponse::Ok {
                     message: Some("All services started".to_string()),
                 },
@@ -154,8 +215,8 @@ async fn process_request(
         }
 
         DaemonRequest::Stop => {
-            let mut s = state.lock().await;
-            match s.supervisor.stop_all() {
+            let mut sup = state.supervisor.lock().await;
+            match sup.stop_all() {
                 Ok(()) => DaemonResponse::Ok {
                     message: Some("All services stopped".to_string()),
                 },
@@ -166,9 +227,8 @@ async fn process_request(
         }
 
         DaemonRequest::Status => {
-            let s = state.lock().await;
-            let services = s
-                .supervisor
+            let sup = state.supervisor.lock().await;
+            let services = sup
                 .status()
                 .iter()
                 .map(|(kind, svc_state)| {
@@ -215,8 +275,8 @@ async fn process_request(
         }
 
         DaemonRequest::Sites => {
-            let s = state.lock().await;
-            match s.site_manager.list_sites() {
+            let sm = state.site_manager.lock().await;
+            match sm.list_sites() {
                 Ok(sites) => {
                     let site_infos = sites
                         .into_iter()
@@ -236,11 +296,12 @@ async fn process_request(
         DaemonRequest::Park { path } => {
             match hearth_lib::valet::ValetCli::park(&path) {
                 Ok(msg) => {
-                    let mut s = state.lock().await;
+                    // Lock config (first in ordering)
+                    let mut cfg = state.config.lock().await;
                     let park_path = PathBuf::from(&path);
-                    if !s.config.parked_paths.contains(&park_path) {
-                        s.config.parked_paths.push(park_path);
-                        if let Err(e) = s.config.save() {
+                    if !cfg.parked_paths.contains(&park_path) {
+                        cfg.parked_paths.push(park_path);
+                        if let Err(e) = cfg.save() {
                             return DaemonResponse::Error {
                                 message: format!("parked but failed to save config: {e}"),
                             };
@@ -253,13 +314,14 @@ async fn process_request(
         }
 
         DaemonRequest::PhpList => {
-            let s = state.lock().await;
-            let versions = s
-                .php_manager
+            // Lock config first, then php_manager (ordering: config -> php_manager)
+            let cfg = state.config.lock().await;
+            let pm = state.php_manager.lock().await;
+            let versions = pm
                 .installed_versions_with_paths()
                 .into_iter()
                 .map(|(version, path)| hearth_lib::socket::PhpVersionInfo {
-                    active: version == s.config.default_php,
+                    active: version == cfg.default_php,
                     version,
                     path: path.to_string_lossy().to_string(),
                 })
@@ -268,15 +330,15 @@ async fn process_request(
         }
 
         DaemonRequest::Restart { service } => {
-            let mut s = state.lock().await;
+            let mut sup = state.supervisor.lock().await;
             match service {
                 None => {
-                    if let Err(e) = s.supervisor.stop_all() {
+                    if let Err(e) = sup.stop_all() {
                         return DaemonResponse::Error {
                             message: format!("stop failed: {e}"),
                         };
                     }
-                    match s.supervisor.start_all() {
+                    match sup.start_all() {
                         Ok(()) => DaemonResponse::Ok {
                             message: Some("All services restarted".to_string()),
                         },
@@ -290,12 +352,12 @@ async fn process_request(
                         Ok(k) => k,
                         Err(e) => return DaemonResponse::Error { message: e },
                     };
-                    if let Err(e) = s.supervisor.stop_service(kind) {
+                    if let Err(e) = sup.stop_service(kind) {
                         return DaemonResponse::Error {
                             message: format!("stop {name} failed: {e}"),
                         };
                     }
-                    match s.supervisor.start_service(kind) {
+                    match sup.start_service(kind) {
                         Ok(()) => DaemonResponse::Ok {
                             message: Some(format!("Restarted {name}")),
                         },
@@ -308,24 +370,33 @@ async fn process_request(
         }
 
         DaemonRequest::PhpConfig { version, key, value } => {
-            let mut s = state.lock().await;
-            let resolved_version = if version == "active" {
-                s.config.default_php.clone()
-            } else {
-                version
+            // Lock ordering: config -> php_manager -> supervisor
+            let resolved_version = {
+                let cfg = state.config.lock().await;
+                if version == "active" {
+                    cfg.default_php.clone()
+                } else {
+                    version
+                }
             };
+            // Drop config lock before acquiring php_manager
 
-            if let Err(e) = s.php_manager.set_ini_value(&resolved_version, &key, &value) {
-                return DaemonResponse::Error { message: e.to_string() };
+            {
+                let pm = state.php_manager.lock().await;
+                if let Err(e) = pm.set_ini_value(&resolved_version, &key, &value) {
+                    return DaemonResponse::Error { message: e.to_string() };
+                }
             }
+            // Drop php_manager lock before acquiring supervisor
 
+            let mut sup = state.supervisor.lock().await;
             // Restart PHP-FPM to pick up INI changes
-            if let Err(e) = s.supervisor.stop_service(hearth_lib::service::ServiceKind::PhpFpm) {
+            if let Err(e) = sup.stop_service(hearth_lib::service::ServiceKind::PhpFpm) {
                 return DaemonResponse::Error {
                     message: format!("INI updated but php-fpm stop failed: {e}"),
                 };
             }
-            if let Err(e) = s.supervisor.start_service(hearth_lib::service::ServiceKind::PhpFpm) {
+            if let Err(e) = sup.start_service(hearth_lib::service::ServiceKind::PhpFpm) {
                 return DaemonResponse::Error {
                     message: format!("INI updated but php-fpm restart failed: {e}"),
                 };
@@ -337,10 +408,9 @@ async fn process_request(
         }
 
         DaemonRequest::PhpSwitch { version } => {
-            let mut s = state.lock().await;
             let config_dir = hearth_lib::config_dir();
 
-            // Resolve the new PHP-FPM binary
+            // Resolve the new PHP-FPM binary (no lock needed)
             let fpm_binary = match hearth_lib::php::resolver::resolve_phpfpm_binary(&version, &config_dir) {
                 Some(path) => path,
                 None => {
@@ -350,11 +420,25 @@ async fn process_request(
                 }
             };
 
+            // Lock ordering: config first, then supervisor
+            {
+                let mut cfg = state.config.lock().await;
+                cfg.default_php = version.clone();
+                if let Err(e) = cfg.save() {
+                    return DaemonResponse::Error {
+                        message: format!("failed to save config: {e}"),
+                    };
+                }
+            }
+            // Drop config lock before acquiring supervisor
+
+            let mut sup = state.supervisor.lock().await;
+
             // Stop current PHP-FPM
-            let _ = s.supervisor.stop_service(hearth_lib::service::ServiceKind::PhpFpm);
+            let _ = sup.stop_service(hearth_lib::service::ServiceKind::PhpFpm);
 
             // Reconfigure with new binary
-            s.supervisor.reconfigure_service(
+            sup.reconfigure_service(
                 hearth_lib::service::ServiceKind::PhpFpm,
                 fpm_binary.to_string_lossy().to_string(),
                 vec![
@@ -367,17 +451,9 @@ async fn process_request(
             );
 
             // Start new PHP-FPM
-            if let Err(e) = s.supervisor.start_service(hearth_lib::service::ServiceKind::PhpFpm) {
+            if let Err(e) = sup.start_service(hearth_lib::service::ServiceKind::PhpFpm) {
                 return DaemonResponse::Error {
                     message: format!("failed to start php-fpm {version}: {e}"),
-                };
-            }
-
-            // Update config
-            s.config.default_php = version.clone();
-            if let Err(e) = s.config.save() {
-                return DaemonResponse::Error {
-                    message: format!("switched but failed to save config: {e}"),
                 };
             }
 

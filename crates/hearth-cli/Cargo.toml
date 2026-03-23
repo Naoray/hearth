@@ -16,3 +16,5 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 opener = "0.7"
+chrono = { workspace = true }
+reqwest = { workspace = true }

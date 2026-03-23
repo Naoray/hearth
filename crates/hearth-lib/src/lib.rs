@@ -1,5 +1,8 @@
 pub mod config;
+pub mod download;
 pub mod dump;
+pub mod mailpit;
+pub mod mcp;
 pub mod php;
 pub mod service;
 pub mod site;

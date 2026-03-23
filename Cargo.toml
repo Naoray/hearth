@@ -49,5 +49,13 @@ configparser = "3"
 # Filesystem
 dirs = "6"
 
-# MCP (future Phase 2)
-# rmcp = "0.16"
+# MCP (Phase 2)
+rmcp = { version = "1", features = ["server", "transport-streamable-http-server"] }
+schemars = "1"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Archive extraction (for GitHub Release downloads)
+flate2 = "1"
+tar = "0.4"
+zip = "2"

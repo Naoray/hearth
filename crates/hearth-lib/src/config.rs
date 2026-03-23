@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 /// Global Hearth configuration, stored at ~/.config/hearth/config.toml
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HearthConfig {
     /// Top-level domain for sites (default: "test")
     pub tld: String,
@@ -25,6 +26,9 @@ pub struct HearthConfig {
     /// Ploi API token (optional)
     pub ploi_api_token: Option<String>,
 
+    /// Port for the MCP (Model Context Protocol) server
+    pub mcp_port: u16,
+
     /// Paths to parked directories
     pub parked_paths: Vec<PathBuf>,
 }
@@ -39,6 +43,7 @@ impl Default for HearthConfig {
             mail_smtp_port: 1025,
             mail_ui_port: 8025,
             ploi_api_token: None,
+            mcp_port: 9900,
             parked_paths: Vec::new(),
         }
     }
@@ -127,5 +132,31 @@ mod tests {
         let config = HearthConfig::load_from(&config_path).unwrap();
         assert_eq!(config.tld, "test");
         assert_eq!(config.default_php, "8.4");
+    }
+
+    #[test]
+    fn default_config_has_mcp_port() {
+        let config = HearthConfig::default();
+        assert_eq!(config.mcp_port, 9900);
+    }
+
+    #[test]
+    fn load_legacy_config_without_mcp_port() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        // Write a Phase 1 config file that lacks mcp_port
+        std::fs::write(&config_path, r#"
+tld = "test"
+default_php = "8.4"
+dns_port = 5354
+dump_port = 9912
+mail_smtp_port = 1025
+mail_ui_port = 8025
+parked_paths = []
+"#).unwrap();
+
+        let config = HearthConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.mcp_port, 9900); // should get default
+        assert_eq!(config.tld, "test");    // existing fields preserved
     }
 }

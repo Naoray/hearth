@@ -74,6 +74,29 @@ impl ValetCli {
         Ok(stdout.trim().to_string())
     }
 
+    /// Link a directory as a Valet site, running the command in the given directory.
+    ///
+    /// Unlike `link()`, this does not mutate the process's current directory.
+    /// Safe for concurrent use from the MCP server.
+    pub fn link_in(working_dir: &str, name: Option<&str>) -> anyhow::Result<String> {
+        let mut cmd = Command::new("valet");
+        cmd.arg("link");
+        cmd.current_dir(working_dir);
+        if let Some(n) = name {
+            cmd.arg(n);
+        }
+
+        let output = cmd.output().context("Failed to run valet link")?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("valet link failed: {}", stderr);
+        }
+
+        Ok(stdout.trim().to_string())
+    }
+
     /// Unlink a site.
     pub fn unlink(name: &str) -> anyhow::Result<()> {
         let output = Command::new("valet")
