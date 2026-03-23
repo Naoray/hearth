@@ -2,6 +2,33 @@
 
 All notable changes to Hearth will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- In-process MCP server with 8 tools for IDE integration (status, sites, php list/switch/config, site link/unlink, service restart)
+- Streamable HTTP transport on port 9900 — IDEs connect via URL, zero spawned processes, zero orphan risk
+- `hearth mcp` stdio bridge for IDEs that only support stdio transport
+- Mailpit mail catcher as a managed service with binary resolution chain (Hearth cache → system PATH)
+- Conditional Mailpit registration — only starts if binary is found
+- GitHub Release downloader utility (`download_github_release`) with tar.gz/zip support
+- Timestamped output for `hearth dump` with auto-reconnect on daemon restart
+- `mcp_port` config field (default 9900)
+- `#[serde(default)]` on `HearthConfig` for forward-compatible config migration
+- `ValetCli::link_in()` for concurrent-safe site linking (uses `Command::current_dir()`)
+- GitHub Actions release workflow for macOS binary artifacts (aarch64 + x86_64)
+- Homebrew formula in `naoray/tap` (source build via `brew install naoray/tap/hearth`)
+- 16 new unit tests (total: 51)
+
+### Changed
+- `DaemonState` refactored from single `Arc<Mutex<DaemonState>>` to per-field `Arc<Mutex<T>>` with documented lock ordering convention (`config → php_manager → site_manager → supervisor`)
+- `default_services()` now accepts `config_dir` parameter for testability and Mailpit resolution
+
+### Fixed
+- Daemon `PhpSwitch` handler lock ordering corrected to `config → supervisor` (was `supervisor → config`, potential deadlock with concurrent MCP calls)
+- MCP `hearth_php_switch` now uses `resolve_phpfpm_binary()` and includes `--fpm-config` arg (was silently using wrong php-fpm config)
+- MCP `hearth_php_switch` now persists config to disk via `config.save()`
+- MCP `hearth_site_link` uses `Command::current_dir()` instead of `std::env::set_current_dir()` (was a process-global race condition)
+
 ## [0.1.1.0] - 2026-03-20
 
 ### Added
