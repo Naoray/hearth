@@ -135,11 +135,19 @@ impl ServiceSupervisor {
     }
 
     /// Start all registered services.
+    ///
+    /// Services that fail to start (e.g., binary not found) are logged and
+    /// skipped — one broken service doesn't prevent the others from running.
     pub fn start_all(&mut self) -> anyhow::Result<()> {
         let kinds: Vec<ServiceKind> = self.services.keys().copied().collect();
         for kind in kinds {
             if let Some(svc) = self.services.get_mut(&kind) {
-                svc.start()?;
+                if let Err(e) = svc.start() {
+                    warn!(service = %kind, error = %e, "failed to start service, skipping");
+                    svc.state = ServiceState::Failed {
+                        reason: e.to_string(),
+                    };
+                }
             }
         }
         Ok(())

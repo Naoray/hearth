@@ -26,38 +26,68 @@ impl SiteManager {
         Self { valet_home, tld }
     }
 
-    /// List all linked sites by reading Valet's Nginx config directory.
-    /// Uses lazy enumeration — only reads directory entries, not file contents.
+    /// List all linked sites by reading Valet's Sites directory (symlinks).
+    ///
+    /// Primary source: `Sites/` — contains symlinks created by `valet link`.
+    /// Fallback: `Nginx/` — contains Nginx config files (used by Herd).
+    /// Sites from both sources are merged, with `Sites/` taking priority.
     pub fn list_sites(&self) -> anyhow::Result<Vec<Site>> {
-        let nginx_dir = self.valet_home.join("Nginx");
-        if !nginx_dir.exists() {
-            return Ok(Vec::new());
+        let mut seen = std::collections::HashSet::new();
+        let mut sites = Vec::new();
+
+        // Primary: read Sites/ directory (symlinks from `valet link`)
+        let sites_dir = self.valet_home.join("Sites");
+        if sites_dir.exists() {
+            for entry in std::fs::read_dir(&sites_dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+
+                let path = if entry.path().is_symlink() {
+                    std::fs::read_link(entry.path()).unwrap_or_default()
+                } else {
+                    entry.path()
+                };
+
+                let cert_path = self
+                    .valet_home
+                    .join("Certificates")
+                    .join(format!("{}.crt", name));
+
+                sites.push(Site {
+                    name: name.clone(),
+                    path,
+                    secured: cert_path.exists(),
+                    php_version: self.resolve_isolated_php(&name),
+                });
+                seen.insert(name);
+            }
         }
 
-        let mut sites = Vec::new();
-        for entry in std::fs::read_dir(&nginx_dir)? {
-            let entry = entry?;
-            let name = entry
-                .file_name()
-                .to_string_lossy()
-                .to_string();
+        // Fallback: read Nginx/ directory (config files, used by Herd)
+        let nginx_dir = self.valet_home.join("Nginx");
+        if nginx_dir.exists() {
+            for entry in std::fs::read_dir(&nginx_dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') || seen.contains(&name) {
+                    continue;
+                }
 
-            // Skip hidden files
-            if name.starts_with('.') {
-                continue;
+                let cert_path = self
+                    .valet_home
+                    .join("Certificates")
+                    .join(format!("{}.crt", name));
+
+                sites.push(Site {
+                    name: name.clone(),
+                    path: self.resolve_site_path(&name).unwrap_or_default(),
+                    secured: cert_path.exists(),
+                    php_version: self.resolve_isolated_php(&name),
+                });
             }
-
-            let cert_path = self
-                .valet_home
-                .join("Certificates")
-                .join(format!("{}.crt", name));
-
-            sites.push(Site {
-                name: name.clone(),
-                path: self.resolve_site_path(&name).unwrap_or_default(),
-                secured: cert_path.exists(),
-                php_version: self.resolve_isolated_php(&name),
-            });
         }
 
         sites.sort_by(|a, b| a.name.cmp(&b.name));
@@ -113,18 +143,16 @@ mod tests {
     use super::*;
 
     fn setup_mock_valet(tmp: &std::path::Path) {
-        // Create Nginx config directory with site entries
-        let nginx_dir = tmp.join("Nginx");
-        std::fs::create_dir_all(&nginx_dir).unwrap();
-        std::fs::write(nginx_dir.join("alpha"), "").unwrap();
-        std::fs::write(nginx_dir.join("beta"), "").unwrap();
-        std::fs::write(nginx_dir.join(".hidden"), "").unwrap();
-
-        // Create a symlink for alpha site path
+        // Create Sites directory with symlinks (primary source)
         let sites_dir = tmp.join("Sites");
         std::fs::create_dir_all(&sites_dir).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("/tmp/alpha-project", sites_dir.join("alpha")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/tmp/beta-project", sites_dir.join("beta")).unwrap();
+
+        // Hidden entry in Sites should be skipped
+        std::fs::write(sites_dir.join(".hidden"), "").unwrap();
 
         // Create certificate for beta (secured)
         let certs_dir = tmp.join("Certificates");
@@ -192,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn list_sites_empty_when_no_nginx_dir() {
+    fn list_sites_empty_when_no_dirs() {
         let tmp = tempfile::TempDir::new().unwrap();
         let manager = SiteManager::new(tmp.path().to_path_buf(), "test".to_string());
         let sites = manager.list_sites().unwrap();
@@ -200,13 +228,49 @@ mod tests {
     }
 
     #[test]
-    fn isolation_uses_configured_tld() {
+    fn list_sites_falls_back_to_nginx_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
 
-        // Setup site
+        // No Sites/ dir, only Nginx/ (Herd-managed)
+        let nginx_dir = tmp.path().join("Nginx");
+        std::fs::create_dir_all(&nginx_dir).unwrap();
+        std::fs::write(nginx_dir.join("herd-site"), "").unwrap();
+
+        let manager = SiteManager::new(tmp.path().to_path_buf(), "test".to_string());
+        let sites = manager.list_sites().unwrap();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].name, "herd-site");
+    }
+
+    #[test]
+    fn list_sites_deduplicates_across_sources() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Same site in both Sites/ and Nginx/
+        let sites_dir = tmp.path().join("Sites");
+        std::fs::create_dir_all(&sites_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/tmp/mysite", sites_dir.join("mysite")).unwrap();
+
         let nginx_dir = tmp.path().join("Nginx");
         std::fs::create_dir_all(&nginx_dir).unwrap();
         std::fs::write(nginx_dir.join("mysite"), "").unwrap();
+
+        let manager = SiteManager::new(tmp.path().to_path_buf(), "test".to_string());
+        let sites = manager.list_sites().unwrap();
+        assert_eq!(sites.len(), 1); // no duplicate
+        assert_eq!(sites[0].name, "mysite");
+    }
+
+    #[test]
+    fn isolation_uses_configured_tld() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Setup site via Sites/ dir
+        let sites_dir = tmp.path().join("Sites");
+        std::fs::create_dir_all(&sites_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/tmp/mysite", sites_dir.join("mysite")).unwrap();
 
         // Isolation file uses custom TLD ".dev"
         let isolate_dir = tmp.path().join("Isolate");
@@ -230,9 +294,10 @@ mod tests {
     fn isolation_fallback_to_bare_filename() {
         let tmp = tempfile::TempDir::new().unwrap();
 
-        let nginx_dir = tmp.path().join("Nginx");
-        std::fs::create_dir_all(&nginx_dir).unwrap();
-        std::fs::write(nginx_dir.join("legacy"), "").unwrap();
+        let sites_dir = tmp.path().join("Sites");
+        std::fs::create_dir_all(&sites_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/tmp/legacy", sites_dir.join("legacy")).unwrap();
 
         // Isolation file without TLD suffix (bare name)
         let isolate_dir = tmp.path().join("Isolate");
