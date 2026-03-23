@@ -844,12 +844,13 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "hearth-cli"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "chrono",
  "clap",
  "hearth-lib",
+ "nix 0.29.0",
  "opener",
  "reqwest",
  "serde_json",
@@ -858,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-daemon"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -876,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-lib"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "chrono",

@@ -2,6 +2,17 @@
 
 All notable changes to Hearth will be documented in this file.
 
+## [0.2.3] - 2026-03-23
+
+### Added
+- `hearth daemon start` — launch the daemon as a background process with log redirection
+- `hearth daemon stop` — gracefully stop supervised services then terminate the daemon
+- `hearth daemon status` — check if daemon is running and socket is responsive
+
+### Fixed
+- `hearth install` now detects Herd and writes `/etc/resolver/test` without custom port (defaults to port 53 for Herd's dnsmasq)
+- `hearth daemon stop` sends a Stop request to gracefully shut down services before SIGTERM, preventing orphaned child processes
+
 ## [0.2.2] - 2026-03-23
 
 ### Fixed
