@@ -78,8 +78,24 @@ enum Commands {
     /// Start MCP stdio bridge (for IDE integration)
     Mcp,
 
+    /// Manage the hearth daemon process
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
+
     /// First-time setup (installs Valet, configures DNS, trusts CA)
     Install,
+}
+
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Start the daemon in the background
+    Start,
+    /// Stop the running daemon
+    Stop,
+    /// Check if the daemon is running
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -143,6 +159,9 @@ async fn main() -> anyhow::Result<()> {
                 value,
             },
         },
+        Commands::Daemon { command } => {
+            return run_daemon(command).await;
+        }
         Commands::Install => {
             // Install is handled directly, not through the daemon
             return run_install().await;
@@ -271,11 +290,16 @@ async fn run_install() -> anyhow::Result<()> {
 
     // 3. Setup DNS resolver (requires sudo)
     println!("\n[3/3] Setting up DNS resolver (requires sudo)...");
-    println!("  This writes /etc/resolver/test with port {}", config.dns_port);
-    let resolver_content = format!(
-        "nameserver 127.0.0.1\nport {}\n",
-        config.dns_port
-    );
+
+    let herd_running = hearth_lib::service::manager::is_herd_running();
+    let resolver_content = if herd_running {
+        // Herd manages its own dnsmasq on default port 53 — don't override it
+        println!("  Herd detected — writing /etc/resolver/test without custom port (using Herd's dnsmasq on port 53)");
+        "nameserver 127.0.0.1\n".to_string()
+    } else {
+        println!("  Writing /etc/resolver/test with port {}", config.dns_port);
+        format!("nameserver 127.0.0.1\nport {}\n", config.dns_port)
+    };
 
     let status = std::process::Command::new("sudo")
         .args(["mkdir", "-p", "/etc/resolver"])
@@ -294,8 +318,113 @@ async fn run_install() -> anyhow::Result<()> {
         anyhow::bail!("Failed to write /etc/resolver/test");
     }
 
-    println!("\nSetup complete! Run `hearth-daemon` to start the supervisor,");
+    println!("\nSetup complete! Run `hearth daemon start` to start the daemon,");
     println!("then use `hearth start` to bring up services.");
+    Ok(())
+}
+
+async fn run_daemon(command: DaemonCommands) -> anyhow::Result<()> {
+    match command {
+        DaemonCommands::Start => daemon_start().await,
+        DaemonCommands::Stop => daemon_stop().await,
+        DaemonCommands::Status => daemon_status().await,
+    }
+}
+
+/// Read the daemon PID file and check if the process is alive.
+fn daemon_pid() -> Option<u32> {
+    let pid_path = hearth_lib::run_dir().join("daemon.pid");
+    let content = std::fs::read_to_string(&pid_path).ok()?;
+    let pid: u32 = content.trim().parse().ok()?;
+
+    // Signal 0 checks if process is alive without actually sending a signal
+    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+    let alive = nix::sys::signal::kill(nix_pid, None).is_ok();
+    if alive { Some(pid) } else { None }
+}
+
+async fn daemon_start() -> anyhow::Result<()> {
+    if let Some(pid) = daemon_pid() {
+        println!("Daemon is already running (PID {})", pid);
+        return Ok(());
+    }
+
+    let log_dir = hearth_lib::log_dir();
+    std::fs::create_dir_all(&log_dir)?;
+
+    let stdout_file = std::fs::File::create(log_dir.join("daemon.out.log"))?;
+    let stderr_file = std::fs::File::create(log_dir.join("daemon.err.log"))?;
+
+    let child = std::process::Command::new("hearth-daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()
+        .context("Failed to start hearth-daemon. Is it installed and on PATH?")?;
+
+    let pid = child.id();
+    println!("Daemon starting (PID {})...", pid);
+
+    // Wait briefly for the socket to appear
+    let socket_path = hearth_lib::socket::socket_path();
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if socket_path.exists() {
+            println!("Daemon is running.");
+            return Ok(());
+        }
+    }
+
+    println!("Daemon started but socket not yet available. Check logs at {}", log_dir.display());
+    Ok(())
+}
+
+async fn daemon_stop() -> anyhow::Result<()> {
+    let Some(pid) = daemon_pid() else {
+        println!("Daemon is not running.");
+        return Ok(());
+    };
+
+    // Send SIGTERM
+    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+    nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM)
+        .context(format!("Failed to send SIGTERM to daemon (PID {})", pid))?;
+
+    println!("Stopping daemon (PID {})...", pid);
+
+    // Wait for the process to exit (up to 5 seconds)
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let alive = nix::sys::signal::kill(nix_pid, None).is_ok();
+        if !alive {
+            // Clean up stale files
+            let _ = std::fs::remove_file(hearth_lib::run_dir().join("daemon.pid"));
+            let _ = std::fs::remove_file(hearth_lib::socket::socket_path());
+            println!("Daemon stopped.");
+            return Ok(());
+        }
+    }
+
+    println!("Daemon did not stop within 5 seconds. You may need to kill PID {} manually.", pid);
+    Ok(())
+}
+
+async fn daemon_status() -> anyhow::Result<()> {
+    match daemon_pid() {
+        Some(pid) => {
+            println!("Daemon is running (PID {})", pid);
+
+            // Try to get service status via socket
+            match send_to_daemon(DaemonRequest::Ping).await {
+                Ok(DaemonResponse::Pong) => println!("Socket is responsive."),
+                Ok(_) => println!("Socket connected but unexpected response."),
+                Err(_) => println!("Socket is not responsive."),
+            }
+        }
+        None => {
+            println!("Daemon is not running.");
+        }
+    }
     Ok(())
 }
 
