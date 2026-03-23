@@ -2,6 +2,11 @@
 
 All notable changes to Hearth will be documented in this file.
 
+## [0.2.2] - 2026-03-23
+
+### Fixed
+- `hearth sites` now shows all sites from both Valet and Herd (was only reading Valet's config dir)
+
 ## [0.2.1] - 2026-03-23
 
 ### Added

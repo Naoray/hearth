@@ -55,10 +55,13 @@ async fn main() -> anyhow::Result<()> {
         supervisor.register(svc);
     }
 
-    // Valet home for site enumeration
-    let valet_home = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".config/valet");
+    // Valet home directories for site enumeration (Valet + Herd)
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let mut valet_homes = vec![home.join(".config/valet")];
+    let herd_valet = home.join("Library/Application Support/Herd/config/valet");
+    if herd_valet.exists() {
+        valet_homes.push(herd_valet);
+    }
     let tld = config.tld.clone();
 
     // Capture ports before wrapping config in Arc<Mutex<>>
@@ -68,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(DaemonState {
         supervisor: Arc::new(Mutex::new(supervisor)),
         config: Arc::new(Mutex::new(config)),
-        site_manager: Arc::new(Mutex::new(SiteManager::new(valet_home, tld))),
+        site_manager: Arc::new(Mutex::new(SiteManager::with_homes(valet_homes, tld))),
         php_manager: Arc::new(Mutex::new(PhpManager::new(hearth_lib::config_dir()))),
     });
 

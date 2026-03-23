@@ -10,83 +10,103 @@ pub struct Site {
     pub php_version: Option<String>,
 }
 
-/// Site management — delegates to Valet CLI for actual operations.
+/// Site management — reads sites from multiple valet home directories.
 ///
-/// Hearth wraps Valet commands and adds:
-/// - Lazy site enumeration (for GUI performance)
-/// - PHP version tracking per-site
-/// - Integration with Anvil worktrees
+/// Merges sites from Valet's config (`~/.config/valet`) and Herd's config
+/// (`~/Library/Application Support/Herd/config/valet`). Sites from earlier
+/// paths take priority when names collide.
 pub struct SiteManager {
-    valet_home: PathBuf,
+    valet_homes: Vec<PathBuf>,
     tld: String,
 }
 
 impl SiteManager {
     pub fn new(valet_home: PathBuf, tld: String) -> Self {
-        Self { valet_home, tld }
+        Self {
+            valet_homes: vec![valet_home],
+            tld,
+        }
     }
 
-    /// List all linked sites by reading Valet's Sites directory (symlinks).
+    /// Create a SiteManager that reads from multiple valet home directories.
+    pub fn with_homes(valet_homes: Vec<PathBuf>, tld: String) -> Self {
+        Self { valet_homes, tld }
+    }
+
+    /// List all linked sites across all valet home directories.
     ///
-    /// Primary source: `Sites/` — contains symlinks created by `valet link`.
-    /// Fallback: `Nginx/` — contains Nginx config files (used by Herd).
-    /// Sites from both sources are merged, with `Sites/` taking priority.
+    /// For each home, reads `Sites/` (symlinks) and `Nginx/` (config files).
+    /// Earlier homes take priority — duplicates from later homes are skipped.
     pub fn list_sites(&self) -> anyhow::Result<Vec<Site>> {
         let mut seen = std::collections::HashSet::new();
         let mut sites = Vec::new();
 
-        // Primary: read Sites/ directory (symlinks from `valet link`)
-        let sites_dir = self.valet_home.join("Sites");
-        if sites_dir.exists() {
-            for entry in std::fs::read_dir(&sites_dir)? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') {
-                    continue;
+        for valet_home in &self.valet_homes {
+            // Read Sites/ directory (symlinks from `valet link`)
+            let sites_dir = valet_home.join("Sites");
+            if sites_dir.exists() {
+                for entry in std::fs::read_dir(&sites_dir)? {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with('.') || seen.contains(&name) {
+                        continue;
+                    }
+
+                    let path = if entry.path().is_symlink() {
+                        std::fs::read_link(entry.path()).unwrap_or_default()
+                    } else {
+                        entry.path()
+                    };
+
+                    let cert_path = valet_home
+                        .join("Certificates")
+                        .join(format!("{}.crt", name));
+
+                    sites.push(Site {
+                        name: name.clone(),
+                        path,
+                        secured: cert_path.exists(),
+                        php_version: self.resolve_isolated_php_in(valet_home, &name),
+                    });
+                    seen.insert(name);
                 }
-
-                let path = if entry.path().is_symlink() {
-                    std::fs::read_link(entry.path()).unwrap_or_default()
-                } else {
-                    entry.path()
-                };
-
-                let cert_path = self
-                    .valet_home
-                    .join("Certificates")
-                    .join(format!("{}.crt", name));
-
-                sites.push(Site {
-                    name: name.clone(),
-                    path,
-                    secured: cert_path.exists(),
-                    php_version: self.resolve_isolated_php(&name),
-                });
-                seen.insert(name);
             }
-        }
 
-        // Fallback: read Nginx/ directory (config files, used by Herd)
-        let nginx_dir = self.valet_home.join("Nginx");
-        if nginx_dir.exists() {
-            for entry in std::fs::read_dir(&nginx_dir)? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') || seen.contains(&name) {
-                    continue;
+            // Read Nginx/ directory (config files, used by Herd)
+            let nginx_dir = valet_home.join("Nginx");
+            if nginx_dir.exists() {
+                for entry in std::fs::read_dir(&nginx_dir)? {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with('.') || seen.contains(&name) {
+                        continue;
+                    }
+
+                    // Strip .test suffix from Herd Nginx config names
+                    let site_name = name
+                        .strip_suffix(&format!(".{}", self.tld))
+                        .unwrap_or(&name)
+                        .to_string();
+
+                    if seen.contains(&site_name) {
+                        continue;
+                    }
+
+                    let path = self.resolve_site_path_in(valet_home, &site_name)
+                        .unwrap_or_default();
+
+                    let cert_path = valet_home
+                        .join("Certificates")
+                        .join(format!("{}.crt", site_name));
+
+                    sites.push(Site {
+                        name: site_name.clone(),
+                        path,
+                        secured: cert_path.exists(),
+                        php_version: self.resolve_isolated_php_in(valet_home, &site_name),
+                    });
+                    seen.insert(site_name);
                 }
-
-                let cert_path = self
-                    .valet_home
-                    .join("Certificates")
-                    .join(format!("{}.crt", name));
-
-                sites.push(Site {
-                    name: name.clone(),
-                    path: self.resolve_site_path(&name).unwrap_or_default(),
-                    secured: cert_path.exists(),
-                    php_version: self.resolve_isolated_php(&name),
-                });
             }
         }
 
@@ -94,9 +114,9 @@ impl SiteManager {
         Ok(sites)
     }
 
-    /// Resolve a site name to its filesystem path using Valet's link symlinks.
-    fn resolve_site_path(&self, site_name: &str) -> Option<PathBuf> {
-        let link_path = self.valet_home.join("Sites").join(site_name);
+    /// Resolve a site name to its filesystem path in a specific valet home.
+    fn resolve_site_path_in(&self, valet_home: &std::path::Path, site_name: &str) -> Option<PathBuf> {
+        let link_path = valet_home.join("Sites").join(site_name);
         if link_path.is_symlink() {
             std::fs::read_link(&link_path).ok()
         } else {
@@ -104,18 +124,9 @@ impl SiteManager {
         }
     }
 
-    /// Get the Valet home path (for testing).
-    #[cfg(test)]
-    pub fn valet_home(&self) -> &std::path::Path {
-        &self.valet_home
-    }
-
-    /// Read the isolated PHP version for a site from Valet's Isolate directory.
-    ///
-    /// Valet stores isolation as files named `{site_name}{tld}` containing the
-    /// PHP version string (e.g., "8.3").
-    fn resolve_isolated_php(&self, site_name: &str) -> Option<String> {
-        let isolate_dir = self.valet_home.join("Isolate");
+    /// Read the isolated PHP version for a site in a specific valet home.
+    fn resolve_isolated_php_in(&self, valet_home: &std::path::Path, site_name: &str) -> Option<String> {
+        let isolate_dir = valet_home.join("Isolate");
         if !isolate_dir.exists() {
             return None;
         }
@@ -308,5 +319,60 @@ mod tests {
         let sites = manager.list_sites().unwrap();
         let site = sites.iter().find(|s| s.name == "legacy").unwrap();
         assert_eq!(site.php_version.as_deref(), Some("7.4"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_homes_merges_sites_from_multiple_dirs() {
+        let valet_dir = tempfile::TempDir::new().unwrap();
+        let herd_dir = tempfile::TempDir::new().unwrap();
+
+        // Valet has site "alpha"
+        let valet_sites = valet_dir.path().join("Sites");
+        std::fs::create_dir_all(&valet_sites).unwrap();
+        std::os::unix::fs::symlink("/tmp/alpha", valet_sites.join("alpha")).unwrap();
+
+        // Herd has site "beta" (via Nginx config)
+        let herd_nginx = herd_dir.path().join("Nginx");
+        std::fs::create_dir_all(&herd_nginx).unwrap();
+        std::fs::write(herd_nginx.join("beta.test"), "").unwrap();
+
+        // Herd also has "beta" in Sites
+        let herd_sites = herd_dir.path().join("Sites");
+        std::fs::create_dir_all(&herd_sites).unwrap();
+        std::os::unix::fs::symlink("/tmp/beta", herd_sites.join("beta")).unwrap();
+
+        let manager = SiteManager::with_homes(
+            vec![valet_dir.path().to_path_buf(), herd_dir.path().to_path_buf()],
+            "test".to_string(),
+        );
+        let sites = manager.list_sites().unwrap();
+        let names: Vec<&str> = sites.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"alpha"), "should contain alpha: {names:?}");
+        assert!(names.contains(&"beta"), "should contain beta: {names:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_homes_first_home_takes_priority() {
+        let first = tempfile::TempDir::new().unwrap();
+        let second = tempfile::TempDir::new().unwrap();
+
+        // Same site in both — first should win
+        let first_sites = first.path().join("Sites");
+        std::fs::create_dir_all(&first_sites).unwrap();
+        std::os::unix::fs::symlink("/tmp/first-path", first_sites.join("mysite")).unwrap();
+
+        let second_sites = second.path().join("Sites");
+        std::fs::create_dir_all(&second_sites).unwrap();
+        std::os::unix::fs::symlink("/tmp/second-path", second_sites.join("mysite")).unwrap();
+
+        let manager = SiteManager::with_homes(
+            vec![first.path().to_path_buf(), second.path().to_path_buf()],
+            "test".to_string(),
+        );
+        let sites = manager.list_sites().unwrap();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].path, PathBuf::from("/tmp/first-path"));
     }
 }
