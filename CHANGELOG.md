@@ -2,6 +2,18 @@
 
 All notable changes to Hearth will be documented in this file.
 
+## [0.2.1] - 2026-03-23
+
+### Added
+- Herd coexistence — detects running Herd and skips nginx/php-fpm/dnsmasq, only runs Hearth-owned services
+- Site listing reads from `Sites/` symlinks (primary) with `Nginx/` fallback, deduplicates across both
+- `ValetCli::link_in()` for concurrent-safe site linking from MCP
+
+### Fixed
+- `hearth sites` now shows linked sites (was reading from empty Nginx dir instead of Sites dir)
+- `hearth start` no longer aborts on first missing binary — skips failed services gracefully
+- PHP deprecation warnings from Valet CLI are filtered from output
+
 ## [0.2.0] - 2026-03-23
 
 ### Added
