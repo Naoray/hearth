@@ -98,6 +98,3 @@ Key ports (all configurable):
 - `mail_ui_port`: 8025 (Mailpit web UI)
 - `mcp_port`: 9900 (MCP Streamable HTTP)
 
-## Design Docs
-
-- Full design document: `~/.gstack/projects/home/krishankonig-unknown-design-20260319-130500.md`
