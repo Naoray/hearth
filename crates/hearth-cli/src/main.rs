@@ -2,8 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use hearth_lib::add::AddAnswers;
 use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
@@ -284,27 +283,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn send_to_daemon(request: DaemonRequest) -> anyhow::Result<DaemonResponse> {
-    let socket_path = hearth_lib::socket::socket_path();
-
-    let stream = UnixStream::connect(&socket_path)
-        .await
-        .context("Daemon not running. Start with: hearth daemon start")?;
-
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-
-    // Send request
-    let request_json = serde_json::to_string(&request)?;
-    writer.write_all(request_json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-
-    // Read response
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
-
-    let response: DaemonResponse = serde_json::from_str(line.trim())?;
-    Ok(response)
+    let client = hearth_lib::client::DaemonClient::new();
+    client.send(request).await
 }
 
 fn print_response(response: DaemonResponse) {
