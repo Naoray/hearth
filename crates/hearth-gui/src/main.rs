@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod commands;
 mod dump;
 mod notifications;
@@ -33,6 +34,8 @@ fn main() {
         ])
         .setup(|app| {
             tray::setup_tray(app.handle());
+
+            autostart::setup_autostart(app.handle());
 
             let config = hearth_lib::config::HearthConfig::load().unwrap_or_default();
             dump::start_dump_listener(app.handle(), config.dump_port);
