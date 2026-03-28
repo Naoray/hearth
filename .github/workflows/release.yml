@@ -58,3 +58,25 @@ jobs:
         with:
           files: hearth-*.tar.gz
           generate_release_notes: true
+
+  build-gui:
+    runs-on: macos-latest
+    needs: release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2"
+
+      - name: Build Tauri app
+        working-directory: crates/hearth-gui
+        run: cargo tauri build
+
+      - name: Upload DMG to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: crates/hearth-gui/target/release/bundle/dmg/*.dmg
