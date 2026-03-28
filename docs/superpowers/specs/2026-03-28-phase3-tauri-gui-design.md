@@ -113,7 +113,7 @@ Poll daemon every 5 seconds (matches daemon's own health check interval). Update
 
 ## Dashboard Window
 
-Single window with three panels, switchable via sidebar or tabs:
+Single window with four panels, switchable via sidebar or tabs:
 
 ### Services Panel (default view)
 - Service cards showing name, state (Running/Stopped/Failed), PID, uptime
@@ -131,6 +131,25 @@ Single window with three panels, switchable via sidebar or tabs:
 - Currently active version (prominent)
 - List of installed versions with "Switch" buttons
 - php.ini quick-edit form (key/value pairs like memory_limit, upload_max_filesize)
+
+### Dump Panel
+- Live-streaming VarDumper output (connects to dump relay subscriber port: `dump_port + 1`)
+- Auto-scroll with pause button
+- Clear buffer button
+- Timestamp prefix per entry (matches CLI `hearth dump` format)
+- Connection status indicator (connected/reconnecting)
+
+## Notifications
+
+Use macOS native notifications (`NSUserNotification` / `UNUserNotificationCenter` via Tauri):
+- **Service crashed**: "nginx crashed — restarting (attempt 2/3)"
+- **Circuit breaker tripped**: "php-fpm stopped after 3 failures in 60s. Manual restart required."
+- Notifications are on by default, configurable via dashboard settings toggle
+- No notification spam — debounce to max 1 per service per 30 seconds
+
+## Login Item
+
+Register as a macOS login item via `SMAppService` (Tauri v2 supports this). On first launch, prompt user: "Start Hearth automatically when you log in?" Default: yes.
 
 ## Frontend Stack
 
@@ -195,14 +214,17 @@ Add a `build-gui` job to the release workflow that:
 2. Scaffold `hearth-gui` Tauri crate
 3. Implement Tauri commands wrapping `DaemonClient`
 4. Build system tray with status polling
-5. Build dashboard panels (Services → Sites → PHP)
-6. Add daemon auto-start logic
+5. Build dashboard panels (Services → Sites → PHP → Dump)
+6. Add dump streaming via WebSocket/TCP subscriber to dump relay
+7. Add macOS notifications for service crashes and circuit breaker trips
+8. Add daemon auto-start logic
+9. Register as macOS login item (auto-start on boot)
 7. CI: add Tauri build + DMG packaging
 8. Homebrew: add cask formula
 
-## Open Questions
+## Resolved Decisions
 
-1. **Login item**: Should the GUI register as a macOS login item (auto-start on boot)?
-2. **Dock icon**: Show in Dock when dashboard is open, or always hide (tray-only)?
-3. **Dump streaming**: Should the dashboard show live dump output, or keep that CLI-only?
-4. **Notifications**: macOS notifications for service crashes / circuit breaker trips?
+1. **Login item**: Yes — register as macOS login item, auto-start on boot (on by default)
+2. **Dock icon**: Tray-only always, no Dock icon
+3. **Dump streaming**: Yes — fourth "Dump" tab streams live VarDumper output (connects to dump relay on `dump_port + 1`)
+4. **Notifications**: Yes — macOS native notifications for service crashes and circuit breaker trips
