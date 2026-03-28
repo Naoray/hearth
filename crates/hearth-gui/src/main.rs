@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod dump;
 mod notifications;
 mod tray;
 
@@ -32,6 +33,10 @@ fn main() {
         ])
         .setup(|app| {
             tray::setup_tray(app.handle());
+
+            let config = hearth_lib::config::HearthConfig::load().unwrap_or_default();
+            dump::start_dump_listener(app.handle(), config.dump_port);
+
             Ok(())
         })
         .run(tauri::generate_context!())
