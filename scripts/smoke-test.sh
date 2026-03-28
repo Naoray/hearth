@@ -216,6 +216,13 @@ else
     fail "hearth db stop — failed: $OUTPUT"
 fi
 
+# ── 11. GUI build check ─────────────────────────────────────────
+info "GUI build check..."
+
+echo "=== GUI build check ==="
+cargo check -p hearth-gui
+echo "GUI build check: OK"
+
 # ── Summary ──────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
