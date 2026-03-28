@@ -1,12 +1,15 @@
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tauri::AppHandle;
 
-/// Debounce interval to prevent notification spam.
-const COOLDOWN_SECS: u64 = 30;
+/// Debounce interval to prevent notification spam (30 seconds per service).
+const COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Tracks per-service notification timestamps to prevent spam.
+///
+/// Each service has an independent cooldown — a failure notification for
+/// "nginx" does not suppress one for "php-fpm".
 pub struct NotificationDebouncer {
     last_sent: HashMap<String, Instant>,
 }
@@ -19,6 +22,9 @@ impl NotificationDebouncer {
     }
 
     /// Send a notification if the cooldown for this service has elapsed.
+    ///
+    /// Skips silently when the last notification for the same service key
+    /// was sent less than 30 seconds ago.
     pub fn notify_if_allowed(
         &mut self,
         app: &AppHandle,
@@ -29,10 +35,13 @@ impl NotificationDebouncer {
         let now = Instant::now();
 
         if let Some(last) = self.last_sent.get(service) {
-            if now.duration_since(*last).as_secs() < COOLDOWN_SECS {
+            if now.duration_since(*last) < COOLDOWN {
+                tracing::debug!(service, "notification suppressed (cooldown active)");
                 return;
             }
         }
+
+        tracing::info!(service, title, body, "sending macOS notification");
 
         #[cfg(not(test))]
         {
