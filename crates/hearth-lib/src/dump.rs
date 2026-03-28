@@ -11,8 +11,12 @@ pub fn dump_addr(port: u16) -> SocketAddr {
 }
 
 /// Relay port where CLI subscribers connect (input port + 1).
+///
+/// Panics in debug builds if dump_port is u16::MAX. In release,
+/// saturates to u16::MAX (65535).
 pub fn relay_port(dump_port: u16) -> u16 {
-    dump_port + 1
+    debug_assert!(dump_port < u16::MAX, "dump_port must be less than u16::MAX");
+    dump_port.saturating_add(1)
 }
 
 /// Run the dump server with broadcast relay.

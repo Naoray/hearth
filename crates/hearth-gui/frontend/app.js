@@ -22,26 +22,47 @@ async function refreshServices() {
   try {
     const services = await invoke('get_status');
     const list = document.getElementById('services-list');
-    list.innerHTML = services.map(s => {
+    list.textContent = '';
+
+    for (const s of services) {
       const color = s.state === 'Running' ? 'green'
         : s.state === 'Stopped' ? 'grey'
         : s.state === 'Starting' ? 'yellow' : 'red';
       const pid = s.pid ? ` (PID ${s.pid})` : '';
-      return `<div class="service-card">
-        <div><span class="status-dot ${color}"></span><span class="service-name">${s.name}</span></div>
-        <div><span class="service-state">${s.state}${pid}</span>
-          <button onclick="restartService('${s.name}')">Restart</button></div>
-      </div>`;
-    }).join('');
+
+      const card = document.createElement('div');
+      card.className = 'service-card';
+
+      const left = document.createElement('div');
+      const dot = document.createElement('span');
+      dot.className = `status-dot ${color}`;
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'service-name';
+      nameSpan.textContent = s.name;
+      left.appendChild(dot);
+      left.appendChild(nameSpan);
+
+      const right = document.createElement('div');
+      const stateSpan = document.createElement('span');
+      stateSpan.className = 'service-state';
+      stateSpan.textContent = s.state + pid;
+      const btn = document.createElement('button');
+      btn.textContent = 'Restart';
+      btn.addEventListener('click', async () => {
+        await invoke('restart_service', { service: s.name });
+        await refreshServices();
+      });
+      right.appendChild(stateSpan);
+      right.appendChild(btn);
+
+      card.appendChild(left);
+      card.appendChild(right);
+      list.appendChild(card);
+    }
     document.getElementById('connection-banner').classList.add('hidden');
   } catch (e) {
     document.getElementById('connection-banner').classList.remove('hidden');
   }
-}
-
-async function restartService(name) {
-  await invoke('restart_service', { service: name });
-  await refreshServices();
 }
 
 document.getElementById('start-all-btn').addEventListener('click', async () => {
@@ -62,28 +83,65 @@ async function refreshSites() {
   try {
     const sites = await invoke('get_sites');
     const list = document.getElementById('sites-list');
-    list.innerHTML = sites.map(s => {
-      const sslBadge = s.secured ? '<span class="site-badge ssl">SSL</span>' : '';
-      const phpBadge = s.php_version ? `<span class="site-badge">PHP ${s.php_version}</span>` : '';
-      return `<div class="site-row">
-        <div><span class="site-name" onclick="window.__TAURI__.shell.open('https://${s.name}.test')">${s.name}</span>
-          <div class="site-path">${s.path}</div></div>
-        <div style="display:flex;gap:6px;align-items:center">
-          ${sslBadge}${phpBadge}
-          <button onclick="toggleSsl('${s.name}', ${s.secured})">${s.secured ? 'Unsecure' : 'Secure'}</button>
-          <button onclick="unlinkSite('${s.name}')">Unlink</button></div>
-      </div>`;
-    }).join('');
-  } catch (e) { console.error('Failed to load sites:', e); }
-}
+    list.textContent = '';
 
-async function toggleSsl(name, isSecured) {
-  await invoke(isSecured ? 'unsecure_site' : 'secure_site', { name });
-  await refreshSites();
-}
-async function unlinkSite(name) {
-  await invoke('unlink_site', { name });
-  await refreshSites();
+    for (const s of sites) {
+      const row = document.createElement('div');
+      row.className = 'site-row';
+
+      const left = document.createElement('div');
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'site-name';
+      nameSpan.textContent = s.name;
+      nameSpan.addEventListener('click', () => {
+        window.__TAURI__.shell.open('https://' + s.name + '.test');
+      });
+      const pathDiv = document.createElement('div');
+      pathDiv.className = 'site-path';
+      pathDiv.textContent = s.path;
+      left.appendChild(nameSpan);
+      left.appendChild(pathDiv);
+
+      const right = document.createElement('div');
+      right.style.display = 'flex';
+      right.style.gap = '6px';
+      right.style.alignItems = 'center';
+
+      if (s.secured) {
+        const sslBadge = document.createElement('span');
+        sslBadge.className = 'site-badge ssl';
+        sslBadge.textContent = 'SSL';
+        right.appendChild(sslBadge);
+      }
+      if (s.php_version) {
+        const phpBadge = document.createElement('span');
+        phpBadge.className = 'site-badge';
+        phpBadge.textContent = 'PHP ' + s.php_version;
+        right.appendChild(phpBadge);
+      }
+
+      const sslBtn = document.createElement('button');
+      sslBtn.textContent = s.secured ? 'Unsecure' : 'Secure';
+      sslBtn.addEventListener('click', async () => {
+        await invoke(s.secured ? 'unsecure_site' : 'secure_site', { name: s.name });
+        await refreshSites();
+      });
+
+      const unlinkBtn = document.createElement('button');
+      unlinkBtn.textContent = 'Unlink';
+      unlinkBtn.addEventListener('click', async () => {
+        await invoke('unlink_site', { name: s.name });
+        await refreshSites();
+      });
+
+      right.appendChild(sslBtn);
+      right.appendChild(unlinkBtn);
+
+      row.appendChild(left);
+      row.appendChild(right);
+      list.appendChild(row);
+    }
+  } catch (e) { console.error('Failed to load sites:', e); }
 }
 
 document.getElementById('link-site-btn').addEventListener('click', async () => {
@@ -100,26 +158,44 @@ async function refreshPhp() {
   try {
     const versions = await invoke('get_php_versions');
     const list = document.getElementById('php-list');
-    list.innerHTML = versions.map(v => {
-      const cls = v.active ? 'php-active' : '';
-      return `<div class="php-version-row">
-        <span class="${cls}">PHP ${v.version}${v.active ? ' (active)' : ''}</span>
-        <div><span class="site-path">${v.path}</span>
-          ${v.active ? '' : `<button onclick="switchPhp('${v.version}')">Switch</button>`}</div>
-      </div>`;
-    }).join('');
-  } catch (e) { console.error('Failed to load PHP versions:', e); }
-}
+    list.textContent = '';
 
-async function switchPhp(version) {
-  await invoke('switch_php', { version });
-  await refreshPhp();
-  await refreshServices();
+    for (const v of versions) {
+      const row = document.createElement('div');
+      row.className = 'php-version-row';
+
+      const label = document.createElement('span');
+      if (v.active) label.className = 'php-active';
+      label.textContent = 'PHP ' + v.version + (v.active ? ' (active)' : '');
+
+      const right = document.createElement('div');
+      const pathSpan = document.createElement('span');
+      pathSpan.className = 'site-path';
+      pathSpan.textContent = v.path;
+      right.appendChild(pathSpan);
+
+      if (!v.active) {
+        const btn = document.createElement('button');
+        btn.textContent = 'Switch';
+        btn.addEventListener('click', async () => {
+          await invoke('switch_php', { version: v.version });
+          await refreshPhp();
+          await refreshServices();
+        });
+        right.appendChild(btn);
+      }
+
+      row.appendChild(label);
+      row.appendChild(right);
+      list.appendChild(row);
+    }
+  } catch (e) { console.error('Failed to load PHP versions:', e); }
 }
 
 // Dump streaming
 let dumpPaused = false;
 let dumpBuffer = [];
+let dumpLineCount = 0;
 
 listen('dump-line', (event) => {
   if (dumpPaused) {
@@ -141,10 +217,14 @@ listen('dump-disconnected', () => {
 function appendDumpLine(line) {
   const output = document.getElementById('dump-output');
   output.textContent += line + '\n';
-  const lines = output.textContent.split('\n');
-  if (lines.length > MAX_LINES) {
+  dumpLineCount++;
+
+  if (dumpLineCount > MAX_LINES && dumpLineCount % 100 === 0) {
+    const lines = output.textContent.split('\n');
     output.textContent = lines.slice(lines.length - MAX_LINES).join('\n');
+    dumpLineCount = MAX_LINES;
   }
+
   output.scrollTop = output.scrollHeight;
 }
 
@@ -155,6 +235,7 @@ document.getElementById('dump-pause-btn').addEventListener('click', () => {
 });
 document.getElementById('dump-clear-btn').addEventListener('click', () => {
   document.getElementById('dump-output').textContent = '';
+  dumpLineCount = 0;
 });
 
 

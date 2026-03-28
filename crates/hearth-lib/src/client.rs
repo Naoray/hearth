@@ -32,7 +32,15 @@ impl DaemonClient {
     }
 
     /// Send a request to the daemon and return the response.
+    ///
+    /// Times out after 5 seconds if the daemon does not respond.
     pub async fn send(&self, request: DaemonRequest) -> anyhow::Result<DaemonResponse> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.send_inner(request))
+            .await
+            .map_err(|_| anyhow::anyhow!("daemon request timed out after 5 seconds"))?
+    }
+
+    async fn send_inner(&self, request: DaemonRequest) -> anyhow::Result<DaemonResponse> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .context("daemon not running — start with: hearth daemon start")?;

@@ -60,23 +60,28 @@ jobs:
           generate_release_notes: true
 
   build-gui:
-    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
     needs: release
 
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
+        with:
+          targets: ${{ matrix.target }}
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2"
-
       - name: Build Tauri app
         working-directory: crates/hearth-gui
-        run: cargo tauri build
-
+        run: cargo tauri build --target ${{ matrix.target }}
       - name: Upload DMG to release
         uses: softprops/action-gh-release@v2
         with:
-          files: crates/hearth-gui/target/release/bundle/dmg/*.dmg
+          files: crates/hearth-gui/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
