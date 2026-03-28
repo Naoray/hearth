@@ -16,6 +16,7 @@ hearth-daemon (always-on, owns all processes via process groups)
 - **hearth-lib**: Core library shared by daemon, CLI, and GUI
 - **hearth-daemon**: Process supervisor + Unix socket API server + MCP HTTP server
 - **hearth-cli**: `hearth` binary, thin client using clap
+- **hearth-gui**: Tauri v2 desktop app with system tray, uses `DaemonClient` from hearth-lib
 
 ### Key modules in hearth-lib
 
@@ -33,6 +34,15 @@ hearth-daemon (always-on, owns all processes via process groups)
 | `site.rs` | Multi-home site enumeration (reads from both Valet and Herd config dirs) |
 | `valet.rs` | Valet CLI wrapper (link, unlink, park, secure, unsecure) |
 | `socket.rs` | `DaemonRequest`/`DaemonResponse` protocol types |
+| `client.rs` | `DaemonClient` — shared Unix socket client used by CLI and GUI |
+
+### Key modules in hearth-gui
+
+| Module | Purpose |
+|--------|---------|
+| `src-tauri/src/main.rs` | Tauri app setup, system tray, menu, and window management |
+| `src-tauri/src/commands.rs` | Tauri IPC commands wrapping `DaemonClient` |
+| `src-tauri/src/tray.rs` | System tray icon, status polling, and context menu |
 
 ## Key Design Decisions
 
@@ -56,6 +66,7 @@ hearth-daemon (always-on, owns all processes via process groups)
 cargo build                    # Build all crates
 cargo run -p hearth-daemon     # Start the daemon (Unix socket + MCP HTTP)
 cargo run -p hearth-cli -- status  # CLI commands
+cargo tauri dev -p hearth-gui  # Run GUI in dev mode (requires tauri-cli v2)
 ```
 
 ### Install via Homebrew
