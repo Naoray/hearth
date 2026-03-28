@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hearth</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <nav id="sidebar">
+      <div class="nav-header">Hearth</div>
+      <button class="nav-item active" data-panel="services">Services</button>
+      <button class="nav-item" data-panel="sites">Sites</button>
+      <button class="nav-item" data-panel="php">PHP</button>
+      <button class="nav-item" data-panel="dump">Dump</button>
+    </nav>
+    <main id="content">
+      <div id="connection-banner" class="banner hidden">
+        Daemon not connected. <button id="start-daemon-btn">Start Daemon</button>
+      </div>
+      <section id="panel-services" class="panel active">
+        <h2>Services</h2>
+        <div id="services-list"></div>
+        <div class="actions">
+          <button id="start-all-btn">Start All</button>
+          <button id="stop-all-btn">Stop All</button>
+        </div>
+      </section>
+      <section id="panel-sites" class="panel">
+        <h2>Sites</h2>
+        <div id="sites-list"></div>
+        <div class="actions">
+          <button id="link-site-btn">Link Site...</button>
+        </div>
+      </section>
+      <section id="panel-php" class="panel">
+        <h2>PHP Versions</h2>
+        <div id="php-list"></div>
+        <div id="php-config-form"></div>
+      </section>
+      <section id="panel-dump" class="panel">
+        <h2>Dump Server</h2>
+        <div class="dump-controls">
+          <span id="dump-status" class="status-dot grey"></span>
+          <button id="dump-pause-btn">Pause</button>
+          <button id="dump-clear-btn">Clear</button>
+        </div>
+        <pre id="dump-output"></pre>
+      </section>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
