@@ -1,14 +1,40 @@
-# Hearth
+# Hearth 🔥
 
-A single CLI that IS your Laravel development environment. Services, sites, SSL, PHP versions, mail catching, dump server, and AI tool integration — all supervised by one Rust daemon that guarantees no orphan processes.
+**Your complete Laravel development environment — one Rust daemon, zero friction.**
 
-Built because Herd leaks 1,000+ MCP processes, freezes with many sites, and gates databases behind a paywall.
+Services, sites, SSL, PHP version switching, mail catching, dump server, and AI tool integration. Install once, works immediately.
+
+```bash
+brew install naoray/tap/hearth
+hearth install    # first-time setup
+hearth start      # everything is running
+```
+
+MIT licensed. No subscriptions. No paid tiers.
+
+---
+
+## What Hearth manages
+
+```
+hearth start / stop / restart / status    — all services at once
+hearth link / unlink / park / sites       — site management
+hearth secure / unsecure                  — SSL certificates (trusted locally)
+hearth php use 8.3                        — switch PHP version instantly
+hearth php list                           — show installed versions
+hearth php config memory_limit 512M       — edit php.ini + restart FPM
+hearth dump                               — stream VarDumper output with timestamps
+hearth mail                               — open Mailpit UI in browser
+hearth mcp                                — MCP server for IDE integration
+hearth laravel new myapp                  — scaffold a new Laravel project
+```
 
 ## Install
 
 ```bash
 brew tap naoray/tap
 brew install hearth
+hearth install
 ```
 
 Or build from source:
@@ -18,75 +44,33 @@ cargo install --path crates/hearth-cli
 cargo install --path crates/hearth-daemon
 ```
 
-## Quick start
+## Works alongside your existing setup
 
-```bash
-brew install naoray/tap/hearth
-hearth-daemon &         # start the supervisor daemon
-hearth start            # bring up services (skips nginx/php-fpm/dnsmasq if Herd is running)
-hearth sites            # list all sites (reads from both Valet and Herd)
-hearth mcp              # MCP stdio bridge for IDE integration
-```
+If you're already using Valet or Herd, Hearth detects them and works alongside — sharing sites and skipping services the other tool already manages. Migrate gradually, or run both indefinitely.
 
-### Works alongside Herd
+## MCP integration
 
-Hearth detects Herd and skips the services Herd already manages (nginx, php-fpm, dnsmasq). You get Hearth's features without conflicts:
+The daemon runs an in-process MCP server on `http://127.0.0.1:9900/mcp`. Connect your IDE directly — no spawned processes, no cleanup required.
 
-- `hearth mcp` — MCP server without the orphan process leak
-- `hearth dump` — VarDumper streaming with timestamps
-- `hearth sites` — list all sites from both Valet and Herd
-- `hearth php list / config` — PHP version management
-- `hearth mail` — Mailpit UI
+For IDEs that only support stdio, `hearth mcp` bridges stdin/stdout to the HTTP endpoint.
 
-When you're ready to replace Herd entirely, Hearth can manage all services directly (Phase 3+).
-
-## What it does
-
-```
-hearth start / stop / restart / status    — manage all services
-hearth link / unlink / park / sites       — site management (via Valet)
-hearth secure / unsecure                  — SSL certificates
-hearth php use 8.3                        — switch PHP version
-hearth php list                           — show installed versions
-hearth php config memory_limit 512M       — edit php.ini + restart FPM
-hearth dump                               — stream VarDumper output with timestamps
-hearth mail                               — open Mailpit UI in browser
-hearth mcp                                — MCP stdio bridge for IDE integration
-hearth laravel new myapp                  — create a new Laravel project
-hearth install                            — first-time setup
-```
+**Available tools:** `hearth_status`, `hearth_sites`, `hearth_php_list`, `hearth_php_switch`, `hearth_site_link`, `hearth_site_unlink`, `hearth_service_restart`, `hearth_php_config`
 
 ## Architecture
 
-Hearth is a thin CLI talking to an always-on daemon over a Unix socket. The daemon owns all child processes via process groups — when it dies, everything dies with it. No orphans.
+Hearth is a thin CLI talking to an always-on daemon over a Unix socket. The daemon owns all child processes via process groups — when it exits, everything exits. No orphaned processes.
 
 ```
 hearth-daemon
-  ├── nginx          (process group, skipped if Herd running)
-  ├── php-fpm        (process group, skipped if Herd running)
-  ├── dnsmasq        (process group, skipped if Herd running)
+  ├── nginx          (process group)
+  ├── php-fpm        (process group)
+  ├── dnsmasq        (process group)
   ├── mailpit        (process group, if installed)
   ├── dump server    (tokio task)
   └── MCP server     (tokio task, port 9900)
 ```
 
-Circuit breaker stops restart loops: 3 crashes in 60 seconds = service marked failed, manual `hearth restart <service>` to retry.
-
-## MCP server
-
-The daemon runs an in-process MCP server on `http://127.0.0.1:9900/mcp` — IDEs connect directly, no spawned processes. This is the whole point: Herd's PHP-based MCP server leaks processes because stdio transport has no process group containment. Hearth's MCP server is a Tokio task inside the daemon. Nothing to orphan.
-
-For IDEs that only support stdio, `hearth mcp` bridges stdin/stdout to the HTTP endpoint.
-
-**Tools:** `hearth_status`, `hearth_sites`, `hearth_php_list`, `hearth_php_switch`, `hearth_site_link`, `hearth_site_unlink`, `hearth_service_restart`, `hearth_php_config`
-
-## PHP resolution
-
-Hearth finds PHP binaries in this order:
-
-1. `~/.config/hearth/php/{version}/php` — own cached binaries
-2. `~/Library/Application Support/Herd/bin/php{version}` — reuse Herd's binaries during migration
-3. `/opt/homebrew/opt/php@{version}/bin/php` — Homebrew fallback
+A circuit breaker prevents restart loops: 3 crashes in 60 seconds marks a service as failed. Use `hearth restart <service>` to retry manually.
 
 ## Configuration
 
@@ -102,22 +86,22 @@ mail_ui_port = 8025
 mcp_port = 9900
 ```
 
-## What's free that Herd charges for
+## PHP resolution
 
-- Databases (MySQL, PostgreSQL, Redis) — Phase 4
-- Mail catching (Mailpit)
-- Dump server
-- MCP without orphan processes
-- Everything, really. MIT licensed.
+Hearth finds PHP binaries in this order:
+
+1. `~/.config/hearth/php/{version}/php` — own cached binaries
+2. `~/Library/Application Support/Herd/bin/php{version}` — reuse existing binaries
+3. `/opt/homebrew/opt/php@{version}/bin/php` — Homebrew fallback
 
 ## Roadmap
 
 - [x] Phase 1: Core CLI + daemon, process supervision, site/PHP management
-- [x] Phase 2: MCP server, Mailpit, dump polish, Homebrew distribution
+- [x] Phase 2: MCP server, Mailpit, dump server, Homebrew distribution
 - [ ] Phase 3: Tauri GUI with system tray
 - [ ] Phase 4: Database management (MySQL, PostgreSQL, Redis)
 - [ ] Phase 5: Anvil worktree integration, Ploi deployment
 
 ## License
 
-MIT
+MIT — free forever, including databases (Phase 4).
