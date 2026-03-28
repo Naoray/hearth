@@ -2,7 +2,7 @@
 
 **Your complete Laravel development environment — one Rust daemon, zero friction.**
 
-Services, sites, SSL, PHP version switching, mail catching, dump server, and AI tool integration. Install once, works immediately.
+Services, sites, SSL, PHP version switching, mail catching, dump server, and package setup. Install once, works immediately.
 
 ```bash
 brew install naoray/tap/hearth
@@ -25,7 +25,7 @@ hearth php list                           — show installed versions
 hearth php config memory_limit 512M       — edit php.ini + restart FPM
 hearth dump                               — stream VarDumper output with timestamps
 hearth mail                               — open Mailpit UI in browser
-hearth mcp                                — MCP server for IDE integration
+hearth add horizon                        — guided install with opinionated config
 hearth laravel new myapp                  — scaffold a new Laravel project
 ```
 
@@ -48,13 +48,26 @@ cargo install --path crates/hearth-daemon
 
 If you're already using Valet or Herd, Hearth detects them and works alongside — sharing sites and skipping services the other tool already manages. Migrate gradually, or run both indefinitely.
 
-## MCP integration
+## `hearth add` — guided package setup
 
-The daemon runs an in-process MCP server on `http://127.0.0.1:9900/mcp`. Connect your IDE directly — no spawned processes, no cleanup required.
+Laravel packages like Horizon, Telescope, Pulse, and Reverb all require additional configuration beyond `composer require`. `hearth add` walks you through it interactively, writes sensible defaults based on your answers, and registers long-running services (like Horizon) as supervised daemon processes.
 
-For IDEs that only support stdio, `hearth mcp` bridges stdin/stdout to the HTTP endpoint.
+```bash
+hearth add horizon     # installs, configures, and supervises Horizon
+hearth add telescope   # installs with safe production guards
+hearth add pulse       # installs with recommended aggregation settings
+hearth add reverb      # installs and starts the WebSocket server
+```
 
-**Available tools:** `hearth_status`, `hearth_sites`, `hearth_php_list`, `hearth_php_switch`, `hearth_site_link`, `hearth_site_unlink`, `hearth_service_restart`, `hearth_php_config`
+No more copy-pasting config snippets from docs. No more manually running workers in a terminal tab.
+
+## Agent integration
+
+Hearth is designed to work with AI coding agents via [Scribe](https://github.com/Naoray/scribe) — a skill manager for agents. Install the Hearth skill and your agent can manage sites, switch PHP versions, check service status, and more through plain CLI calls. No embedded server required.
+
+```bash
+scribe install hearth
+```
 
 ## Architecture
 
@@ -66,8 +79,8 @@ hearth-daemon
   ├── php-fpm        (process group)
   ├── dnsmasq        (process group)
   ├── mailpit        (process group, if installed)
-  ├── dump server    (tokio task)
-  └── MCP server     (tokio task, port 9900)
+  ├── horizon        (process group, if added)
+  └── dump server    (tokio task)
 ```
 
 A circuit breaker prevents restart loops: 3 crashes in 60 seconds marks a service as failed. Use `hearth restart <service>` to retry manually.
@@ -83,7 +96,6 @@ dns_port = 5354
 dump_port = 9912
 mail_smtp_port = 1025
 mail_ui_port = 8025
-mcp_port = 9900
 ```
 
 ## PHP resolution
@@ -97,10 +109,10 @@ Hearth finds PHP binaries in this order:
 ## Roadmap
 
 - [x] Phase 1: Core CLI + daemon, process supervision, site/PHP management
-- [x] Phase 2: MCP server, Mailpit, dump server, Homebrew distribution
-- [ ] Phase 3: Tauri GUI with system tray
+- [x] Phase 2: Mailpit, dump server, Homebrew distribution
+- [ ] Phase 3: `hearth add` — guided package installer (Horizon, Telescope, Pulse, Reverb)
 - [ ] Phase 4: Database management (MySQL, PostgreSQL, Redis)
-- [ ] Phase 5: Anvil worktree integration, Ploi deployment
+- [ ] Phase 5: Log streaming per site, Scribe skill publishing
 
 ## License
 
