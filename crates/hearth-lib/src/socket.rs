@@ -80,14 +80,14 @@ pub enum DaemonResponse {
     Pong,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceStatus {
     pub name: String,
     pub state: String,
     pub pid: Option<u32>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteInfo {
     pub name: String,
     pub path: String,
@@ -95,7 +95,7 @@ pub struct SiteInfo {
     pub php_version: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhpVersionInfo {
     pub version: String,
     pub path: String,

@@ -62,7 +62,7 @@ tar = "0.4"
 zip = "2"
 
 # GUI (Phase 3)
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-notification = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
