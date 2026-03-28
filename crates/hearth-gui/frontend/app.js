@@ -1,13 +1,19 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
-// Panel navigation
+const MAX_LINES = 5000;
+const MAX_BUFFER_LINES = 1000;
+
+// Panel navigation + data refresh on switch
+const panelRefreshMap = { services: refreshServices, sites: refreshSites, php: refreshPhp };
 document.querySelectorAll('.nav-item').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
     btn.classList.add('active');
     document.getElementById(`panel-${btn.dataset.panel}`).classList.add('active');
+    const fn_ = panelRefreshMap[btn.dataset.panel];
+    if (fn_) fn_();
   });
 });
 
@@ -116,7 +122,13 @@ let dumpPaused = false;
 let dumpBuffer = [];
 
 listen('dump-line', (event) => {
-  if (dumpPaused) { dumpBuffer.push(event.payload); return; }
+  if (dumpPaused) {
+    dumpBuffer.push(event.payload);
+    if (dumpBuffer.length > MAX_BUFFER_LINES) {
+      dumpBuffer = dumpBuffer.slice(dumpBuffer.length - MAX_BUFFER_LINES);
+    }
+    return;
+  }
   appendDumpLine(event.payload);
 });
 listen('dump-connected', () => {
@@ -129,6 +141,10 @@ listen('dump-disconnected', () => {
 function appendDumpLine(line) {
   const output = document.getElementById('dump-output');
   output.textContent += line + '\n';
+  const lines = output.textContent.split('\n');
+  if (lines.length > MAX_LINES) {
+    output.textContent = lines.slice(lines.length - MAX_LINES).join('\n');
+  }
   output.scrollTop = output.scrollHeight;
 }
 
@@ -141,14 +157,6 @@ document.getElementById('dump-clear-btn').addEventListener('click', () => {
   document.getElementById('dump-output').textContent = '';
 });
 
-// Panel switch triggers refresh
-const panelRefreshMap = { services: refreshServices, sites: refreshSites, php: refreshPhp };
-document.querySelectorAll('.nav-item').forEach(btn => {
-  btn.addEventListener('click', () => {
-    const fn = panelRefreshMap[btn.dataset.panel];
-    if (fn) fn();
-  });
-});
 
 // Initial load
 refreshServices();

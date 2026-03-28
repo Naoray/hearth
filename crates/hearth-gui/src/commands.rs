@@ -157,11 +157,10 @@ pub async fn ensure_daemon() -> Result<String, String> {
         .spawn()
         .map_err(|e| format!("failed to spawn hearth-daemon: {e}"))?;
 
-    // Wait up to 2 seconds for socket to appear
-    let socket = hearth_lib::socket::socket_path();
+    // Wait up to 2 seconds for daemon to respond
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if socket.exists() && client.is_daemon_running().await {
+        if client.is_daemon_running().await {
             return Ok("daemon started".to_string());
         }
     }

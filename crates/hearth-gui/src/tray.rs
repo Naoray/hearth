@@ -9,7 +9,8 @@ use tokio::sync::Mutex;
 use crate::notifications::NotificationDebouncer;
 
 /// Tray icon state derived from service health.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TrayState {
     /// All services running
     Green,
@@ -66,6 +67,10 @@ pub async fn poll_status(client: &DaemonClient) -> (TrayState, String, Vec<Servi
     match resp {
         Ok(DaemonResponse::Status { services }) => {
             let total = services.len();
+            if total == 0 {
+                return (TrayState::Grey, "no services registered".to_string(), vec![]);
+            }
+
             let running = services.iter().filter(|s| s.state == "Running").count();
             let failed = services
                 .iter()
@@ -74,7 +79,7 @@ pub async fn poll_status(client: &DaemonClient) -> (TrayState, String, Vec<Servi
 
             let (state, tooltip) = if failed > 0 {
                 (TrayState::Red, format!("{failed} service(s) failed"))
-            } else if running == total && total > 0 {
+            } else if running == total {
                 (
                     TrayState::Green,
                     format!("all {total} services running"),
@@ -101,9 +106,17 @@ pub async fn poll_status(client: &DaemonClient) -> (TrayState, String, Vec<Servi
 /// Payload emitted to the frontend on tray status changes.
 #[derive(Debug, Clone, serde::Serialize)]
 struct TrayStatusPayload {
-    state: String,
+    state: TrayState,
     tooltip: String,
     services: Vec<ServiceStatus>,
+}
+
+/// Check whether the service list changed (by name + state).
+fn services_changed(prev: &[ServiceStatus], current: &[ServiceStatus]) -> bool {
+    if prev.len() != current.len() {
+        return true;
+    }
+    prev.iter().zip(current.iter()).any(|(a, b)| a.name != b.name || a.state != b.state)
 }
 
 /// Background polling loop that updates the tray icon and emits events.
@@ -111,42 +124,43 @@ async fn polling_loop(app: AppHandle) {
     let client = DaemonClient::new();
     let debouncer = Arc::new(Mutex::new(NotificationDebouncer::new()));
     let mut prev_services: Vec<ServiceStatus> = Vec::new();
+    let mut prev_state: Option<TrayState> = None;
 
     loop {
         let (state, tooltip, services) = poll_status(&client).await;
 
-        // Update tray tooltip and icon
-        if let Some(tray) = app.tray_by_id("main") {
-            let icon_rgba: &[u8] = match state {
-                TrayState::Green => include_bytes!("../icons/tray-green.png"),
-                TrayState::Yellow => include_bytes!("../icons/tray-yellow.png"),
-                TrayState::Red => include_bytes!("../icons/tray-red.png"),
-                TrayState::Grey => include_bytes!("../icons/tray-grey.png"),
-            };
-            if let Ok(icon) = tauri::image::Image::from_bytes(icon_rgba) {
-                let _ = tray.set_icon(Some(icon));
+        // Only update tray icon and tooltip when state changed
+        let state_changed = prev_state != Some(state);
+        if state_changed {
+            if let Some(tray) = app.tray_by_id("main") {
+                let icon_rgba: &[u8] = match state {
+                    TrayState::Green => include_bytes!("../icons/tray-green.png"),
+                    TrayState::Yellow => include_bytes!("../icons/tray-yellow.png"),
+                    TrayState::Red => include_bytes!("../icons/tray-red.png"),
+                    TrayState::Grey => include_bytes!("../icons/tray-grey.png"),
+                };
+                if let Ok(icon) = tauri::image::Image::from_bytes(icon_rgba) {
+                    let _ = tray.set_icon(Some(icon));
+                }
+                let _ = tray.set_tooltip(Some(&tooltip));
             }
-            let _ = tray.set_tooltip(Some(&tooltip));
         }
 
-        // Emit event to frontend
-        let state_str = match state {
-            TrayState::Green => "green",
-            TrayState::Yellow => "yellow",
-            TrayState::Red => "red",
-            TrayState::Grey => "grey",
-        };
-        let _ = app.emit(
-            "tray-status-changed",
-            TrayStatusPayload {
-                state: state_str.to_string(),
-                tooltip: tooltip.clone(),
-                services: services.clone(),
-            },
-        );
+        // Only emit event to frontend when services actually changed
+        if state_changed || services_changed(&prev_services, &services) {
+            let _ = app.emit(
+                "tray-status-changed",
+                TrayStatusPayload {
+                    state,
+                    tooltip: tooltip.clone(),
+                    services: services.clone(),
+                },
+            );
+        }
 
         // Check for state transitions and send notifications
         check_state_transitions(&app, &debouncer, &prev_services, &services).await;
+        prev_state = Some(state);
         prev_services = services;
 
         tokio::time::sleep(Duration::from_secs(5)).await;

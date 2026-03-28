@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 /// is timestamped and emitted as a `dump-line` event to the frontend.
 pub fn start_dump_listener(app: &AppHandle, dump_port: u16) {
     let app_handle = app.clone();
-    let relay_port = dump_port + 1;
+    let relay_port = hearth_lib::dump::relay_port(dump_port);
 
     tauri::async_runtime::spawn(async move {
         loop {
