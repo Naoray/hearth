@@ -10,6 +10,7 @@ pub mod env_file;
 pub mod horizon;
 pub mod laravel;
 pub mod prompt;
+pub mod pulse;
 pub mod recipe;
 pub mod reverb;
 pub mod site_context;
@@ -58,8 +59,8 @@ pub fn apply_recipe(
         "telescope" => telescope::apply(ctx, answers),
         "horizon" => horizon::apply(ctx, answers),
         "reverb" => reverb::apply(ctx, answers),
-        // "pulse"     => pulse::apply(ctx, answers),
-        other => anyhow::bail!("unknown or not-yet-implemented package: {other}"),
+        "pulse" => pulse::apply(ctx, answers),
+        other => anyhow::bail!("unknown package: {other}"),
     }
 }
 

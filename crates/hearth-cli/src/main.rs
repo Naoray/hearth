@@ -665,7 +665,7 @@ async fn run_add(
         AddPackage::Telescope => telescope_prompts(yes)?,
         AddPackage::Horizon => horizon_prompts(yes)?,
         AddPackage::Reverb => reverb_prompts(yes)?,
-        AddPackage::Pulse => anyhow::bail!("hearth add pulse: recipe arrives in v0.3.0 Task 6"),
+        AddPackage::Pulse => pulse_prompts(yes)?,
     };
 
     // Up-front message so the user knows composer-require can take 30-90s. The actual
@@ -839,6 +839,25 @@ fn reverb_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
         .interact()?;
     answers.reverb_scheme = Some(schemes[idx].to_string());
 
+    Ok(answers)
+}
+
+/// Collect Pulse-specific answers. Single prompt: storage driver (default: database).
+/// The `pulse_ingest_trim_lottery` advanced prompt is intentionally dropped
+/// (dissent D3 in scratchpad 796) — defaults to Pulse's own default of 100.
+fn pulse_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
+    let mut answers = AddAnswers::default();
+    if yes {
+        answers.pulse_storage_driver = Some("database".to_string());
+        return Ok(answers);
+    }
+    let drivers = ["database", "redis"];
+    let idx = dialoguer::Select::new()
+        .with_prompt("Pulse storage driver")
+        .items(&drivers)
+        .default(0)
+        .interact()?;
+    answers.pulse_storage_driver = Some(drivers[idx].to_string());
     Ok(answers)
 }
 
