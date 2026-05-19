@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use command_group::{CommandGroup, GroupChild};
 use tokio::time;
@@ -8,16 +9,46 @@ use tracing::{error, info, warn};
 
 use super::{CircuitBreaker, ServiceKind, ServiceState};
 
+/// How to bring a service down cleanly.
+///
+/// Default is fine for stateless services (mailpit, nginx, redis). DB engines
+/// that hold open WAL/InnoDB state need a longer grace window — SIGKILLing a
+/// mid-flush mysqld shreds `ib_logfile`. Postgres prefers `pg_ctl stop -m fast`
+/// for a coordinated checkpoint before any signal is sent.
+#[derive(Debug, Clone)]
+pub enum ShutdownStrategy {
+    /// SIGTERM to the process group, 5s grace, then SIGKILL.
+    Default,
+    /// SIGTERM, `grace_ms` wait, then SIGKILL. For mysqld (~20s).
+    LongGrace { grace_ms: u64 },
+    /// `pg_ctl stop -m fast -D <datadir>` first; falls back to SIGTERM + 20s
+    /// grace + SIGKILL if pg_ctl fails or isn't on disk.
+    Postgres {
+        datadir: PathBuf,
+        pg_ctl_binary: PathBuf,
+    },
+}
+
+impl ShutdownStrategy {
+    fn grace(&self) -> Duration {
+        match self {
+            Self::Default => Duration::from_secs(5),
+            Self::LongGrace { grace_ms } => Duration::from_millis(*grace_ms),
+            Self::Postgres { .. } => Duration::from_secs(20),
+        }
+    }
+}
+
 /// Manages a single supervised service process.
 ///
-/// Each service runs in its own process group via `command-group`.
-/// On shutdown, SIGTERM is sent to the entire group, followed by
-/// SIGKILL after a timeout — guaranteeing no orphan processes.
+/// Each service runs in its own process group via `command-group`. Shutdown is
+/// driven by [`ShutdownStrategy`]; see that enum for engine-specific tuning.
 pub struct ManagedService {
     pub kind: ServiceKind,
     pub state: ServiceState,
     pub child: Option<GroupChild>,
     pub circuit_breaker: CircuitBreaker,
+    pub shutdown_strategy: ShutdownStrategy,
     command: String,
     args: Vec<String>,
 }
@@ -29,9 +60,16 @@ impl ManagedService {
             state: ServiceState::Stopped,
             child: None,
             circuit_breaker: CircuitBreaker::new(3, Duration::from_secs(60)),
+            shutdown_strategy: ShutdownStrategy::Default,
             command,
             args,
         }
+    }
+
+    /// Builder: set the shutdown strategy for this service.
+    pub fn with_shutdown_strategy(mut self, strategy: ShutdownStrategy) -> Self {
+        self.shutdown_strategy = strategy;
+        self
     }
 
     /// Start the service in a new process group.
@@ -52,28 +90,86 @@ impl ManagedService {
         Ok(())
     }
 
-    /// Stop the service by sending SIGTERM to the process group,
-    /// then SIGKILL after 5 seconds if still alive.
+    /// Stop the service. Strategy:
+    /// - `Postgres` → `pg_ctl stop -m fast` first, then signals on fallback.
+    /// - All others → SIGTERM to the process group, poll until grace expires,
+    ///   then SIGKILL.
     pub fn stop(&mut self) -> anyhow::Result<()> {
-        if let Some(mut child) = self.child.take() {
-            let pid = child.id();
-            info!(service = %self.kind, pid, "stopping service");
+        let Some(mut child) = self.child.take() else {
+            self.state = ServiceState::Stopped;
+            return Ok(());
+        };
 
-            // Send SIGTERM to process group
-            let _ = child.kill();
+        let pid = child.id();
+        info!(service = %self.kind, pid, "stopping service");
 
-            // Wait briefly, then force kill if needed
-            match child.try_wait()? {
-                Some(_status) => {
-                    info!(service = %self.kind, "service stopped cleanly");
+        let mut needs_signal = true;
+
+        if let ShutdownStrategy::Postgres { datadir, pg_ctl_binary } = &self.shutdown_strategy {
+            // `pg_ctl stop -m fast` does a clean shutdown with a checkpoint.
+            match std::process::Command::new(pg_ctl_binary)
+                .args(["stop", "-m", "fast", "-w", "-D"])
+                .arg(datadir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                Ok(status) if status.success() => {
+                    info!(service = %self.kind, "pg_ctl stop succeeded");
+                    needs_signal = false;
                 }
-                None => {
-                    warn!(service = %self.kind, "service did not stop, force killing");
-                    let _ = child.kill();
-                    let _ = child.wait();
+                Ok(status) => {
+                    warn!(
+                        service = %self.kind,
+                        code = ?status.code(),
+                        "pg_ctl stop returned non-zero; falling back to SIGTERM"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        service = %self.kind,
+                        error = %e,
+                        "pg_ctl invocation failed; falling back to SIGTERM"
+                    );
                 }
             }
         }
+
+        if needs_signal {
+            let pgid = nix::unistd::Pid::from_raw(pid as i32);
+            if let Err(e) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM) {
+                // ESRCH ("no such process") is fine — child already exited.
+                if e != nix::errno::Errno::ESRCH {
+                    warn!(service = %self.kind, error = %e, "SIGTERM to group failed");
+                }
+            }
+        }
+
+        let grace = self.shutdown_strategy.grace();
+        let deadline = Instant::now() + grace;
+        loop {
+            match child.try_wait()? {
+                Some(_status) => {
+                    info!(service = %self.kind, "service stopped cleanly");
+                    self.state = ServiceState::Stopped;
+                    return Ok(());
+                }
+                None => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+
+        warn!(
+            service = %self.kind,
+            grace_ms = grace.as_millis() as u64,
+            "service did not stop within grace window — sending SIGKILL"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
         self.state = ServiceState::Stopped;
         Ok(())
     }

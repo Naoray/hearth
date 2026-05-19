@@ -29,6 +29,15 @@ pub struct HearthConfig {
     /// Port for the MCP (Model Context Protocol) server
     pub mcp_port: u16,
 
+    /// Port for MySQL/MariaDB (default: 3306)
+    pub mysql_port: u16,
+
+    /// Port for Postgres (default: 5432)
+    pub postgres_port: u16,
+
+    /// Port for Redis (default: 6379)
+    pub redis_port: u16,
+
     /// Paths to parked directories
     pub parked_paths: Vec<PathBuf>,
 }
@@ -44,6 +53,9 @@ impl Default for HearthConfig {
             mail_ui_port: 8025,
             ploi_api_token: None,
             mcp_port: 9900,
+            mysql_port: 3306,
+            postgres_port: 5432,
+            redis_port: 6379,
             parked_paths: Vec::new(),
         }
     }
@@ -138,6 +150,38 @@ mod tests {
     fn default_config_has_mcp_port() {
         let config = HearthConfig::default();
         assert_eq!(config.mcp_port, 9900);
+    }
+
+    #[test]
+    fn default_config_has_db_ports() {
+        let config = HearthConfig::default();
+        assert_eq!(config.mysql_port, 3306);
+        assert_eq!(config.postgres_port, 5432);
+        assert_eq!(config.redis_port, 6379);
+    }
+
+    #[test]
+    fn load_legacy_config_without_db_fields() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        // Pre-DB v0.2.x config — mcp_port present, no db_* keys.
+        std::fs::write(&config_path, r#"
+tld = "test"
+default_php = "8.4"
+dns_port = 5354
+dump_port = 9912
+mail_smtp_port = 1025
+mail_ui_port = 8025
+mcp_port = 9900
+parked_paths = []
+"#).unwrap();
+
+        let config = HearthConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.mysql_port, 3306);
+        assert_eq!(config.postgres_port, 5432);
+        assert_eq!(config.redis_port, 6379);
+        assert_eq!(config.tld, "test");
+        assert_eq!(config.default_php, "8.4");
     }
 
     #[test]

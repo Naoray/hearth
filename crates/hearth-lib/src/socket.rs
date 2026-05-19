@@ -32,6 +32,12 @@ pub enum DaemonRequest {
     Sites,
     /// Ping (health check)
     Ping,
+    /// Start a DB engine (mysql, postgres, redis) or all DB engines when `engine` is None.
+    DbStart { engine: Option<String> },
+    /// Stop a DB engine, or all DB engines when `engine` is None.
+    DbStop { engine: Option<String> },
+    /// Report status of all DB engines (registered + not registered).
+    DbStatus,
 }
 
 /// Responses from the daemon to clients.
@@ -48,6 +54,14 @@ pub enum DaemonResponse {
     Sites { sites: Vec<SiteInfo> },
     /// List of PHP versions
     PhpVersions { versions: Vec<PhpVersionInfo> },
+    /// DB engine status report (one row per known engine).
+    DbStatus { engines: Vec<DbEngineStatus> },
+    /// Typed port-collision response from a Db dispatch handler.
+    Conflict {
+        engine: String,
+        port: u16,
+        owner_hint: Option<String>,
+    },
     /// Pong (health check response)
     Pong,
 }
@@ -72,6 +86,26 @@ pub struct PhpVersionInfo {
     pub version: String,
     pub path: String,
     pub active: bool,
+}
+
+/// One row in a `DbStatus` response.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbEngineStatus {
+    /// Canonical engine name: `mysql`, `postgresql`, `redis`.
+    pub engine: String,
+    /// One of: `running`, `stopped`, `starting`, `failed:<reason>`, `not_registered`.
+    pub state: String,
+    /// PID iff state is `running`.
+    pub pid: Option<u32>,
+    /// Configured port for this engine.
+    pub port: u16,
+    /// Absolute path to this engine's data directory.
+    pub data_dir: String,
+    /// True when the port is bound by a process Hearth is *not* supervising
+    /// (e.g. Herd Pro, Homebrew services, ad-hoc engine).
+    pub conflict_port: bool,
+    /// Optional hint about who owns the conflicting port (e.g. a launchd label).
+    pub owner_hint: Option<String>,
 }
 
 /// Socket path for daemon communication.
@@ -101,6 +135,11 @@ mod tests {
             DaemonRequest::PhpConfig { version: "active".to_string(), key: "memory_limit".to_string(), value: "512M".to_string() },
             DaemonRequest::Secure { name: "mysite".to_string() },
             DaemonRequest::Unsecure { name: "mysite".to_string() },
+            DaemonRequest::DbStart { engine: None },
+            DaemonRequest::DbStart { engine: Some("postgres".to_string()) },
+            DaemonRequest::DbStop { engine: None },
+            DaemonRequest::DbStop { engine: Some("redis".to_string()) },
+            DaemonRequest::DbStatus,
         ];
 
         for request in cases {
@@ -140,6 +179,22 @@ mod tests {
                     path: "/usr/bin/php".to_string(),
                     active: true,
                 }],
+            },
+            DaemonResponse::DbStatus {
+                engines: vec![DbEngineStatus {
+                    engine: "postgresql".to_string(),
+                    state: "running".to_string(),
+                    pid: Some(4242),
+                    port: 5432,
+                    data_dir: "/Users/x/.config/hearth/data/postgresql".to_string(),
+                    conflict_port: false,
+                    owner_hint: None,
+                }],
+            },
+            DaemonResponse::Conflict {
+                engine: "mysql".to_string(),
+                port: 3306,
+                owner_hint: Some("homebrew.mxcl.mysql".to_string()),
             },
         ];
 

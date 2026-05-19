@@ -152,6 +152,42 @@ else
     fail "MCP endpoint not reachable at :9900"
 fi
 
+# ── 10. DB engines ───────────────────────────────────────────────
+info "Testing DB engine commands..."
+
+# Status — must succeed even when zero engines are installed.
+if OUTPUT=$($CLI db status 2>&1); then
+    pass "hearth db status — command succeeded"
+else
+    fail "hearth db status — failed"
+fi
+
+# JSON output is parseable (when python3 is available).
+if command -v python3 >/dev/null 2>&1; then
+    if $CLI db status --json 2>/dev/null | python3 -c 'import sys, json; json.load(sys.stdin)'; then
+        pass "hearth db status --json — valid JSON"
+    else
+        fail "hearth db status --json — output is not valid JSON"
+    fi
+else
+    warn "python3 missing — skipping --json parse check"
+fi
+
+# Start postgres — soft pass: started OR not registered OR conflict.
+OUTPUT=$($CLI db start postgres 2>&1) || true
+if echo "$OUTPUT" | grep -qiE "started|not registered|already running|conflict|in use"; then
+    pass "hearth db start postgres — expected response"
+else
+    fail "hearth db start postgres — unexpected: $OUTPUT"
+fi
+
+# Stop all — must not fail even if nothing is running.
+if OUTPUT=$($CLI db stop 2>&1); then
+    pass "hearth db stop — accepted"
+else
+    fail "hearth db stop — failed: $OUTPUT"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
