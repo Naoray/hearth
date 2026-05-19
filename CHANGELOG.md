@@ -2,9 +2,41 @@
 
 All notable changes to Hearth will be documented in this file.
 
-## [Unreleased]
+## [0.3.0] - 2026-05-26
 
 ### Added
+- **`hearth add <package>`** — guided Laravel package installer for `horizon`,
+  `telescope`, `pulse`, and `reverb`. Each recipe runs `composer require`
+  through the site's resolved PHP binary, walks the per-package `artisan`
+  scaffolding steps, and patches `.env` with a backup written to
+  `.env.hearth.YYYYMMDD-HHMMSS-NNNNNNNNN-PID.bak`.
+- Horizon and Reverb workers are registered as supervised process-group
+  children via new `ServiceKind::Horizon` and `ServiceKind::Reverb`. Their
+  spec is persisted in `HearthConfig.added_packages` so `hearth daemon`
+  restarts re-register them. Boot-time prune drops entries whose
+  `<site_path>/vendor/<vendor>/<pkg>` no longer exists on disk (closes the
+  gap left by `hearth remove` arriving later).
+- `ManagedService::with_cwd(...)` / `with_cwd_and_site(...)` + a new
+  `site_name: Option<String>` field. Display name on multi-site workers
+  reads `horizon[shopfront]` / `reverb[chatapp]`.
+- `HearthConfig.composer_phar`: absolute path to `composer.phar`, resolved
+  during `hearth install` (Homebrew Cellar layout, with a runtime probe
+  fallback in the daemon). Composer always runs as
+  `<site_php> -d memory_limit=-1 <phar> require ...` — bypasses the brew
+  `composer` bash wrapper, which uses the system PHP and breaks
+  Valet-isolated sites.
+- `DaemonState.add_lock` serializes concurrent `hearth add` invocations so
+  `.env` edits + supervisor registration don't race.
+- Dialoguer-driven interactive prompts in the CLI (telescope environments,
+  horizon connection / environment / max processes, reverb host / port /
+  hostname / scheme, pulse storage driver). `--yes` accepts all defaults.
+  Reverb auto-bumps the default port across `8080..=8099` if `--yes` lands
+  on a busy port (caps at 20 tries).
+- stdlib `std::io::IsTerminal` non-TTY guard — refuses to prompt without
+  `--yes` when stdin is piped.
+- `DaemonRequest::Add { package, site_path, answers, no_supervise, dry_run }`
+  + `AddAnswers` over the socket protocol.
+
 - **`hearth db` subcommand** with `start`, `stop`, `restart`, `status [--json]`
   for MySQL/MariaDB, PostgreSQL, and Redis. Engines are supervised process
   groups with the existing 3-in-60s circuit breaker.
@@ -40,6 +72,17 @@ All notable changes to Hearth will be documented in this file.
 ### Changed
 - `ManagedService::stop()` now blocks for the strategy's grace window
   (previously SIGKILLed immediately after a single non-blocking `try_wait`).
+
+### Notes
+- v0.3.0 ships single-site Horizon/Reverb. A second `hearth add horizon`
+  against a different linked site errors with a clear "multi-site arrives
+  in v0.3.1" message rather than silently colliding on the supervisor's
+  state.
+- Telescope intentionally does not regex-patch
+  `TelescopeServiceProvider::gate()`. A post-install hint reminds users
+  to gate it manually in production.
+- Pulse `pulse:check` recorder is install-only in v0.3.0; not registered
+  as a supervised worker.
 
 ## [0.2.3] - 2026-03-23
 
