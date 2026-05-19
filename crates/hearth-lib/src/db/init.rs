@@ -58,7 +58,9 @@ set -euo pipefail
 DATA_DIR={data}
 RUN_DIR={run}
 SENTINEL="$DATA_DIR/.hearth-init-complete"
-LOCK_DIR="$DATA_DIR/.init.lockd"
+# Lock dir lives in RUN_DIR, not DATA_DIR — engine init utilities refuse to
+# operate on a non-empty datadir, so the lock cannot share the datadir.
+LOCK_DIR="$RUN_DIR/{engine}.init.lockd"
 
 mkdir -p "$DATA_DIR" "$RUN_DIR"
 {dir_mode}
@@ -84,7 +86,6 @@ if [ ! -f "$SENTINEL" ]; then
     # but the completion sentinel is missing. Refuse to proceed — manual
     # recovery required.
     half_init=$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 \
-        ! -name '.init.lockd' \
         ! -name '.hearth-init-complete' \
         -print -quit 2>/dev/null || true)
     if [ -n "$half_init" ]; then
