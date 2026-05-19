@@ -45,11 +45,11 @@ Install the engines via Homebrew (cache-based install lands in a later phase):
 brew install postgresql@17 redis mysql
 ```
 
-Hearth picks them up automatically. Port collisions with Herd Pro Services panel
-are auto-detected: when the configured port is already bound, that engine is
-skipped at registration and `hearth db status` reports `conflict_port: true` so
-you know to stop the colliding service (`brew services stop ...` or quit Herd's
-panel).
+Hearth picks them up automatically. Port collisions with another tool already
+managing the same DB (Herd's services panel, `brew services`, etc.) are
+auto-detected: when the configured port is already bound, that engine is
+skipped at registration and `hearth db status` reports `conflict_port: true`
+so you know which colliding service to stop.
 
 ## Install
 
