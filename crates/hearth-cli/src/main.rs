@@ -117,9 +117,9 @@ enum Commands {
 
     /// Install a known Laravel package (horizon, telescope, pulse, reverb).
     ///
-    /// Foundation v0.3.0: subcommand + protocol wired; recipes land per package in
-    /// subsequent tasks. Until a recipe ships for the requested package, the daemon
-    /// returns a "not yet implemented" error.
+    /// Walks `composer require` + `php artisan` against the Laravel site at --site
+    /// (or the first linked site reached by walking up from cwd). Horizon and Reverb
+    /// additionally register a supervised worker that survives daemon restart.
     Add {
         /// Package to install
         #[arg(value_enum)]
@@ -269,24 +269,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Add {
             package,
             site,
-            yes: _,
+            yes,
             no_supervise,
             dry_run,
         } => {
-            // Task 1 ships the protocol wire; Task 3 will add the dialoguer prompt loop
-            // and call `hearth_lib::add::apply_recipe`. Until then, send empty answers
-            // — the daemon stub returns a clear "not yet implemented" message.
-            let site_path = match site {
-                Some(p) => p.to_string_lossy().to_string(),
-                None => std::env::current_dir()?.to_string_lossy().to_string(),
-            };
-            DaemonRequest::Add {
-                package: package.as_key().to_string(),
-                site_path,
-                answers: AddAnswers::default(),
-                no_supervise,
-                dry_run,
-            }
+            return run_add(package, site, yes, no_supervise, dry_run).await;
         }
     };
 
@@ -463,7 +450,15 @@ async fn run_install() -> anyhow::Result<()> {
     println!("\n[2/3] Creating config directory...");
     let config_dir = hearth_lib::config_dir();
     std::fs::create_dir_all(&config_dir)?;
-    let config = hearth_lib::config::HearthConfig::default();
+    let mut config = hearth_lib::config::HearthConfig::default();
+    // Resolve composer.phar up-front so `hearth add` can shell out via the site's PHP
+    // (avoids the brew composer wrapper, which uses the system PHP — scratchpad 796 B3).
+    config.composer_phar = hearth_lib::add::composer::resolve_composer_phar();
+    if let Some(ref phar) = config.composer_phar {
+        println!("  Resolved composer.phar → {}", phar.display());
+    } else {
+        println!("  Warning: composer.phar not found on host. `hearth add` will probe at request time.");
+    }
     config.save()?;
     println!("  Config saved to {}", config_dir.display());
 
@@ -640,6 +635,96 @@ async fn run_laravel(command: LaravelCommands) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Drive `hearth add <package>` — interactive prompts when on a TTY, deterministic
+/// defaults under `--yes`. Sends the populated `AddAnswers` to the daemon and prints
+/// the response.
+///
+/// `IsTerminal` from stdlib (Rust 1.70+) avoids the deprecated `atty` crate.
+async fn run_add(
+    package: AddPackage,
+    site: Option<PathBuf>,
+    yes: bool,
+    no_supervise: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+
+    if !yes && !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "refusing to prompt on non-TTY; pass --yes to accept defaults"
+        );
+    }
+
+    let site_path = site
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let answers = match package {
+        AddPackage::Telescope => telescope_prompts(yes)?,
+        AddPackage::Horizon => {
+            // Recipe ships in Task 4; CLI prompts wire then.
+            anyhow::bail!("hearth add horizon: recipe arrives in v0.3.0 Task 4");
+        }
+        AddPackage::Pulse => anyhow::bail!("hearth add pulse: recipe arrives in v0.3.0 Task 6"),
+        AddPackage::Reverb => anyhow::bail!("hearth add reverb: recipe arrives in v0.3.0 Task 5"),
+    };
+
+    // Up-front message so the user knows composer-require can take 30-90s. The actual
+    // log file is written by the daemon once composer finishes (streaming protocol is
+    // Phase 4 per plan §R2 / hearth-add plan).
+    let log_path = hearth_lib::log_dir().join(format!("add-{}.log", package.as_key()));
+    if !dry_run {
+        eprintln!(
+            "► running composer require + artisan (can take 30-90s; daemon log: {})",
+            log_path.display()
+        );
+    }
+
+    let request = DaemonRequest::Add {
+        package: package.as_key().to_string(),
+        site_path,
+        answers,
+        no_supervise,
+        dry_run,
+    };
+
+    let response = send_to_daemon(request).await?;
+    print_response(response);
+    Ok(())
+}
+
+/// Collect Telescope-specific answers. With `--yes`, takes defaults:
+/// telescope_environments = ["local"], telescope_enable_in_prod = false.
+fn telescope_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
+    let mut answers = AddAnswers::default();
+    if yes {
+        answers.telescope_environments = Some(vec!["local".to_string()]);
+        answers.telescope_enable_in_prod = Some(false);
+        return Ok(answers);
+    }
+
+    let env_choices = ["local", "staging", "production"];
+    let defaults = [true, false, false];
+    let selected_idx = dialoguer::MultiSelect::new()
+        .with_prompt("Enable Telescope in which environments? (space to toggle, enter to accept)")
+        .items(&env_choices)
+        .defaults(&defaults)
+        .interact()?;
+    let selected: Vec<String> = selected_idx
+        .iter()
+        .map(|&i| env_choices[i].to_string())
+        .collect();
+    answers.telescope_environments = Some(selected);
+
+    let in_prod = dialoguer::Confirm::new()
+        .with_prompt("Will Telescope run in production?")
+        .default(false)
+        .interact()?;
+    answers.telescope_enable_in_prod = Some(in_prod);
+
+    Ok(answers)
 }
 
 /// Stdio-to-HTTP bridge for MCP clients that only support stdio transport.

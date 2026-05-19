@@ -606,19 +606,96 @@ async fn process_request(
 
         DaemonRequest::Add {
             package,
-            site_path: _,
-            answers: _,
-            no_supervise: _,
-            dry_run: _,
+            site_path,
+            answers,
+            no_supervise,
+            dry_run,
         } => {
-            // Recipes land in Task 2+. Foundation only wires the request type, the
-            // serialization protocol, and the add_lock; concurrent Add invocations
-            // serialize here even though the handler body is still a stub.
+            // Hold the add lock for the duration so concurrent Add invocations
+            // (e.g. scripted `hearth add horizon && hearth add telescope`) don't race
+            // on .env editing or supervisor registration.
             let _guard = state.add_lock.lock().await;
-            DaemonResponse::Error {
-                message: format!(
-                    "hearth add {package}: recipe not yet implemented (foundation v0.3.0)"
-                ),
+
+            // Snapshot config (read-only fields) under the config lock, then drop.
+            // Lock order: config -> site_manager. apply_recipe runs lock-free.
+            let (composer_phar_cfg, default_php_clone) = {
+                let cfg = state.config.lock().await;
+                (cfg.composer_phar.clone(), cfg.default_php.clone())
+            };
+
+            // Compose-phar fallback: if config doesn't have it, probe the host. Lets
+            // existing installs work without re-running `hearth install`.
+            let composer_phar = composer_phar_cfg
+                .or_else(hearth_lib::add::composer::resolve_composer_phar);
+
+            // Resolve site context under site_manager lock.
+            let site_path_buf = PathBuf::from(&site_path);
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            let snapshot_config = HearthConfig {
+                default_php: default_php_clone,
+                ..HearthConfig::default()
+            };
+            let config_dir = hearth_lib::config_dir();
+            let ctx_resolution = {
+                let sm = state.site_manager.lock().await;
+                let explicit: Option<&std::path::Path> = if site_path.is_empty() {
+                    None
+                } else {
+                    Some(&site_path_buf)
+                };
+                hearth_lib::add::site_context::resolve(
+                    explicit,
+                    &cwd,
+                    &sm,
+                    &snapshot_config,
+                    &config_dir,
+                )
+            };
+            let site_ctx = match ctx_resolution {
+                Ok(s) => s,
+                Err(e) => {
+                    return DaemonResponse::Error {
+                        message: format!("hearth add {package}: {e}"),
+                    };
+                }
+            };
+
+            // Build the per-request log file path so the CLI can `tail -f` it.
+            let log_path = hearth_lib::log_dir().join(format!("add-{package}.log"));
+
+            let recipe_ctx = hearth_lib::add::recipe::RecipeContext {
+                site_path: site_ctx.site.path.clone(),
+                site_name: site_ctx.site.name.clone(),
+                php_binary: site_ctx.php_binary.clone(),
+                composer_phar,
+                no_supervise,
+                dry_run,
+                log_path: Some(log_path),
+                now: chrono::Utc::now(),
+            };
+
+            let outcome = match hearth_lib::add::apply_recipe(&package, &recipe_ctx, &answers) {
+                Ok(o) => o,
+                Err(e) => {
+                    return DaemonResponse::Error {
+                        message: format!("hearth add {package} failed: {e}"),
+                    };
+                }
+            };
+
+            // Persistence of AddedPackage + supervised registration arrives in Task 4
+            // (Horizon). Telescope/Pulse return outcome.supervised = None so this branch
+            // is dormant for them.
+            if outcome.supervised.is_some() && !no_supervise && !dry_run {
+                // TODO(Task 4/5): persist AddedPackage and register with supervisor.
+                warn!(
+                    package = %package,
+                    "supervised registration not yet wired (Task 4)",
+                );
+            }
+
+            DaemonResponse::Ok {
+                message: Some(hearth_lib::add::format_outcome(&package, &outcome)),
             }
         }
 

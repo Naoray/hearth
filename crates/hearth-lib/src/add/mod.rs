@@ -61,6 +61,43 @@ pub fn apply_recipe(
     }
 }
 
+/// Render a `RecipeOutcome` as a user-facing block. Daemon returns this as the body
+/// of `DaemonResponse::Ok { message }`.
+pub fn format_outcome(package: &str, outcome: &RecipeOutcome) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("hearth add {package} — done"));
+    if outcome.composer_ran {
+        lines.push(format!("► composer require laravel/{package}"));
+    } else if outcome.composer_skipped {
+        lines.push(format!("► composer require skipped (laravel/{package} already required)"));
+    }
+    for call in &outcome.artisan_calls {
+        lines.push(format!("► php artisan {call}"));
+    }
+    if !outcome.env_keys_written.is_empty() {
+        lines.push(format!(
+            "► .env patched ({})",
+            outcome.env_keys_written.join(", ")
+        ));
+    }
+    for backup in &outcome.backup_paths {
+        lines.push(format!("  backup: {}", backup.display()));
+    }
+    if let Some(spec) = &outcome.supervised {
+        lines.push(format!(
+            "► supervised: {}[{}] — {} {}",
+            spec.package,
+            spec.site_name,
+            spec.command,
+            spec.args.join(" ")
+        ));
+    }
+    for hint in &outcome.hints {
+        lines.push(format!("ℹ {hint}"));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +129,28 @@ mod tests {
         let ctx = RecipeContext::for_test(PathBuf::from("/tmp/x"), "x");
         let err = apply_recipe("not-a-package", &ctx, &AddAnswers::default()).unwrap_err();
         assert!(err.to_string().contains("unknown"));
+    }
+
+    #[test]
+    fn format_outcome_includes_each_step() {
+        let mut outcome = RecipeOutcome::default();
+        outcome.composer_ran = true;
+        outcome.artisan_calls.push("telescope:install".to_string());
+        outcome.env_keys_written.push("TELESCOPE_ENABLED".to_string());
+        outcome.add_hint("Open https://blog.test/telescope");
+        let s = format_outcome("telescope", &outcome);
+        assert!(s.contains("composer require"));
+        assert!(s.contains("php artisan telescope:install"));
+        assert!(s.contains("TELESCOPE_ENABLED"));
+        assert!(s.contains("Open https://blog.test/telescope"));
+    }
+
+    #[test]
+    fn format_outcome_shows_composer_skip() {
+        let mut outcome = RecipeOutcome::default();
+        outcome.composer_skipped = true;
+        let s = format_outcome("telescope", &outcome);
+        assert!(s.contains("composer require skipped"));
     }
 
     #[test]

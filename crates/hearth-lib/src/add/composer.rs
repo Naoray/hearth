@@ -128,6 +128,42 @@ pub fn composer_phar_from_config(path: Option<&PathBuf>) -> Option<PathBuf> {
     path.cloned()
 }
 
+/// Probe common locations for `composer.phar` (Homebrew Cellar layout). Returns the
+/// first existing match. Called by `hearth install` to populate
+/// `HearthConfig.composer_phar`, and by the daemon as a fallback when config is unset
+/// — so dogfood works even if the user installed Hearth before this feature shipped.
+pub fn resolve_composer_phar() -> Option<PathBuf> {
+    // 1. Homebrew Cellar — `/opt/homebrew/Cellar/composer/X.Y.Z/libexec/composer.phar`.
+    let homebrew_cellar = PathBuf::from("/opt/homebrew/Cellar/composer");
+    if let Ok(entries) = std::fs::read_dir(&homebrew_cellar) {
+        for entry in entries.flatten() {
+            let phar = entry.path().join("libexec/composer.phar");
+            if phar.exists() {
+                return Some(phar);
+            }
+        }
+    }
+
+    // 2. Apple-silicon canonical symlinked path (some configs only expose this).
+    let opt_path = PathBuf::from("/opt/homebrew/opt/composer/libexec/composer.phar");
+    if opt_path.exists() {
+        return Some(opt_path);
+    }
+
+    // 3. Intel-mac Homebrew layout.
+    let intel_path = PathBuf::from("/usr/local/Cellar/composer");
+    if let Ok(entries) = std::fs::read_dir(&intel_path) {
+        for entry in entries.flatten() {
+            let phar = entry.path().join("libexec/composer.phar");
+            if phar.exists() {
+                return Some(phar);
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
