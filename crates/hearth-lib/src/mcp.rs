@@ -57,6 +57,13 @@ pub struct PhpConfigParams {
     pub value: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct DbActionParams {
+    /// Engine name: `mysql`, `postgres`, `redis`. Omit to target all DB engines.
+    #[serde(default)]
+    pub engine: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // HearthMcpServer
 // ---------------------------------------------------------------------------
@@ -76,6 +83,22 @@ pub struct HearthMcpServer {
     pub config: Arc<Mutex<HearthConfig>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+}
+
+/// Resolve a DB engine name (or absence) into the supervised kinds the MCP
+/// tool should act on. None → all three DB engines; explicit non-DB kinds
+/// (e.g. `nginx`) are rejected.
+fn db_engine_targets(engine: Option<&str>) -> Result<Vec<ServiceKind>, String> {
+    match engine {
+        None => Ok(ServiceKind::db_engines().to_vec()),
+        Some(name) => {
+            let kind: ServiceKind = name.parse().map_err(|e: String| e)?;
+            if !kind.is_db() {
+                return Err(format!("{name} is not a DB engine"));
+            }
+            Ok(vec![kind])
+        }
+    }
 }
 
 impl HearthMcpServer {
@@ -280,6 +303,84 @@ impl HearthMcpServer {
         }
     }
 
+    /// Start a DB engine (mysql, postgres, redis) or all DB engines.
+    #[tool(name = "hearth_db_start", description = "Start a database engine (mysql, postgres, redis) or all DB engines")]
+    async fn hearth_db_start(
+        &self,
+        Parameters(params): Parameters<DbActionParams>,
+    ) -> Result<String, String> {
+        let kinds = db_engine_targets(params.engine.as_deref())?;
+        let mut sup = self.supervisor.lock().await;
+        let mut summary: Vec<String> = Vec::new();
+        for kind in kinds {
+            if !sup.status().contains_key(&kind) {
+                summary.push(format!("{kind}: not registered"));
+                continue;
+            }
+            if matches!(sup.status().get(&kind), Some(ServiceState::Running { .. })) {
+                summary.push(format!("{kind}: already running"));
+                continue;
+            }
+            match sup.start_service(kind) {
+                Ok(()) => summary.push(format!("{kind}: started")),
+                Err(e) => summary.push(format!("{kind}: start failed: {e}")),
+            }
+        }
+        Ok(summary.join("\n"))
+    }
+
+    /// Stop a DB engine or all DB engines.
+    #[tool(name = "hearth_db_stop", description = "Stop a database engine or all DB engines")]
+    async fn hearth_db_stop(
+        &self,
+        Parameters(params): Parameters<DbActionParams>,
+    ) -> Result<String, String> {
+        let kinds = db_engine_targets(params.engine.as_deref())?;
+        let mut sup = self.supervisor.lock().await;
+        let mut summary: Vec<String> = Vec::new();
+        for kind in kinds {
+            if !sup.status().contains_key(&kind) {
+                summary.push(format!("{kind}: not registered"));
+                continue;
+            }
+            match sup.stop_service(kind) {
+                Ok(()) => summary.push(format!("{kind}: stopped")),
+                Err(e) => summary.push(format!("{kind}: stop failed: {e}")),
+            }
+        }
+        Ok(summary.join("\n"))
+    }
+
+    /// Report status for the three DB engines.
+    #[tool(name = "hearth_db_status", description = "Report state, pid, port, and data dir for each registered DB engine")]
+    async fn hearth_db_status(&self) -> Result<String, String> {
+        let cfg = self.config.lock().await;
+        let mysql_port = cfg.mysql_port;
+        let postgres_port = cfg.postgres_port;
+        let redis_port = cfg.redis_port;
+        drop(cfg);
+
+        let sup = self.supervisor.lock().await;
+        let mut lines: Vec<String> = Vec::new();
+        for kind in ServiceKind::db_engines() {
+            let port = match kind {
+                ServiceKind::Mysql => mysql_port,
+                ServiceKind::Postgresql => postgres_port,
+                ServiceKind::Redis => redis_port,
+                _ => 0,
+            };
+            let state_str = match sup.status().get(&kind) {
+                Some(ServiceState::Running { pid }) => format!("running (pid {pid})"),
+                Some(ServiceState::Starting) => "starting".to_string(),
+                Some(ServiceState::Stopped) => "stopped".to_string(),
+                Some(ServiceState::Failed { reason }) => format!("failed: {reason}"),
+                None => "not registered".to_string(),
+            };
+            lines.push(format!("{kind} (port {port}): {state_str}"));
+        }
+        Ok(lines.join("\n"))
+    }
+
     /// Set a php.ini value for the active PHP version and restart php-fpm.
     #[tool(name = "hearth_php_config", description = "Set a php.ini configuration value for the active PHP version and restart php-fpm")]
     async fn hearth_php_config(
@@ -479,15 +580,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_router_lists_eight_tools() {
+    async fn tool_router_lists_eleven_tools() {
         let server = make_server();
         let tools = server.tool_router.list_all();
+        let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
         assert_eq!(
             tools.len(),
-            8,
-            "Expected 8 tools, got {}: {:?}",
+            11,
+            "Expected 11 tools, got {}: {:?}",
             tools.len(),
-            tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+            names
         );
+        for required in [
+            "hearth_status",
+            "hearth_sites",
+            "hearth_php_list",
+            "hearth_php_switch",
+            "hearth_site_link",
+            "hearth_site_unlink",
+            "hearth_service_restart",
+            "hearth_php_config",
+            "hearth_db_start",
+            "hearth_db_stop",
+            "hearth_db_status",
+        ] {
+            assert!(
+                names.iter().any(|n| n == required),
+                "missing tool {required}, have: {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn db_start_rejects_unknown_engine() {
+        let server = make_server();
+        let result = server
+            .hearth_db_start(Parameters(DbActionParams {
+                engine: Some("nginx".to_string()),
+            }))
+            .await;
+        let err = result.expect_err("nginx is not a DB engine");
+        assert!(err.contains("not a DB engine"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn db_status_reports_three_engines() {
+        let server = make_server();
+        let text = server.hearth_db_status().await.expect("status ok");
+        assert!(text.contains("mysql"), "got: {text}");
+        assert!(text.contains("postgresql"), "got: {text}");
+        assert!(text.contains("redis"), "got: {text}");
+        // Default ports surface in the report.
+        assert!(text.contains("3306"));
+        assert!(text.contains("5432"));
+        assert!(text.contains("6379"));
+    }
+
+    #[tokio::test]
+    async fn db_stop_unknown_engine_errors_cleanly() {
+        let server = make_server();
+        let result = server
+            .hearth_db_stop(Parameters(DbActionParams {
+                engine: Some("flux-capacitor".to_string()),
+            }))
+            .await;
+        let err = result.expect_err("unknown engine errors");
+        assert!(err.to_lowercase().contains("unknown"), "got: {err}");
     }
 }
