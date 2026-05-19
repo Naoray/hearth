@@ -663,10 +663,7 @@ async fn run_add(
 
     let answers = match package {
         AddPackage::Telescope => telescope_prompts(yes)?,
-        AddPackage::Horizon => {
-            // Recipe ships in Task 4; CLI prompts wire then.
-            anyhow::bail!("hearth add horizon: recipe arrives in v0.3.0 Task 4");
-        }
+        AddPackage::Horizon => horizon_prompts(yes)?,
         AddPackage::Pulse => anyhow::bail!("hearth add pulse: recipe arrives in v0.3.0 Task 6"),
         AddPackage::Reverb => anyhow::bail!("hearth add reverb: recipe arrives in v0.3.0 Task 5"),
     };
@@ -723,6 +720,47 @@ fn telescope_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
         .default(false)
         .interact()?;
     answers.telescope_enable_in_prod = Some(in_prod);
+
+    Ok(answers)
+}
+
+/// Collect Horizon-specific answers. `--yes` defaults: connection=redis,
+/// environment=local, max_processes=3.
+fn horizon_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
+    let mut answers = AddAnswers::default();
+    if yes {
+        answers.horizon_connection = Some("redis".to_string());
+        answers.horizon_environment = Some("local".to_string());
+        answers.horizon_max_processes = Some(3);
+        return Ok(answers);
+    }
+
+    let connections = ["redis", "database", "sqs", "beanstalkd"];
+    let idx = dialoguer::Select::new()
+        .with_prompt("Queue connection?")
+        .items(&connections)
+        .default(0)
+        .interact()?;
+    answers.horizon_connection = Some(connections[idx].to_string());
+
+    let env: String = dialoguer::Input::new()
+        .with_prompt("Horizon environment name")
+        .default("local".to_string())
+        .interact_text()?;
+    answers.horizon_environment = Some(env);
+
+    let max_processes: i64 = dialoguer::Input::new()
+        .with_prompt("Max processes per supervisor (1-64)")
+        .default(3)
+        .validate_with(|n: &i64| -> Result<(), &str> {
+            if (1..=64).contains(n) {
+                Ok(())
+            } else {
+                Err("must be 1-64")
+            }
+        })
+        .interact_text()?;
+    answers.horizon_max_processes = Some(max_processes);
 
     Ok(answers)
 }

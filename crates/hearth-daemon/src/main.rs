@@ -7,12 +7,12 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use hearth_lib::config::HearthConfig;
+use hearth_lib::config::{AddedPackage, HearthConfig};
 use hearth_lib::db::health::port_in_use;
 use hearth_lib::mcp::HearthMcpServer;
 use hearth_lib::php::PhpManager;
 use hearth_lib::service::manager::{default_services, prune_added_packages};
-use hearth_lib::service::supervisor::ServiceSupervisor;
+use hearth_lib::service::supervisor::{ManagedService, ServiceSupervisor};
 use hearth_lib::service::{ServiceKind, ServiceState};
 use hearth_lib::site::SiteManager;
 use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
@@ -414,17 +414,15 @@ async fn process_request(
         DaemonRequest::Status => {
             let sup = state.supervisor.lock().await;
             let services = sup
-                .status()
-                .iter()
-                .map(|(kind, svc_state)| {
-                    hearth_lib::socket::ServiceStatus {
-                        name: kind.name().to_string(),
-                        state: format!("{:?}", svc_state),
-                        pid: match svc_state {
-                            hearth_lib::service::ServiceState::Running { pid } => Some(*pid),
-                            _ => None,
-                        },
-                    }
+                .services_detailed()
+                .into_iter()
+                .map(|d| hearth_lib::socket::ServiceStatus {
+                    name: d.display_name,
+                    state: format!("{:?}", d.state),
+                    pid: match d.state {
+                        hearth_lib::service::ServiceState::Running { pid } => Some(pid),
+                        _ => None,
+                    },
                 })
                 .collect();
 
@@ -683,15 +681,78 @@ async fn process_request(
                 }
             };
 
-            // Persistence of AddedPackage + supervised registration arrives in Task 4
-            // (Horizon). Telescope/Pulse return outcome.supervised = None so this branch
-            // is dormant for them.
-            if outcome.supervised.is_some() && !no_supervise && !dry_run {
-                // TODO(Task 4/5): persist AddedPackage and register with supervisor.
-                warn!(
-                    package = %package,
-                    "supervised registration not yet wired (Task 4)",
-                );
+            // Supervised packages (Horizon, Reverb) are persisted to config and registered
+            // with the supervisor. Telescope/Pulse return supervised = None and skip both.
+            if let Some(ref spec) = outcome.supervised
+                && !dry_run
+            {
+                let kind = match spec.package.as_str() {
+                    "horizon" => ServiceKind::Horizon,
+                    "reverb" => ServiceKind::Reverb,
+                    other => {
+                        return DaemonResponse::Error {
+                            message: format!("unknown supervised package: {other}"),
+                        };
+                    }
+                };
+
+                // Multi-site check + persist under config lock. v0.3.0 ships single-instance
+                // Horizon and Reverb; multi-site is v0.3.1.
+                let now = chrono::Utc::now();
+                {
+                    let mut cfg = state.config.lock().await;
+                    let existing_other_site = cfg.added_packages.iter().find(|p| {
+                        p.package == spec.package && p.site_name != spec.site_name
+                    });
+                    if let Some(existing) = existing_other_site {
+                        return DaemonResponse::Error {
+                            message: format!(
+                                "{} is already supervised for site `{}`; v0.3.0 ships \
+                                 single-site only — multi-site support arrives in v0.3.1",
+                                spec.package, existing.site_name
+                            ),
+                        };
+                    }
+                    // Remove an existing same-site entry (idempotent re-run) before pushing.
+                    cfg.added_packages
+                        .retain(|p| !(p.package == spec.package && p.site_name == spec.site_name));
+                    cfg.added_packages.push(AddedPackage {
+                        package: spec.package.clone(),
+                        site_path: spec.cwd.clone(),
+                        site_name: spec.site_name.clone(),
+                        command: spec.command.clone(),
+                        args: spec.args.clone(),
+                        installed_at: now,
+                    });
+                    if let Err(e) = cfg.save() {
+                        return DaemonResponse::Error {
+                            message: format!(
+                                "recipe ran but failed to persist AddedPackage: {e}"
+                            ),
+                        };
+                    }
+                }
+                // Drop config lock before acquiring supervisor (lock order).
+
+                if !no_supervise {
+                    let mut sup = state.supervisor.lock().await;
+                    let svc = ManagedService::with_cwd_and_site(
+                        kind,
+                        spec.command.clone(),
+                        spec.args.clone(),
+                        spec.cwd.clone(),
+                        spec.site_name.clone(),
+                    );
+                    sup.register(svc);
+                    if let Err(e) = sup.start_service(kind) {
+                        warn!(
+                            package = %package,
+                            error = %e,
+                            "supervised worker registered but failed to start; \
+                             will retry on next health check tick",
+                        );
+                    }
+                }
             }
 
             DaemonResponse::Ok {

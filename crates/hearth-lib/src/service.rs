@@ -197,6 +197,7 @@ mod tests {
 
     #[test]
     fn service_kind_strips_bracket_suffix() {
+        // `horizon[shopfront]` (the display name) parses back to ServiceKind::Horizon.
         assert_eq!(
             "horizon[shopfront]".parse::<ServiceKind>().unwrap(),
             ServiceKind::Horizon

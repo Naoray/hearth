@@ -7,6 +7,7 @@
 pub mod artisan;
 pub mod composer;
 pub mod env_file;
+pub mod horizon;
 pub mod laravel;
 pub mod prompt;
 pub mod recipe;
@@ -54,7 +55,7 @@ pub fn apply_recipe(
 ) -> anyhow::Result<RecipeOutcome> {
     match package {
         "telescope" => telescope::apply(ctx, answers),
-        // "horizon"   => horizon::apply(ctx, answers),
+        "horizon" => horizon::apply(ctx, answers),
         // "pulse"     => pulse::apply(ctx, answers),
         // "reverb"    => reverb::apply(ctx, answers),
         other => anyhow::bail!("unknown or not-yet-implemented package: {other}"),

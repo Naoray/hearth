@@ -120,7 +120,7 @@ pub fn default_services(config: &HearthConfig, config_dir: &std::path::Path) -> 
     }
 
     // Postgres — register only if binaries resolve AND nothing else owns
-    // the configured port (Herd Pro Services panel, Homebrew services, etc.).
+    // the configured port (other tools' services panels, Homebrew services, etc.).
     if let Some(pg) = crate::db::postgres::resolve_postgres_binaries(config_dir) {
         if crate::db::health::port_in_use("127.0.0.1", config.postgres_port) {
             info!(
