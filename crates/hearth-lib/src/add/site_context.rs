@@ -109,15 +109,29 @@ pub fn resolve(
 fn resolve_explicit(path: &Path, sites: &[Site]) -> Result<Site, SiteResolutionError> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|_| SiteResolutionError::SiteNotLinked(path.to_path_buf()))?;
-    sites
-        .iter()
-        .find(|s| {
-            std::fs::canonicalize(&s.path)
-                .map(|p| p == canonical)
-                .unwrap_or(false)
-        })
-        .cloned()
-        .ok_or(SiteResolutionError::SiteNotLinked(canonical))
+    // If the path matches a linked site, reuse its Site (preserves SSL +
+    // per-site PHP isolation).
+    if let Some(s) = sites.iter().find(|s| {
+        std::fs::canonicalize(&s.path)
+            .map(|p| p == canonical)
+            .unwrap_or(false)
+    }) {
+        return Ok(s.clone());
+    }
+    // Otherwise synthesize a Site from the path. `hearth add` only needs the
+    // path + a display name; linking (Valet/Herd nginx) is orthogonal and
+    // requires sudo. The Laravel-framework check happens after this point.
+    let name = canonical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("site")
+        .to_string();
+    Ok(Site {
+        name,
+        path: canonical,
+        secured: false,
+        php_version: None,
+    })
 }
 
 fn walk_up_for_site(cwd: &Path, sites: &[Site]) -> Result<Site, SiteResolutionError> {
@@ -241,10 +255,35 @@ mod tests {
     }
 
     #[test]
-    fn errors_when_explicit_path_not_linked() {
+    fn accepts_explicit_unlinked_path_when_laravel_app() {
+        // `--site=<path>` should accept any directory that LOOKS like a
+        // Laravel app, even if not linked in Valet/Herd. Linking is for
+        // serving (sudo-gated); add-recipes only need composer + .env.
         let tmp = tempfile::TempDir::new().unwrap();
-        let stray = tmp.path().join("stray");
-        std::fs::create_dir_all(&stray).unwrap();
+        let site_root = tmp.path().join("unlinked");
+        std::fs::create_dir_all(&site_root).unwrap();
+        write_laravel_skeleton(&site_root, "^11.0");
+
+        let valet = tmp.path().join("valet");
+        std::fs::create_dir_all(&valet).unwrap();
+
+        let config_dir = tmp.path().join("config");
+        fake_php(&config_dir, "8.4");
+
+        let mgr = SiteManager::new(valet, "test".to_string());
+        let mut config = HearthConfig::default();
+        config.default_php = "8.4".to_string();
+
+        let ctx = resolve(Some(&site_root), tmp.path(), &mgr, &config, &config_dir).unwrap();
+        assert_eq!(ctx.site.name, "unlinked");
+        assert_eq!(ctx.site.path, std::fs::canonicalize(&site_root).unwrap());
+        assert!(!ctx.site.secured);
+    }
+
+    #[test]
+    fn errors_when_explicit_path_not_a_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("nope");
 
         let valet = tmp.path().join("valet");
         std::fs::create_dir_all(&valet).unwrap();
@@ -252,7 +291,7 @@ mod tests {
         let mgr = SiteManager::new(valet, "test".to_string());
         let config = HearthConfig::default();
         let config_dir = tmp.path().join("config");
-        let err = resolve(Some(&stray), tmp.path(), &mgr, &config, &config_dir).unwrap_err();
+        let err = resolve(Some(&missing), tmp.path(), &mgr, &config, &config_dir).unwrap_err();
         assert!(matches!(err, SiteResolutionError::SiteNotLinked(_)));
     }
 
