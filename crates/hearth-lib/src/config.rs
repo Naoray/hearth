@@ -1,6 +1,30 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// A Laravel package installed via `hearth add` and (for Horizon/Reverb) supervised
+/// as a long-running worker. Persisted in `HearthConfig.added_packages` so the daemon
+/// re-registers it on every restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AddedPackage {
+    /// Package key — `"horizon" | "telescope" | "pulse" | "reverb"`.
+    pub package: String,
+    /// Absolute path to the Laravel site root.
+    pub site_path: PathBuf,
+    /// Site name (mirrors `Site.name`) — used to disambiguate per-site supervised
+    /// rows in `hearth status` (e.g. `horizon[shopfront]`).
+    pub site_name: String,
+    /// Resolved PHP binary used to run the supervised worker.
+    /// Empty string for install-only packages (Telescope, Pulse).
+    #[serde(default)]
+    pub command: String,
+    /// Args passed to the PHP binary (e.g. `["artisan", "horizon"]`).
+    /// Empty for install-only packages.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// When the package was installed.
+    pub installed_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Global Hearth configuration, stored at ~/.config/hearth/config.toml
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -40,6 +64,16 @@ pub struct HearthConfig {
 
     /// Paths to parked directories
     pub parked_paths: Vec<PathBuf>,
+
+    /// Absolute path to a `composer.phar` Hearth invokes via the site's resolved PHP
+    /// binary. Resolved at `hearth install` time; avoids Composer's bash wrapper
+    /// (which uses the system PHP and breaks Valet-isolated sites).
+    pub composer_phar: Option<PathBuf>,
+
+    /// Laravel packages installed via `hearth add`. Horizon/Reverb entries also become
+    /// supervised services on daemon boot. Boot-time prune drops entries whose
+    /// `<site_path>/vendor/<package>` no longer exists.
+    pub added_packages: Vec<AddedPackage>,
 }
 
 impl Default for HearthConfig {
@@ -57,6 +91,8 @@ impl Default for HearthConfig {
             postgres_port: 5432,
             redis_port: 6379,
             parked_paths: Vec::new(),
+            composer_phar: None,
+            added_packages: Vec::new(),
         }
     }
 }
@@ -202,5 +238,62 @@ parked_paths = []
         let config = HearthConfig::load_from(&config_path).unwrap();
         assert_eq!(config.mcp_port, 9900); // should get default
         assert_eq!(config.tld, "test");    // existing fields preserved
+    }
+
+    #[test]
+    fn default_config_has_no_added_packages() {
+        let config = HearthConfig::default();
+        assert!(config.added_packages.is_empty());
+        assert!(config.composer_phar.is_none());
+    }
+
+    #[test]
+    fn load_legacy_config_without_added_packages() {
+        // Forward-compat: a config written before v0.3.0 must still load.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, r#"
+tld = "test"
+default_php = "8.4"
+dns_port = 5354
+dump_port = 9912
+mail_smtp_port = 1025
+mail_ui_port = 8025
+mcp_port = 9900
+parked_paths = []
+"#).unwrap();
+
+        let config = HearthConfig::load_from(&config_path).unwrap();
+        assert!(config.added_packages.is_empty());
+        assert!(config.composer_phar.is_none());
+    }
+
+    #[test]
+    fn added_packages_round_trip_serde() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let mut config = HearthConfig::default();
+        config.composer_phar = Some(PathBuf::from("/opt/homebrew/bin/composer.phar"));
+        config.added_packages.push(AddedPackage {
+            package: "horizon".to_string(),
+            site_path: PathBuf::from("/Users/me/Sites/shopfront"),
+            site_name: "shopfront".to_string(),
+            command: "/opt/homebrew/opt/php@8.4/bin/php".to_string(),
+            args: vec!["artisan".to_string(), "horizon".to_string()],
+            installed_at: chrono::Utc::now(),
+        });
+
+        config.save_to(&config_path).unwrap();
+        let loaded = HearthConfig::load_from(&config_path).unwrap();
+
+        assert_eq!(loaded.added_packages.len(), 1);
+        assert_eq!(loaded.added_packages[0].package, "horizon");
+        assert_eq!(loaded.added_packages[0].site_name, "shopfront");
+        assert_eq!(loaded.added_packages[0].args, vec!["artisan", "horizon"]);
+        assert_eq!(
+            loaded.composer_phar,
+            Some(PathBuf::from("/opt/homebrew/bin/composer.phar"))
+        );
     }
 }

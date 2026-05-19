@@ -138,6 +138,34 @@ else
     warn "park failed (expected if Valet not installed)"
 fi
 
+# ── 9a. hearth add subcommand wired ──────────────────────────────
+info "Testing hearth add subcommand parser..."
+
+OUTPUT=$($CLI add --help 2>&1)
+if echo "$OUTPUT" | grep -q "horizon" && echo "$OUTPUT" | grep -q "telescope" && \
+   echo "$OUTPUT" | grep -q "pulse" && echo "$OUTPUT" | grep -q "reverb"; then
+    pass "hearth add — all 4 packages registered"
+else
+    fail "hearth add --help missing expected packages"
+fi
+
+# ── 9b. hearth add against an unlinked path errors cleanly ───────
+info "Testing hearth add error path (unlinked site)..."
+
+mkdir -p /tmp/hearth-smoke-test/laravel
+cat > /tmp/hearth-smoke-test/laravel/composer.json <<EOF
+{"require":{"laravel/framework":"^11.0","laravel/telescope":"^5.0"}}
+EOF
+echo "APP_ENV=local" > /tmp/hearth-smoke-test/laravel/.env
+
+# Site is NOT linked → daemon should refuse with a clear error rather than crashing.
+OUTPUT=$($CLI add telescope --site=/tmp/hearth-smoke-test/laravel --yes --dry-run 2>&1) || true
+if echo "$OUTPUT" | grep -qiE "not in the linked sites list|not.*linked|no resolved path"; then
+    pass "hearth add — unlinked-site error surfaces cleanly"
+else
+    warn "hearth add unlinked-site response unexpected: $OUTPUT"
+fi
+
 # ── 9. MCP server reachable ──────────────────────────────────────
 info "Testing MCP Streamable HTTP endpoint..."
 

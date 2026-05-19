@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::add::AddAnswers;
+
 /// Messages sent from CLI/GUI clients to the daemon over Unix socket.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -38,6 +40,18 @@ pub enum DaemonRequest {
     DbStop { engine: Option<String> },
     /// Report status of all DB engines (registered + not registered).
     DbStatus,
+    /// Install a Laravel package via a recipe (horizon | telescope | pulse | reverb).
+    /// CLI collected all prompt answers up-front; daemon never opens a TTY.
+    /// `cwd` is the CLI's working directory at invocation time — daemon uses it for
+    /// cwd-walk site auto-detect when `site_path` is empty.
+    Add {
+        package: String,
+        site_path: String,
+        cwd: String,
+        answers: AddAnswers,
+        no_supervise: bool,
+        dry_run: bool,
+    },
 }
 
 /// Responses from the daemon to clients.
@@ -140,6 +154,17 @@ mod tests {
             DaemonRequest::DbStop { engine: None },
             DaemonRequest::DbStop { engine: Some("redis".to_string()) },
             DaemonRequest::DbStatus,
+            DaemonRequest::Add {
+                package: "telescope".to_string(),
+                site_path: "/Users/me/Sites/blog".to_string(),
+                cwd: "/Users/me/Sites/blog/app".to_string(),
+                answers: AddAnswers {
+                    telescope_enable_in_prod: Some(false),
+                    ..Default::default()
+                },
+                no_supervise: false,
+                dry_run: true,
+            },
         ];
 
         for request in cases {

@@ -7,12 +7,12 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use hearth_lib::config::HearthConfig;
+use hearth_lib::config::{AddedPackage, HearthConfig};
 use hearth_lib::db::health::port_in_use;
 use hearth_lib::mcp::HearthMcpServer;
 use hearth_lib::php::PhpManager;
-use hearth_lib::service::manager::default_services;
-use hearth_lib::service::supervisor::ServiceSupervisor;
+use hearth_lib::service::manager::{default_services, prune_added_packages};
+use hearth_lib::service::supervisor::{ManagedService, ServiceSupervisor};
 use hearth_lib::service::{ServiceKind, ServiceState};
 use hearth_lib::site::SiteManager;
 use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
@@ -28,11 +28,16 @@ use rmcp::transport::StreamableHttpService;
 ///
 /// Lock ordering convention (when multiple locks are needed):
 ///   `config` -> `php_manager` -> `site_manager` -> `supervisor`
+///
+/// `add_lock` is a coarse mutex held for the duration of an `Add` handler. Concurrent
+/// `hearth add` invocations against the same site would otherwise race on `.env`
+/// editing and supervisor registration (scratchpad 796 H8).
 struct DaemonState {
     supervisor: Arc<Mutex<ServiceSupervisor>>,
     config: Arc<Mutex<HearthConfig>>,
     site_manager: Arc<Mutex<SiteManager>>,
     php_manager: Arc<Mutex<PhpManager>>,
+    add_lock: Arc<Mutex<()>>,
 }
 
 #[tokio::main]
@@ -44,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Hearth daemon starting...");
 
     // Load config
-    let config = HearthConfig::load().context("Failed to load config")?;
+    let mut config = HearthConfig::load().context("Failed to load config")?;
 
     // Ensure directories exist before any engine registration. DB engines
     // expect `run/` and `data/` to be present on first start; pre-creating
@@ -54,7 +59,19 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(hearth_lib::log_dir())?;
     std::fs::create_dir_all(hearth_lib::data_dir())?;
 
-    // Build supervisor with default services
+    // Boot-time prune: drop AddedPackage entries whose vendor dir no longer exists on
+    // disk (closes the gap left by `hearth remove` being out of v0.3.0 scope).
+    let (kept, dropped) = prune_added_packages(&config.added_packages);
+    if !dropped.is_empty() {
+        info!(count = dropped.len(), "pruned stale AddedPackage entries from config");
+        config.added_packages = kept;
+        if let Err(e) = config.save() {
+            warn!(error = %e, "failed to persist pruned config");
+        }
+    }
+
+    // Build supervisor with default services. Per-package supervised registration
+    // lands in Task 4 (Horizon) and Task 5 (Reverb).
     let mut supervisor = ServiceSupervisor::new();
     for svc in default_services(&config, &config_dir) {
         supervisor.register(svc);
@@ -78,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(Mutex::new(config)),
         site_manager: Arc::new(Mutex::new(SiteManager::with_homes(valet_homes, tld))),
         php_manager: Arc::new(Mutex::new(PhpManager::new(hearth_lib::config_dir()))),
+        add_lock: Arc::new(Mutex::new(())),
     });
 
     // Remove stale socket
@@ -396,17 +414,15 @@ async fn process_request(
         DaemonRequest::Status => {
             let sup = state.supervisor.lock().await;
             let services = sup
-                .status()
-                .iter()
-                .map(|(kind, svc_state)| {
-                    hearth_lib::socket::ServiceStatus {
-                        name: kind.name().to_string(),
-                        state: format!("{:?}", svc_state),
-                        pid: match svc_state {
-                            hearth_lib::service::ServiceState::Running { pid } => Some(*pid),
-                            _ => None,
-                        },
-                    }
+                .services_detailed()
+                .into_iter()
+                .map(|d| hearth_lib::socket::ServiceStatus {
+                    name: d.display_name,
+                    state: format!("{:?}", d.state),
+                    pid: match d.state {
+                        hearth_lib::service::ServiceState::Running { pid } => Some(pid),
+                        _ => None,
+                    },
                 })
                 .collect();
 
@@ -584,6 +600,171 @@ async fn process_request(
 
         DaemonRequest::DbStatus => {
             db_status(state).await
+        }
+
+        DaemonRequest::Add {
+            package,
+            site_path,
+            cwd: cli_cwd,
+            answers,
+            no_supervise,
+            dry_run,
+        } => {
+            // Hold the add lock for the duration so concurrent Add invocations
+            // (e.g. scripted `hearth add horizon && hearth add telescope`) don't race
+            // on .env editing or supervisor registration.
+            let _guard = state.add_lock.lock().await;
+
+            // Snapshot config (read-only fields) under the config lock, then drop.
+            // Lock order: config -> site_manager. apply_recipe runs lock-free.
+            let (composer_phar_cfg, default_php_clone) = {
+                let cfg = state.config.lock().await;
+                (cfg.composer_phar.clone(), cfg.default_php.clone())
+            };
+
+            // Compose-phar fallback: if config doesn't have it, probe the host. Lets
+            // existing installs work without re-running `hearth install`.
+            let composer_phar = composer_phar_cfg
+                .or_else(hearth_lib::add::composer::resolve_composer_phar);
+
+            // Resolve site context under site_manager lock.
+            let site_path_buf = PathBuf::from(&site_path);
+            // Use the CLI's cwd, not the daemon's. Daemon may be running from `/` via
+            // launchd / `brew services`; the CLI knows where the user actually invoked.
+            let cwd = if cli_cwd.is_empty() {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+            } else {
+                PathBuf::from(&cli_cwd)
+            };
+            let snapshot_config = HearthConfig {
+                default_php: default_php_clone,
+                ..HearthConfig::default()
+            };
+            let config_dir = hearth_lib::config_dir();
+            let ctx_resolution = {
+                let sm = state.site_manager.lock().await;
+                let explicit: Option<&std::path::Path> = if site_path.is_empty() {
+                    None
+                } else {
+                    Some(&site_path_buf)
+                };
+                hearth_lib::add::site_context::resolve(
+                    explicit,
+                    &cwd,
+                    &sm,
+                    &snapshot_config,
+                    &config_dir,
+                )
+            };
+            let site_ctx = match ctx_resolution {
+                Ok(s) => s,
+                Err(e) => {
+                    return DaemonResponse::Error {
+                        message: format!("hearth add {package}: {e}"),
+                    };
+                }
+            };
+
+            // Build the per-request log file path so the CLI can `tail -f` it.
+            let log_path = hearth_lib::log_dir().join(format!("add-{package}.log"));
+
+            let recipe_ctx = hearth_lib::add::recipe::RecipeContext {
+                site_path: site_ctx.site.path.clone(),
+                site_name: site_ctx.site.name.clone(),
+                php_binary: site_ctx.php_binary.clone(),
+                composer_phar,
+                no_supervise,
+                dry_run,
+                log_path: Some(log_path),
+                now: chrono::Utc::now(),
+            };
+
+            let outcome = match hearth_lib::add::apply_recipe(&package, &recipe_ctx, &answers) {
+                Ok(o) => o,
+                Err(e) => {
+                    return DaemonResponse::Error {
+                        message: format!("hearth add {package} failed: {e}"),
+                    };
+                }
+            };
+
+            // Supervised packages (Horizon, Reverb) are persisted to config and registered
+            // with the supervisor. Telescope/Pulse return supervised = None and skip both.
+            if let Some(ref spec) = outcome.supervised
+                && !dry_run
+            {
+                let kind = match spec.package.as_str() {
+                    "horizon" => ServiceKind::Horizon,
+                    "reverb" => ServiceKind::Reverb,
+                    other => {
+                        return DaemonResponse::Error {
+                            message: format!("unknown supervised package: {other}"),
+                        };
+                    }
+                };
+
+                // Multi-site check + persist under config lock. v0.3.0 ships single-instance
+                // Horizon and Reverb; multi-site is v0.3.1.
+                let now = chrono::Utc::now();
+                {
+                    let mut cfg = state.config.lock().await;
+                    let existing_other_site = cfg.added_packages.iter().find(|p| {
+                        p.package == spec.package && p.site_name != spec.site_name
+                    });
+                    if let Some(existing) = existing_other_site {
+                        return DaemonResponse::Error {
+                            message: format!(
+                                "{} is already supervised for site `{}`; v0.3.0 ships \
+                                 single-site only — multi-site support arrives in v0.3.1",
+                                spec.package, existing.site_name
+                            ),
+                        };
+                    }
+                    // Remove an existing same-site entry (idempotent re-run) before pushing.
+                    cfg.added_packages
+                        .retain(|p| !(p.package == spec.package && p.site_name == spec.site_name));
+                    cfg.added_packages.push(AddedPackage {
+                        package: spec.package.clone(),
+                        site_path: spec.cwd.clone(),
+                        site_name: spec.site_name.clone(),
+                        command: spec.command.clone(),
+                        args: spec.args.clone(),
+                        installed_at: now,
+                    });
+                    if let Err(e) = cfg.save() {
+                        return DaemonResponse::Error {
+                            message: format!(
+                                "recipe ran but failed to persist AddedPackage: {e}"
+                            ),
+                        };
+                    }
+                }
+                // Drop config lock before acquiring supervisor (lock order).
+
+                if !no_supervise {
+                    let mut sup = state.supervisor.lock().await;
+                    let svc = ManagedService::with_cwd_and_site(
+                        kind,
+                        spec.command.clone(),
+                        spec.args.clone(),
+                        spec.cwd.clone(),
+                        spec.site_name.clone(),
+                    );
+                    sup.register(svc);
+                    if let Err(e) = sup.start_service(kind) {
+                        warn!(
+                            package = %package,
+                            error = %e,
+                            "supervised worker registered but failed to start; \
+                             will retry on next health check tick",
+                        );
+                    }
+                }
+            }
+
+            DaemonResponse::Ok {
+                message: Some(hearth_lib::add::format_outcome(&package, &outcome)),
+            }
         }
 
         DaemonRequest::PhpSwitch { version } => {

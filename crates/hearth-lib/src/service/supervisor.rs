@@ -51,6 +51,15 @@ pub struct ManagedService {
     pub shutdown_strategy: ShutdownStrategy,
     command: String,
     args: Vec<String>,
+    /// Working directory for the spawned process. None = inherit daemon cwd.
+    /// Required for supervised Laravel workers (Horizon, Reverb) which must run
+    /// inside the site root so `artisan` finds the app bootstrap.
+    cwd: Option<PathBuf>,
+    /// Optional site name; surfaces in `display_name()` as `horizon[shopfront]`.
+    /// Set for `hearth add`-managed Horizon/Reverb instances; `None` for the
+    /// shared system services (nginx, php-fpm, dnsmasq, mailpit, dump-server,
+    /// the DB engines).
+    site_name: Option<String>,
 }
 
 impl ManagedService {
@@ -63,6 +72,8 @@ impl ManagedService {
             shutdown_strategy: ShutdownStrategy::Default,
             command,
             args,
+            cwd: None,
+            site_name: None,
         }
     }
 
@@ -72,15 +83,83 @@ impl ManagedService {
         self
     }
 
+    /// Create a managed service that runs in a specific working directory.
+    ///
+    /// Used by supervised Laravel workers (Horizon, Reverb) which must run inside
+    /// the site root so `php artisan` finds the application bootstrap.
+    pub fn with_cwd(
+        kind: ServiceKind,
+        command: String,
+        args: Vec<String>,
+        cwd: PathBuf,
+    ) -> Self {
+        Self {
+            kind,
+            state: ServiceState::Stopped,
+            child: None,
+            circuit_breaker: CircuitBreaker::new(3, Duration::from_secs(60)),
+            shutdown_strategy: ShutdownStrategy::Default,
+            command,
+            args,
+            cwd: Some(cwd),
+            site_name: None,
+        }
+    }
+
+    /// Like `with_cwd` but also records a site name for display purposes.
+    pub fn with_cwd_and_site(
+        kind: ServiceKind,
+        command: String,
+        args: Vec<String>,
+        cwd: PathBuf,
+        site_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            state: ServiceState::Stopped,
+            child: None,
+            circuit_breaker: CircuitBreaker::new(3, Duration::from_secs(60)),
+            shutdown_strategy: ShutdownStrategy::Default,
+            command,
+            args,
+            cwd: Some(cwd),
+            site_name: Some(site_name.into()),
+        }
+    }
+
+    /// Working directory the service will be spawned in, if any.
+    pub fn cwd(&self) -> Option<&std::path::Path> {
+        self.cwd.as_deref()
+    }
+
+    /// Optional site name carried by per-site Laravel workers (Horizon, Reverb).
+    pub fn site_name(&self) -> Option<&str> {
+        self.site_name.as_deref()
+    }
+
+    /// User-facing label used in `hearth status` and tracing. Adds the site name
+    /// in brackets when present so two Laravel sites with Horizon render as
+    /// `horizon[shopfront]` / `horizon[chatapp]` rather than two indistinguishable
+    /// `horizon` rows.
+    pub fn display_name(&self) -> String {
+        match &self.site_name {
+            Some(site) => format!("{}[{}]", self.kind.name(), site),
+            None => self.kind.name().to_string(),
+        }
+    }
+
     /// Start the service in a new process group.
     pub fn start(&mut self) -> anyhow::Result<()> {
         info!(service = %self.kind, "starting service");
 
-        let child = std::process::Command::new(&self.command)
-            .args(&self.args)
+        let mut cmd = std::process::Command::new(&self.command);
+        cmd.args(&self.args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .group_spawn()?;
+            .stderr(Stdio::piped());
+        if let Some(ref dir) = self.cwd {
+            cmd.current_dir(dir);
+        }
+        let child = cmd.group_spawn()?;
 
         let pid = child.id();
         self.child = Some(child);
@@ -335,6 +414,24 @@ impl ServiceSupervisor {
             .map(|(k, v)| (*k, &v.state))
             .collect()
     }
+
+    /// Same as `status()` but carries each service's display name (with site bracket
+    /// for per-site Laravel workers). Used by the daemon for `hearth status` output.
+    pub fn services_detailed(&self) -> Vec<ServiceDetail> {
+        self.services
+            .values()
+            .map(|svc| ServiceDetail {
+                display_name: svc.display_name(),
+                state: svc.state.clone(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceDetail {
+    pub display_name: String,
+    pub state: ServiceState,
 }
 
 impl Drop for ServiceSupervisor {
@@ -446,5 +543,69 @@ mod tests {
         sup.register(svc2);
         assert_eq!(sup.services.len(), 1);
         assert_eq!(sup.services[&ServiceKind::Nginx].command, "nginx-new");
+    }
+
+    #[test]
+    fn managed_service_new_has_no_cwd() {
+        let svc = ManagedService::new(ServiceKind::Nginx, "true".to_string(), vec![]);
+        assert!(svc.cwd().is_none());
+    }
+
+    #[test]
+    fn managed_service_with_cwd_stores_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = ManagedService::with_cwd(
+            ServiceKind::Nginx,
+            "true".to_string(),
+            vec![],
+            tmp.path().to_path_buf(),
+        );
+        assert_eq!(svc.cwd(), Some(tmp.path()));
+    }
+
+    #[test]
+    fn managed_service_with_cwd_and_site_renders_display_name() {
+        let svc = ManagedService::with_cwd_and_site(
+            ServiceKind::Horizon,
+            "/php".to_string(),
+            vec!["artisan".to_string(), "horizon".to_string()],
+            std::path::PathBuf::from("/site"),
+            "shopfront",
+        );
+        assert_eq!(svc.display_name(), "horizon[shopfront]");
+        assert_eq!(svc.site_name(), Some("shopfront"));
+    }
+
+    #[test]
+    fn managed_service_display_name_falls_back_to_kind_name() {
+        let svc = ManagedService::new(ServiceKind::Nginx, "nginx".to_string(), vec![]);
+        assert_eq!(svc.display_name(), "nginx");
+        assert!(svc.site_name().is_none());
+    }
+
+    #[test]
+    fn managed_service_with_cwd_spawns_in_directory() {
+        // Use `pwd` to verify the child's working directory.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Canonicalize to mirror what macOS does (symlinks under /var → /private/var, etc.)
+        let cwd = std::fs::canonicalize(tmp.path()).unwrap();
+        let marker = cwd.join("pwd-output");
+
+        let mut svc = ManagedService::with_cwd(
+            ServiceKind::Nginx,
+            "sh".to_string(),
+            vec!["-c".to_string(), "pwd > pwd-output".to_string()],
+            cwd.clone(),
+        );
+        svc.start().unwrap();
+        // Allow the child to write the file
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = svc.stop();
+
+        let contents = std::fs::read_to_string(&marker)
+            .expect("child should have written pwd-output in cwd");
+        let observed = std::path::PathBuf::from(contents.trim());
+        let observed = std::fs::canonicalize(&observed).unwrap_or(observed);
+        assert_eq!(observed, cwd);
     }
 }

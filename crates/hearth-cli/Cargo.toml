@@ -19,3 +19,4 @@ nix = { workspace = true }
 opener = "0.7"
 chrono = { workspace = true }
 reqwest = { workspace = true }
+dialoguer = "0.11"

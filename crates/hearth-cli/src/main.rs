@@ -1,11 +1,33 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use hearth_lib::add::AddAnswers;
 use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
+
+/// Closed enum of packages accepted by `hearth add`. Validated at parse time so users
+/// get a clean clap error rather than a runtime "unknown package".
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AddPackage {
+    Horizon,
+    Telescope,
+    Pulse,
+    Reverb,
+}
+
+impl AddPackage {
+    fn as_key(&self) -> &'static str {
+        match self {
+            AddPackage::Horizon => "horizon",
+            AddPackage::Telescope => "telescope",
+            AddPackage::Pulse => "pulse",
+            AddPackage::Reverb => "reverb",
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "hearth", about = "Unified Laravel development command center")]
@@ -92,6 +114,29 @@ enum Commands {
 
     /// First-time setup (installs Valet, configures DNS, trusts CA)
     Install,
+
+    /// Install a known Laravel package (horizon, telescope, pulse, reverb).
+    ///
+    /// Walks `composer require` + `php artisan` against the Laravel site at --site
+    /// (or the first linked site reached by walking up from cwd). Horizon and Reverb
+    /// additionally register a supervised worker that survives daemon restart.
+    Add {
+        /// Package to install
+        #[arg(value_enum)]
+        package: AddPackage,
+        /// Absolute path to a linked Laravel site (defaults to walking up from cwd)
+        #[arg(long)]
+        site: Option<PathBuf>,
+        /// Accept all prompt defaults non-interactively
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Install + configure but do not register supervised workers
+        #[arg(long)]
+        no_supervise: bool,
+        /// Print planned actions; touch no files, run no commands
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -220,6 +265,15 @@ async fn main() -> anyhow::Result<()> {
             let mcp_url = format!("http://127.0.0.1:{}/mcp", config.mcp_port);
             eprintln!("Hearth MCP stdio bridge → {}", mcp_url);
             return run_mcp_bridge(&mcp_url).await;
+        }
+        Commands::Add {
+            package,
+            site,
+            yes,
+            no_supervise,
+            dry_run,
+        } => {
+            return run_add(package, site, yes, no_supervise, dry_run).await;
         }
     };
 
@@ -396,7 +450,15 @@ async fn run_install() -> anyhow::Result<()> {
     println!("\n[2/3] Creating config directory...");
     let config_dir = hearth_lib::config_dir();
     std::fs::create_dir_all(&config_dir)?;
-    let config = hearth_lib::config::HearthConfig::default();
+    let mut config = hearth_lib::config::HearthConfig::default();
+    // Resolve composer.phar up-front so `hearth add` can shell out via the site's PHP
+    // (avoids the brew composer wrapper, which uses the system PHP — scratchpad 796 B3).
+    config.composer_phar = hearth_lib::add::composer::resolve_composer_phar();
+    if let Some(ref phar) = config.composer_phar {
+        println!("  Resolved composer.phar → {}", phar.display());
+    } else {
+        println!("  Warning: composer.phar not found on host. `hearth add` will probe at request time.");
+    }
     config.save()?;
     println!("  Config saved to {}", config_dir.display());
 
@@ -573,6 +635,235 @@ async fn run_laravel(command: LaravelCommands) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Drive `hearth add <package>` — interactive prompts when on a TTY, deterministic
+/// defaults under `--yes`. Sends the populated `AddAnswers` to the daemon and prints
+/// the response.
+///
+/// `IsTerminal` from stdlib (Rust 1.70+) avoids the deprecated `atty` crate.
+async fn run_add(
+    package: AddPackage,
+    site: Option<PathBuf>,
+    yes: bool,
+    no_supervise: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+
+    if !yes && !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "refusing to prompt on non-TTY; pass --yes to accept defaults"
+        );
+    }
+
+    let site_path = site
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let answers = match package {
+        AddPackage::Telescope => telescope_prompts(yes)?,
+        AddPackage::Horizon => horizon_prompts(yes)?,
+        AddPackage::Reverb => reverb_prompts(yes)?,
+        AddPackage::Pulse => pulse_prompts(yes)?,
+    };
+
+    // Up-front message so the user knows composer-require can take 30-90s. The actual
+    // log file is written by the daemon once composer finishes (streaming protocol is
+    // Phase 4 per plan §R2 / hearth-add plan).
+    let log_path = hearth_lib::log_dir().join(format!("add-{}.log", package.as_key()));
+    if !dry_run {
+        eprintln!(
+            "► running composer require + artisan (can take 30-90s; daemon log: {})",
+            log_path.display()
+        );
+    }
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let request = DaemonRequest::Add {
+        package: package.as_key().to_string(),
+        site_path,
+        cwd,
+        answers,
+        no_supervise,
+        dry_run,
+    };
+
+    let response = send_to_daemon(request).await?;
+    print_response(response);
+    Ok(())
+}
+
+/// Collect Telescope-specific answers. With `--yes`, takes defaults:
+/// telescope_environments = ["local"], telescope_enable_in_prod = false.
+fn telescope_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
+    let mut answers = AddAnswers::default();
+    if yes {
+        answers.telescope_environments = Some(vec!["local".to_string()]);
+        answers.telescope_enable_in_prod = Some(false);
+        return Ok(answers);
+    }
+
+    let env_choices = ["local", "staging", "production"];
+    let defaults = [true, false, false];
+    let selected_idx = dialoguer::MultiSelect::new()
+        .with_prompt("Enable Telescope in which environments? (space to toggle, enter to accept)")
+        .items(&env_choices)
+        .defaults(&defaults)
+        .interact()?;
+    let selected: Vec<String> = selected_idx
+        .iter()
+        .map(|&i| env_choices[i].to_string())
+        .collect();
+    answers.telescope_environments = Some(selected);
+
+    let in_prod = dialoguer::Confirm::new()
+        .with_prompt("Will Telescope run in production?")
+        .default(false)
+        .interact()?;
+    answers.telescope_enable_in_prod = Some(in_prod);
+
+    Ok(answers)
+}
+
+/// Collect Horizon-specific answers. `--yes` defaults: connection=redis,
+/// environment=local, max_processes=3.
+fn horizon_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
+    let mut answers = AddAnswers::default();
+    if yes {
+        answers.horizon_connection = Some("redis".to_string());
+        answers.horizon_environment = Some("local".to_string());
+        answers.horizon_max_processes = Some(3);
+        return Ok(answers);
+    }
+
+    let connections = ["redis", "database", "sqs", "beanstalkd"];
+    let idx = dialoguer::Select::new()
+        .with_prompt("Queue connection?")
+        .items(&connections)
+        .default(0)
+        .interact()?;
+    answers.horizon_connection = Some(connections[idx].to_string());
+
+    let env: String = dialoguer::Input::new()
+        .with_prompt("Horizon environment name")
+        .default("local".to_string())
+        .interact_text()?;
+    answers.horizon_environment = Some(env);
+
+    let max_processes: i64 = dialoguer::Input::new()
+        .with_prompt("Max processes per supervisor (1-64)")
+        .default(3)
+        .validate_with(|n: &i64| -> Result<(), &str> {
+            if (1..=64).contains(n) {
+                Ok(())
+            } else {
+                Err("must be 1-64")
+            }
+        })
+        .interact_text()?;
+    answers.horizon_max_processes = Some(max_processes);
+
+    Ok(answers)
+}
+
+/// Collect Reverb-specific answers. With `--yes`: host=0.0.0.0, port=8080
+/// (auto-bump 8080..=8099 if busy), scheme=http. Bracketed-error if all 20 ports
+/// in the range are busy.
+fn reverb_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
+    use hearth_lib::add::prompt::{first_free_port, port_is_free};
+    let mut answers = AddAnswers::default();
+
+    if yes {
+        answers.reverb_host = Some("0.0.0.0".to_string());
+        answers.reverb_scheme = Some("http".to_string());
+        // Auto-bump if 8080 busy (scratchpad 796 B6).
+        let port = if port_is_free(8080) {
+            8080
+        } else {
+            first_free_port(8080, 8099, 20)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "ports 8080..=8099 are all busy; pass --site and rerun without --yes"
+                ))?
+        };
+        answers.reverb_port = Some(port);
+        return Ok(answers);
+    }
+
+    let host: String = dialoguer::Input::new()
+        .with_prompt("Reverb host")
+        .default("0.0.0.0".to_string())
+        .interact_text()?;
+    answers.reverb_host = Some(host);
+
+    let port: u16 = loop {
+        let candidate: u16 = dialoguer::Input::new()
+            .with_prompt("Reverb port")
+            .default(8080)
+            .validate_with(|n: &u16| -> Result<(), &str> {
+                if (1024..=65535).contains(n) {
+                    Ok(())
+                } else {
+                    Err("must be 1024-65535")
+                }
+            })
+            .interact_text()?;
+        if port_is_free(candidate) {
+            break candidate;
+        }
+        if dialoguer::Confirm::new()
+            .with_prompt(format!("Port {candidate} is busy. Try {}?", candidate + 1))
+            .default(true)
+            .interact()?
+        {
+            // Loop and re-prompt with the suggested port as the next default. We do
+            // this by writing the prompt again rather than threading state through.
+            continue;
+        } else {
+            anyhow::bail!("Reverb port {candidate} busy; rerun and choose a free port");
+        }
+    };
+    answers.reverb_port = Some(port);
+
+    let hostname: String = dialoguer::Input::new()
+        .with_prompt("Reverb hostname (sent to the JS client)")
+        .allow_empty(true)
+        .interact_text()?;
+    if !hostname.is_empty() {
+        answers.reverb_hostname = Some(hostname);
+    }
+
+    let schemes = ["http", "https"];
+    let idx = dialoguer::Select::new()
+        .with_prompt("Reverb scheme")
+        .items(&schemes)
+        .default(0)
+        .interact()?;
+    answers.reverb_scheme = Some(schemes[idx].to_string());
+
+    Ok(answers)
+}
+
+/// Collect Pulse-specific answers. Single prompt: storage driver (default: database).
+/// The `pulse_ingest_trim_lottery` advanced prompt is intentionally dropped
+/// (dissent D3 in scratchpad 796) — defaults to Pulse's own default of 100.
+fn pulse_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
+    let mut answers = AddAnswers::default();
+    if yes {
+        answers.pulse_storage_driver = Some("database".to_string());
+        return Ok(answers);
+    }
+    let drivers = ["database", "redis"];
+    let idx = dialoguer::Select::new()
+        .with_prompt("Pulse storage driver")
+        .items(&drivers)
+        .default(0)
+        .interact()?;
+    answers.pulse_storage_driver = Some(drivers[idx].to_string());
+    Ok(answers)
 }
 
 /// Stdio-to-HTTP bridge for MCP clients that only support stdio transport.
