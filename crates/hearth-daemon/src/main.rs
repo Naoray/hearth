@@ -605,6 +605,7 @@ async fn process_request(
         DaemonRequest::Add {
             package,
             site_path,
+            cwd: cli_cwd,
             answers,
             no_supervise,
             dry_run,
@@ -628,7 +629,13 @@ async fn process_request(
 
             // Resolve site context under site_manager lock.
             let site_path_buf = PathBuf::from(&site_path);
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            // Use the CLI's cwd, not the daemon's. Daemon may be running from `/` via
+            // launchd / `brew services`; the CLI knows where the user actually invoked.
+            let cwd = if cli_cwd.is_empty() {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+            } else {
+                PathBuf::from(&cli_cwd)
+            };
             let snapshot_config = HearthConfig {
                 default_php: default_php_clone,
                 ..HearthConfig::default()
