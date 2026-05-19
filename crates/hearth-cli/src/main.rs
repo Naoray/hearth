@@ -539,10 +539,27 @@ async fn daemon_start() -> anyhow::Result<()> {
         .filter(|p| p.is_file())
         .map(|p| p.into_os_string())
         .unwrap_or_else(|| std::ffi::OsString::from("hearth-daemon"));
-    let child = std::process::Command::new(&daemon_bin)
+    let mut command = std::process::Command::new(&daemon_bin);
+    command
         .stdin(std::process::Stdio::null())
         .stdout(stdout_file)
-        .stderr(stderr_file)
+        .stderr(stderr_file);
+    // Detach from the CLI's session so the daemon survives the parent shell's
+    // SIGHUP. Without setsid the daemon dies with whichever PTY started it —
+    // visible under tight session managers (codex, tmux detach) but masked
+    // under interactive zsh/bash. setsid also installs the daemon as its own
+    // session leader, which the supervisor relies on for process-group reaping.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            // SAFETY: setsid is async-signal-safe; safe to call between fork and exec.
+            nix::unistd::setsid()
+                .map(|_| ())
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+        });
+    }
+    let child = command
         .spawn()
         .context("Failed to start hearth-daemon. Is it installed next to the `hearth` binary or on PATH?")?;
 
