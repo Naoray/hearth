@@ -4,7 +4,12 @@ pub mod supervisor;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
-/// Services that Hearth can supervise
+/// Services that Hearth can supervise.
+///
+/// `Horizon`/`Reverb` (added by `hearth add`) are per-site Laravel workers. v0.3.0
+/// ships single-site only — `hearth add horizon` from a second linked site errors
+/// with a "multi-site is v0.3.1" message. Display layer surfaces the site name via
+/// `ManagedService::display_name()` (e.g. `horizon[shopfront]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceKind {
@@ -16,6 +21,8 @@ pub enum ServiceKind {
     Postgresql,
     Mailpit,
     DumpServer,
+    Horizon,
+    Reverb,
 }
 
 impl ServiceKind {
@@ -29,6 +36,8 @@ impl ServiceKind {
             Self::Postgresql => "postgresql",
             Self::Mailpit => "mailpit",
             Self::DumpServer => "dump-server",
+            Self::Horizon => "horizon",
+            Self::Reverb => "reverb",
         }
     }
 
@@ -53,7 +62,10 @@ impl std::str::FromStr for ServiceKind {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
+        // Accept `horizon[shopfront]` by stripping the bracket suffix — the display
+        // layer adds it; tolerating it on parse lets users copy-paste from `status`.
+        let bare = s.split('[').next().unwrap_or(s).trim();
+        match bare.to_lowercase().as_str() {
             "nginx" => Ok(Self::Nginx),
             "php-fpm" | "phpfpm" | "php" => Ok(Self::PhpFpm),
             "dnsmasq" | "dns" => Ok(Self::Dnsmasq),
@@ -62,6 +74,8 @@ impl std::str::FromStr for ServiceKind {
             "postgresql" | "postgres" | "pg" => Ok(Self::Postgresql),
             "mailpit" | "mail" => Ok(Self::Mailpit),
             "dump-server" | "dump" => Ok(Self::DumpServer),
+            "horizon" => Ok(Self::Horizon),
+            "reverb" => Ok(Self::Reverb),
             _ => Err(format!("unknown service: {s}")),
         }
     }
@@ -165,12 +179,32 @@ mod tests {
             ServiceKind::Postgresql,
             ServiceKind::Mailpit,
             ServiceKind::DumpServer,
+            ServiceKind::Horizon,
+            ServiceKind::Reverb,
         ];
         for kind in kinds {
             let name = kind.to_string();
             let parsed: ServiceKind = name.parse().unwrap();
             assert_eq!(parsed, kind);
         }
+    }
+
+    #[test]
+    fn service_kind_parses_horizon_and_reverb() {
+        assert_eq!("horizon".parse::<ServiceKind>().unwrap(), ServiceKind::Horizon);
+        assert_eq!("reverb".parse::<ServiceKind>().unwrap(), ServiceKind::Reverb);
+    }
+
+    #[test]
+    fn service_kind_strips_bracket_suffix() {
+        assert_eq!(
+            "horizon[shopfront]".parse::<ServiceKind>().unwrap(),
+            ServiceKind::Horizon
+        );
+        assert_eq!(
+            "reverb[chatapp]".parse::<ServiceKind>().unwrap(),
+            ServiceKind::Reverb
+        );
     }
 
     #[test]

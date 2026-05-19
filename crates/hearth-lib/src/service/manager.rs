@@ -1,8 +1,8 @@
-use tracing::info;
+use tracing::{info, warn};
 
 use super::supervisor::ManagedService;
 use super::ServiceKind;
-use crate::config::HearthConfig;
+use crate::config::{AddedPackage, HearthConfig};
 
 /// Detect whether Laravel Herd is running by checking for its process.
 pub fn is_herd_running() -> bool {
@@ -10,6 +10,45 @@ pub fn is_herd_running() -> bool {
         .args(["-q", "-f", "Herd\\.app"])
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// Filter `added_packages` to only entries whose `<site_path>/vendor/<vendor>/<pkg>`
+/// still exists on disk. Returns the kept entries and the dropped entries so the
+/// caller can persist the cleaned config + log warnings.
+///
+/// Closes the gap left by `hearth remove` being out of v0.3.0 scope — without this,
+/// a user who `composer remove laravel/horizon` would be stuck with the supervisor
+/// hammering a broken worker until the circuit breaker trips. (Scratchpad 796 B1.)
+pub fn prune_added_packages(packages: &[AddedPackage]) -> (Vec<AddedPackage>, Vec<AddedPackage>) {
+    let mut kept = Vec::with_capacity(packages.len());
+    let mut dropped = Vec::new();
+    for pkg in packages {
+        let vendor_path = pkg.site_path.join("vendor").join(vendor_path_for(&pkg.package));
+        if vendor_path.exists() {
+            kept.push(pkg.clone());
+        } else {
+            warn!(
+                package = %pkg.package,
+                site = %pkg.site_path.display(),
+                "prune: {} at {} no longer installed; removed from supervised list",
+                pkg.package,
+                pkg.site_path.display(),
+            );
+            dropped.push(pkg.clone());
+        }
+    }
+    (kept, dropped)
+}
+
+/// Map a package key to its vendor-relative path (e.g. `"horizon"` → `"laravel/horizon"`).
+pub fn vendor_path_for(package: &str) -> String {
+    match package {
+        "horizon" => "laravel/horizon".to_string(),
+        "telescope" => "laravel/telescope".to_string(),
+        "pulse" => "laravel/pulse".to_string(),
+        "reverb" => "laravel/reverb".to_string(),
+        other => format!("laravel/{other}"),
+    }
 }
 
 /// Build the default set of managed services based on configuration.
@@ -130,6 +169,23 @@ pub fn default_services(config: &HearthConfig, config_dir: &std::path::Path) -> 
                 }
             }
         }
+    }
+
+    // Supervised AddedPackage entries (Horizon, Reverb). Boot-time prune already ran
+    // before this is called (see daemon main.rs), so every entry here has a vendor dir.
+    for pkg in &config.added_packages {
+        let kind = match pkg.package.as_str() {
+            "horizon" => ServiceKind::Horizon,
+            "reverb" => ServiceKind::Reverb,
+            _ => continue, // telescope/pulse are install-only
+        };
+        services.push(ManagedService::with_cwd_and_site(
+            kind,
+            pkg.command.clone(),
+            pkg.args.clone(),
+            pkg.site_path.clone(),
+            pkg.site_name.clone(),
+        ));
     }
 
     services
@@ -304,5 +360,95 @@ mod tests {
             !kinds.contains(&ServiceKind::Postgresql),
             "postgres should be skipped on port collision, got: {kinds:?}"
         );
+    }
+
+    #[test]
+    fn vendor_path_for_maps_known_packages() {
+        assert_eq!(vendor_path_for("horizon"), "laravel/horizon");
+        assert_eq!(vendor_path_for("telescope"), "laravel/telescope");
+        assert_eq!(vendor_path_for("pulse"), "laravel/pulse");
+        assert_eq!(vendor_path_for("reverb"), "laravel/reverb");
+    }
+
+    #[test]
+    fn prune_drops_packages_whose_vendor_dir_is_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let site_kept = tmp.path().join("site-kept");
+        std::fs::create_dir_all(site_kept.join("vendor/laravel/horizon")).unwrap();
+        let site_gone = tmp.path().join("site-gone");
+        std::fs::create_dir_all(site_gone.join("vendor")).unwrap();
+        // vendor/laravel/horizon NOT created — composer remove happened externally
+
+        let now = chrono::Utc::now();
+        let packages = vec![
+            AddedPackage {
+                package: "horizon".to_string(),
+                site_path: site_kept.clone(),
+                site_name: "kept".to_string(),
+                command: "/php".to_string(),
+                args: vec!["artisan".to_string(), "horizon".to_string()],
+                installed_at: now,
+            },
+            AddedPackage {
+                package: "horizon".to_string(),
+                site_path: site_gone.clone(),
+                site_name: "gone".to_string(),
+                command: "/php".to_string(),
+                args: vec!["artisan".to_string(), "horizon".to_string()],
+                installed_at: now,
+            },
+        ];
+        let (kept, dropped) = prune_added_packages(&packages);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].site_name, "kept");
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].site_name, "gone");
+    }
+
+    #[test]
+    fn prune_empty_input_returns_empty() {
+        let (kept, dropped) = prune_added_packages(&[]);
+        assert!(kept.is_empty());
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn default_services_registers_horizon_from_added_packages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = HearthConfig::default();
+        config.added_packages.push(AddedPackage {
+            package: "horizon".to_string(),
+            site_path: tmp.path().to_path_buf(),
+            site_name: "shopfront".to_string(),
+            command: "/php".to_string(),
+            args: vec!["artisan".to_string(), "horizon".to_string()],
+            installed_at: chrono::Utc::now(),
+        });
+
+        let services = default_services(&config, tmp.path());
+        let horizon = services
+            .iter()
+            .find(|s| s.kind == ServiceKind::Horizon)
+            .expect("Horizon should be registered");
+        assert_eq!(horizon.site_name(), Some("shopfront"));
+        assert_eq!(horizon.display_name(), "horizon[shopfront]");
+    }
+
+    #[test]
+    fn default_services_ignores_telescope_in_added_packages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = HearthConfig::default();
+        config.added_packages.push(AddedPackage {
+            package: "telescope".to_string(),
+            site_path: tmp.path().to_path_buf(),
+            site_name: "blog".to_string(),
+            command: String::new(),
+            args: vec![],
+            installed_at: chrono::Utc::now(),
+        });
+
+        let services = default_services(&config, tmp.path());
+        assert!(services.iter().all(|s| s.kind != ServiceKind::Horizon));
+        assert!(services.iter().all(|s| s.kind != ServiceKind::Reverb));
     }
 }

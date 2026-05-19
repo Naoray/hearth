@@ -1,11 +1,33 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use hearth_lib::add::AddAnswers;
 use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
+
+/// Closed enum of packages accepted by `hearth add`. Validated at parse time so users
+/// get a clean clap error rather than a runtime "unknown package".
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AddPackage {
+    Horizon,
+    Telescope,
+    Pulse,
+    Reverb,
+}
+
+impl AddPackage {
+    fn as_key(&self) -> &'static str {
+        match self {
+            AddPackage::Horizon => "horizon",
+            AddPackage::Telescope => "telescope",
+            AddPackage::Pulse => "pulse",
+            AddPackage::Reverb => "reverb",
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "hearth", about = "Unified Laravel development command center")]
@@ -92,6 +114,29 @@ enum Commands {
 
     /// First-time setup (installs Valet, configures DNS, trusts CA)
     Install,
+
+    /// Install a known Laravel package (horizon, telescope, pulse, reverb).
+    ///
+    /// Foundation v0.3.0: subcommand + protocol wired; recipes land per package in
+    /// subsequent tasks. Until a recipe ships for the requested package, the daemon
+    /// returns a "not yet implemented" error.
+    Add {
+        /// Package to install
+        #[arg(value_enum)]
+        package: AddPackage,
+        /// Absolute path to a linked Laravel site (defaults to walking up from cwd)
+        #[arg(long)]
+        site: Option<PathBuf>,
+        /// Accept all prompt defaults non-interactively
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Install + configure but do not register supervised workers
+        #[arg(long)]
+        no_supervise: bool,
+        /// Print planned actions; touch no files, run no commands
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -220,6 +265,28 @@ async fn main() -> anyhow::Result<()> {
             let mcp_url = format!("http://127.0.0.1:{}/mcp", config.mcp_port);
             eprintln!("Hearth MCP stdio bridge → {}", mcp_url);
             return run_mcp_bridge(&mcp_url).await;
+        }
+        Commands::Add {
+            package,
+            site,
+            yes: _,
+            no_supervise,
+            dry_run,
+        } => {
+            // Task 1 ships the protocol wire; Task 3 will add the dialoguer prompt loop
+            // and call `hearth_lib::add::apply_recipe`. Until then, send empty answers
+            // — the daemon stub returns a clear "not yet implemented" message.
+            let site_path = match site {
+                Some(p) => p.to_string_lossy().to_string(),
+                None => std::env::current_dir()?.to_string_lossy().to_string(),
+            };
+            DaemonRequest::Add {
+                package: package.as_key().to_string(),
+                site_path,
+                answers: AddAnswers::default(),
+                no_supervise,
+                dry_run,
+            }
         }
     };
 

@@ -11,7 +11,7 @@ use hearth_lib::config::HearthConfig;
 use hearth_lib::db::health::port_in_use;
 use hearth_lib::mcp::HearthMcpServer;
 use hearth_lib::php::PhpManager;
-use hearth_lib::service::manager::default_services;
+use hearth_lib::service::manager::{default_services, prune_added_packages};
 use hearth_lib::service::supervisor::ServiceSupervisor;
 use hearth_lib::service::{ServiceKind, ServiceState};
 use hearth_lib::site::SiteManager;
@@ -28,11 +28,16 @@ use rmcp::transport::StreamableHttpService;
 ///
 /// Lock ordering convention (when multiple locks are needed):
 ///   `config` -> `php_manager` -> `site_manager` -> `supervisor`
+///
+/// `add_lock` is a coarse mutex held for the duration of an `Add` handler. Concurrent
+/// `hearth add` invocations against the same site would otherwise race on `.env`
+/// editing and supervisor registration (scratchpad 796 H8).
 struct DaemonState {
     supervisor: Arc<Mutex<ServiceSupervisor>>,
     config: Arc<Mutex<HearthConfig>>,
     site_manager: Arc<Mutex<SiteManager>>,
     php_manager: Arc<Mutex<PhpManager>>,
+    add_lock: Arc<Mutex<()>>,
 }
 
 #[tokio::main]
@@ -44,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Hearth daemon starting...");
 
     // Load config
-    let config = HearthConfig::load().context("Failed to load config")?;
+    let mut config = HearthConfig::load().context("Failed to load config")?;
 
     // Ensure directories exist before any engine registration. DB engines
     // expect `run/` and `data/` to be present on first start; pre-creating
@@ -54,7 +59,19 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(hearth_lib::log_dir())?;
     std::fs::create_dir_all(hearth_lib::data_dir())?;
 
-    // Build supervisor with default services
+    // Boot-time prune: drop AddedPackage entries whose vendor dir no longer exists on
+    // disk (closes the gap left by `hearth remove` being out of v0.3.0 scope).
+    let (kept, dropped) = prune_added_packages(&config.added_packages);
+    if !dropped.is_empty() {
+        info!(count = dropped.len(), "pruned stale AddedPackage entries from config");
+        config.added_packages = kept;
+        if let Err(e) = config.save() {
+            warn!(error = %e, "failed to persist pruned config");
+        }
+    }
+
+    // Build supervisor with default services. Per-package supervised registration
+    // lands in Task 4 (Horizon) and Task 5 (Reverb).
     let mut supervisor = ServiceSupervisor::new();
     for svc in default_services(&config, &config_dir) {
         supervisor.register(svc);
@@ -78,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(Mutex::new(config)),
         site_manager: Arc::new(Mutex::new(SiteManager::with_homes(valet_homes, tld))),
         php_manager: Arc::new(Mutex::new(PhpManager::new(hearth_lib::config_dir()))),
+        add_lock: Arc::new(Mutex::new(())),
     });
 
     // Remove stale socket
@@ -584,6 +602,24 @@ async fn process_request(
 
         DaemonRequest::DbStatus => {
             db_status(state).await
+        }
+
+        DaemonRequest::Add {
+            package,
+            site_path: _,
+            answers: _,
+            no_supervise: _,
+            dry_run: _,
+        } => {
+            // Recipes land in Task 2+. Foundation only wires the request type, the
+            // serialization protocol, and the add_lock; concurrent Add invocations
+            // serialize here even though the handler body is still a stub.
+            let _guard = state.add_lock.lock().await;
+            DaemonResponse::Error {
+                message: format!(
+                    "hearth add {package}: recipe not yet implemented (foundation v0.3.0)"
+                ),
+            }
         }
 
         DaemonRequest::PhpSwitch { version } => {
