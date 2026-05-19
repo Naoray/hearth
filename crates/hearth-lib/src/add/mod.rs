@@ -11,6 +11,7 @@ pub mod laravel;
 pub mod prompt;
 pub mod recipe;
 pub mod site_context;
+pub mod telescope;
 
 use serde::{Deserialize, Serialize};
 
@@ -48,14 +49,14 @@ pub struct AddAnswers {
 /// error path during foundation testing.
 pub fn apply_recipe(
     package: &str,
-    _ctx: &RecipeContext,
-    _answers: &AddAnswers,
+    ctx: &RecipeContext,
+    answers: &AddAnswers,
 ) -> anyhow::Result<RecipeOutcome> {
     match package {
-        // "telescope" => telescope::apply(_ctx, _answers),
-        // "horizon"   => horizon::apply(_ctx, _answers),
-        // "pulse"     => pulse::apply(_ctx, _answers),
-        // "reverb"    => reverb::apply(_ctx, _answers),
+        "telescope" => telescope::apply(ctx, answers),
+        // "horizon"   => horizon::apply(ctx, answers),
+        // "pulse"     => pulse::apply(ctx, answers),
+        // "reverb"    => reverb::apply(ctx, answers),
         other => anyhow::bail!("unknown or not-yet-implemented package: {other}"),
     }
 }
@@ -91,5 +92,23 @@ mod tests {
         let ctx = RecipeContext::for_test(PathBuf::from("/tmp/x"), "x");
         let err = apply_recipe("not-a-package", &ctx, &AddAnswers::default()).unwrap_err();
         assert!(err.to_string().contains("unknown"));
+    }
+
+    #[test]
+    fn apply_recipe_dispatches_telescope() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("composer.json"),
+            r#"{"require":{"laravel/framework":"^11.0"},"require-dev":{"laravel/telescope":"^5.0"}}"#,
+        )
+        .unwrap();
+        let ctx = RecipeContext::for_test(tmp.path().to_path_buf(), "test-app");
+        let outcome = apply_recipe("telescope", &ctx, &AddAnswers::default()).unwrap();
+        // Already in require-dev → composer skipped, but artisan + env still scheduled.
+        assert!(outcome.composer_skipped);
+        assert!(outcome
+            .artisan_calls
+            .iter()
+            .any(|s| s == "telescope:install"));
     }
 }

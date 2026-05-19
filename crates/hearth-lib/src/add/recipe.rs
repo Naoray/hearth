@@ -35,12 +35,14 @@ pub struct RecipeContext {
 
 impl RecipeContext {
     /// Minimal builder used in unit tests where most fields are irrelevant.
+    /// `composer_phar` defaults to a non-existent stub path; safe because `dry_run = true`
+    /// makes composer skip file checks.
     pub fn for_test(site_path: PathBuf, site_name: impl Into<String>) -> Self {
         Self {
             site_path,
             site_name: site_name.into(),
             php_binary: PathBuf::from("/usr/bin/php"),
-            composer_phar: None,
+            composer_phar: Some(PathBuf::from("/opt/composer.phar")),
             no_supervise: false,
             dry_run: true,
             log_path: None,
