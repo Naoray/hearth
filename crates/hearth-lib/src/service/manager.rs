@@ -98,6 +98,23 @@ pub fn default_services(config: &HearthConfig, config_dir: &std::path::Path) -> 
         }
     }
 
+    // Redis — dataless engine. Same port_in_use guard as Postgres.
+    if let Some(redis_bin) = crate::db::redis::resolve_redis_binary(config_dir) {
+        if crate::db::health::port_in_use("127.0.0.1", config.redis_port) {
+            info!(
+                port = config.redis_port,
+                "redis port already in use — skipping registration"
+            );
+        } else {
+            match crate::db::redis::managed_service(&redis_bin, config, config_dir) {
+                Ok(svc) => services.push(svc),
+                Err(e) => {
+                    info!(error = %e, "failed to build redis ManagedService — skipping")
+                }
+            }
+        }
+    }
+
     services
 }
 
@@ -164,6 +181,47 @@ mod tests {
             kinds.contains(&ServiceKind::Postgresql),
             "postgres should be registered, got: {kinds:?}"
         );
+    }
+
+    fn write_fake_redis(bin: &std::path::Path) {
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(bin, "fake").unwrap();
+    }
+
+    #[test]
+    fn default_services_registers_redis_when_binary_present_and_port_free() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fake_redis(&tmp.path().join("services/redis/bin/redis-server"));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let free_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = HearthConfig {
+            redis_port: free_port,
+            ..HearthConfig::default()
+        };
+        let services = default_services(&config, tmp.path());
+        let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
+        assert!(kinds.contains(&ServiceKind::Redis), "got: {kinds:?}");
+    }
+
+    #[test]
+    fn default_services_skips_redis_when_port_in_use() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fake_redis(&tmp.path().join("services/redis/bin/redis-server"));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy_port = listener.local_addr().unwrap().port();
+        let config = HearthConfig {
+            redis_port: busy_port,
+            ..HearthConfig::default()
+        };
+        let services = default_services(&config, tmp.path());
+        drop(listener);
+
+        let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
+        assert!(!kinds.contains(&ServiceKind::Redis), "got: {kinds:?}");
     }
 
     #[test]

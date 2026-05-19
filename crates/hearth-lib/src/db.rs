@@ -13,3 +13,4 @@
 pub mod health;
 pub mod init;
 pub mod postgres;
+pub mod redis;
