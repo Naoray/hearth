@@ -2,12 +2,14 @@
 
 ## Architecture
 
-CLI-first Rust application with Tauri GUI wrapper (Phase 3).
+CLI-first Rust application with Tauri GUI wrapper (Phase 5).
+
+**Current phase: Phase 3 (`hearth add`). Deadline 2026-05-26.**
 
 ```
 hearth-daemon (always-on, owns all processes via process groups)
   ├── hearth-cli (thin client, talks to daemon via Unix socket)
-  ├── hearth-gui (Tauri, Phase 3, also thin client)
+  ├── hearth-gui (Tauri, Phase 5, also thin client)
   └── MCP server (in-process, Streamable HTTP on port 9900)
 ```
 

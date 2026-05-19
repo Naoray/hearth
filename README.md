@@ -112,7 +112,8 @@ Hearth finds PHP binaries in this order:
 - [x] Phase 2: Mailpit, dump server, Homebrew distribution
 - [ ] Phase 3: `hearth add` — guided package installer (Horizon, Telescope, Pulse, Reverb)
 - [ ] Phase 4: Database management (MySQL, PostgreSQL, Redis)
-- [ ] Phase 5: Log streaming per site, Scribe skill publishing
+- [ ] Phase 5: Tauri GUI (parked PR #4 lands here)
+- Future (not in v0.3.0): Log Viewer, XDebug detection
 
 ## License
 
