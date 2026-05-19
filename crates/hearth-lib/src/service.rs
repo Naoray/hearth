@@ -31,6 +31,16 @@ impl ServiceKind {
             Self::DumpServer => "dump-server",
         }
     }
+
+    /// True for the three DB engines supervised by `hearth db`.
+    pub fn is_db(&self) -> bool {
+        matches!(self, Self::Mysql | Self::Postgresql | Self::Redis)
+    }
+
+    /// All DB engine kinds, in canonical order (matches `hearth db status` rows).
+    pub fn db_engines() -> [ServiceKind; 3] {
+        [Self::Mysql, Self::Postgresql, Self::Redis]
+    }
 }
 
 impl std::fmt::Display for ServiceKind {

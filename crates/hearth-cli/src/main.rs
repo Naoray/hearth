@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use hearth_lib::socket::{DaemonRequest, DaemonResponse};
+use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
 
 #[derive(Parser)]
 #[command(name = "hearth", about = "Unified Laravel development command center")]
@@ -63,6 +63,12 @@ enum Commands {
         command: PhpCommands,
     },
 
+    /// Database engine management (mysql, postgres, redis)
+    Db {
+        #[command(subcommand)]
+        command: DbCommands,
+    },
+
     /// Laravel project management
     Laravel {
         #[command(subcommand)]
@@ -117,6 +123,29 @@ enum PhpCommands {
 }
 
 #[derive(Subcommand)]
+enum DbCommands {
+    /// Start a DB engine (mysql, postgres, redis, or all)
+    Start {
+        /// Engine name. Omit or pass `all` for every DB engine.
+        engine: Option<String>,
+    },
+    /// Stop a DB engine, or all DB engines.
+    Stop {
+        engine: Option<String>,
+    },
+    /// Restart a DB engine (stop + start).
+    Restart {
+        engine: Option<String>,
+    },
+    /// Report status of all DB engines.
+    Status {
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum LaravelCommands {
     /// Create a new Laravel project
     New {
@@ -159,6 +188,9 @@ async fn main() -> anyhow::Result<()> {
                 value,
             },
         },
+        Commands::Db { command } => {
+            return run_db(command).await;
+        }
         Commands::Daemon { command } => {
             return run_daemon(command).await;
         }
@@ -262,7 +294,87 @@ fn print_response(response: DaemonResponse) {
                 println!("PHP {}{} — {}", v.version, marker, v.path);
             }
         }
+        DaemonResponse::DbStatus { engines } => {
+            print_db_status_table(&engines);
+        }
+        DaemonResponse::Conflict { engine, port, owner_hint } => {
+            let hint = owner_hint
+                .as_deref()
+                .map(|h| format!(" (owner: {h})"))
+                .unwrap_or_default();
+            eprintln!(
+                "Error: port {port} for {engine} is already in use{hint}\n\
+                 Hint: stop the colliding process (e.g. `brew services stop {engine}`) or change the port in ~/.config/hearth/config.toml."
+            );
+            std::process::exit(1);
+        }
         DaemonResponse::Pong => println!("Daemon is running"),
+    }
+}
+
+fn normalize_engine_arg(raw: Option<String>) -> Option<String> {
+    match raw {
+        None => None,
+        Some(s) if s.eq_ignore_ascii_case("all") => None,
+        Some(s) => Some(s),
+    }
+}
+
+async fn run_db(command: DbCommands) -> anyhow::Result<()> {
+    match command {
+        DbCommands::Start { engine } => {
+            let response = send_to_daemon(DaemonRequest::DbStart {
+                engine: normalize_engine_arg(engine),
+            })
+            .await?;
+            print_response(response);
+        }
+        DbCommands::Stop { engine } => {
+            let response = send_to_daemon(DaemonRequest::DbStop {
+                engine: normalize_engine_arg(engine),
+            })
+            .await?;
+            print_response(response);
+        }
+        DbCommands::Restart { engine } => {
+            let target = normalize_engine_arg(engine);
+            let _ = send_to_daemon(DaemonRequest::DbStop {
+                engine: target.clone(),
+            })
+            .await?;
+            let response = send_to_daemon(DaemonRequest::DbStart { engine: target }).await?;
+            print_response(response);
+        }
+        DbCommands::Status { json } => {
+            let response = send_to_daemon(DaemonRequest::DbStatus).await?;
+            match response {
+                DaemonResponse::DbStatus { engines } if json => {
+                    println!("{}", serde_json::to_string(&engines)?);
+                }
+                DaemonResponse::DbStatus { engines } => print_db_status_table(&engines),
+                other => print_response(other),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_db_status_table(engines: &[DbEngineStatus]) {
+    println!(
+        "{:<12} {:<18} {:<6} {:<8} {}",
+        "ENGINE", "STATE", "PORT", "PID", "DATA_DIR"
+    );
+    println!("{}", "-".repeat(80));
+    for row in engines {
+        let pid = row.pid.map(|p| p.to_string()).unwrap_or_default();
+        let mut state = row.state.clone();
+        if row.conflict_port {
+            state = format!("{state} [conflict]");
+        }
+        println!(
+            "{:<12} {:<18} {:<6} {:<8} {}",
+            row.engine, state, row.port, pid, row.data_dir
+        );
     }
 }
 

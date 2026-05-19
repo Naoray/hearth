@@ -1,4 +1,5 @@
 pub mod config;
+pub mod db;
 pub mod download;
 pub mod dump;
 pub mod mailpit;
@@ -26,4 +27,9 @@ pub fn run_dir() -> PathBuf {
 /// Default log directory
 pub fn log_dir() -> PathBuf {
     config_dir().join("log")
+}
+
+/// Default data directory (parent of per-engine datadirs).
+pub fn data_dir() -> PathBuf {
+    config_dir().join("data")
 }

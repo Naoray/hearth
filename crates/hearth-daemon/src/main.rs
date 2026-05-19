@@ -8,12 +8,14 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use hearth_lib::config::HearthConfig;
+use hearth_lib::db::health::port_in_use;
 use hearth_lib::mcp::HearthMcpServer;
 use hearth_lib::php::PhpManager;
 use hearth_lib::service::manager::default_services;
 use hearth_lib::service::supervisor::ServiceSupervisor;
+use hearth_lib::service::{ServiceKind, ServiceState};
 use hearth_lib::site::SiteManager;
-use hearth_lib::socket::{DaemonRequest, DaemonResponse};
+use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
 
 use rmcp::transport::StreamableHttpServerConfig;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -44,10 +46,13 @@ async fn main() -> anyhow::Result<()> {
     // Load config
     let config = HearthConfig::load().context("Failed to load config")?;
 
-    // Ensure directories exist
+    // Ensure directories exist before any engine registration. DB engines
+    // expect `run/` and `data/` to be present on first start; pre-creating
+    // them once per daemon boot keeps the wrapper scripts simple.
     let config_dir = hearth_lib::config_dir();
     std::fs::create_dir_all(hearth_lib::run_dir())?;
     std::fs::create_dir_all(hearth_lib::log_dir())?;
+    std::fs::create_dir_all(hearth_lib::data_dir())?;
 
     // Build supervisor with default services
     let mut supervisor = ServiceSupervisor::new();
@@ -196,6 +201,165 @@ async fn handle_client(
     }
 
     Ok(())
+}
+
+/// Parse a CLI engine token (`mysql`, `pg`, `postgres`, ...) into a DB
+/// `ServiceKind`. Rejects non-DB kinds (e.g. `nginx`) so `hearth db start nginx`
+/// fails fast.
+fn parse_db_engine(name: &str) -> Result<ServiceKind, String> {
+    let kind: ServiceKind = name
+        .parse()
+        .map_err(|e: String| e)?;
+    if !kind.is_db() {
+        return Err(format!("{name} is not a DB engine"));
+    }
+    Ok(kind)
+}
+
+fn engines_for(target: Option<String>) -> Result<Vec<ServiceKind>, String> {
+    match target {
+        None => Ok(ServiceKind::db_engines().to_vec()),
+        Some(name) => Ok(vec![parse_db_engine(&name)?]),
+    }
+}
+
+fn port_for(config: &HearthConfig, kind: ServiceKind) -> u16 {
+    match kind {
+        ServiceKind::Mysql => config.mysql_port,
+        ServiceKind::Postgresql => config.postgres_port,
+        ServiceKind::Redis => config.redis_port,
+        _ => 0,
+    }
+}
+
+fn data_dir_for(kind: ServiceKind) -> PathBuf {
+    let segment = match kind {
+        ServiceKind::Mysql => "mysql",
+        ServiceKind::Postgresql => "postgresql",
+        ServiceKind::Redis => "redis",
+        _ => "unknown",
+    };
+    hearth_lib::data_dir().join(segment)
+}
+
+async fn db_start(state: &Arc<DaemonState>, engine: Option<String>) -> DaemonResponse {
+    let kinds = match engines_for(engine) {
+        Ok(k) => k,
+        Err(e) => return DaemonResponse::Error { message: e },
+    };
+
+    // Snapshot ports + registration state under config + supervisor locks
+    // (config first per lock ordering).
+    let port_map: Vec<(ServiceKind, u16)> = {
+        let cfg = state.config.lock().await;
+        kinds.iter().map(|k| (*k, port_for(&cfg, *k))).collect()
+    };
+
+    let mut sup = state.supervisor.lock().await;
+    let mut started: Vec<String> = Vec::new();
+
+    for (kind, port) in port_map {
+        let registered = sup.status().contains_key(&kind);
+        // Already running? Treat as no-op.
+        let already_running = matches!(
+            sup.status().get(&kind),
+            Some(ServiceState::Running { .. })
+        );
+        if already_running {
+            started.push(format!("{kind} already running"));
+            continue;
+        }
+
+        // P0 #5: re-probe inside the dispatch handler. Surfaces typed Conflict
+        // for the "Herd-up-AFTER-Hearth" race so the CLI prints clearly instead
+        // of burning the circuit breaker.
+        if port != 0 && port_in_use("127.0.0.1", port) {
+            return DaemonResponse::Conflict {
+                engine: kind.name().to_string(),
+                port,
+                owner_hint: None,
+            };
+        }
+
+        if !registered {
+            // Engine module not landed yet OR binary not found. Soft-fail with
+            // a clear message so smoke tests + downstream blocks can grep it.
+            started.push(format!("{kind} not registered"));
+            continue;
+        }
+
+        match sup.start_service(kind) {
+            Ok(()) => started.push(format!("{kind} started")),
+            Err(e) => started.push(format!("{kind} start failed: {e}")),
+        }
+    }
+
+    DaemonResponse::Ok {
+        message: Some(started.join("; ")),
+    }
+}
+
+async fn db_stop(state: &Arc<DaemonState>, engine: Option<String>) -> DaemonResponse {
+    let kinds = match engines_for(engine) {
+        Ok(k) => k,
+        Err(e) => return DaemonResponse::Error { message: e },
+    };
+
+    let mut sup = state.supervisor.lock().await;
+    let mut stopped: Vec<String> = Vec::new();
+    for kind in kinds {
+        if !sup.status().contains_key(&kind) {
+            stopped.push(format!("{kind} not registered"));
+            continue;
+        }
+        match sup.stop_service(kind) {
+            Ok(()) => stopped.push(format!("{kind} stopped")),
+            Err(e) => stopped.push(format!("{kind} stop failed: {e}")),
+        }
+    }
+    DaemonResponse::Ok {
+        message: Some(stopped.join("; ")),
+    }
+}
+
+async fn db_status(state: &Arc<DaemonState>) -> DaemonResponse {
+    let ports: Vec<(ServiceKind, u16)> = {
+        let cfg = state.config.lock().await;
+        ServiceKind::db_engines()
+            .iter()
+            .map(|k| (*k, port_for(&cfg, *k)))
+            .collect()
+    };
+
+    let sup = state.supervisor.lock().await;
+    let mut engines: Vec<DbEngineStatus> = Vec::with_capacity(3);
+
+    for (kind, port) in ports {
+        let (state_str, pid) = match sup.status().get(&kind) {
+            Some(ServiceState::Running { pid }) => ("running".to_string(), Some(*pid)),
+            Some(ServiceState::Starting) => ("starting".to_string(), None),
+            Some(ServiceState::Stopped) => ("stopped".to_string(), None),
+            Some(ServiceState::Failed { reason }) => (format!("failed: {reason}"), None),
+            None => ("not_registered".to_string(), None),
+        };
+
+        let port_busy = port_in_use("127.0.0.1", port);
+        // If we're running this engine, "port busy" means *us*, not a conflict.
+        let we_run_it = matches!(sup.status().get(&kind), Some(ServiceState::Running { .. }));
+        let conflict_port = port_busy && !we_run_it;
+
+        engines.push(DbEngineStatus {
+            engine: kind.name().to_string(),
+            state: state_str,
+            pid,
+            port,
+            data_dir: data_dir_for(kind).display().to_string(),
+            conflict_port,
+            owner_hint: None,
+        });
+    }
+
+    DaemonResponse::DbStatus { engines }
 }
 
 async fn process_request(
@@ -408,6 +572,18 @@ async fn process_request(
             DaemonResponse::Ok {
                 message: Some(format!("Set {key}={value} for PHP {resolved_version} and restarted php-fpm")),
             }
+        }
+
+        DaemonRequest::DbStart { engine } => {
+            db_start(state, engine).await
+        }
+
+        DaemonRequest::DbStop { engine } => {
+            db_stop(state, engine).await
+        }
+
+        DaemonRequest::DbStatus => {
+            db_status(state).await
         }
 
         DaemonRequest::PhpSwitch { version } => {
