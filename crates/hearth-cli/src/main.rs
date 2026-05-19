@@ -529,12 +529,22 @@ async fn daemon_start() -> anyhow::Result<()> {
     let stdout_file = std::fs::File::create(log_dir.join("daemon.out.log"))?;
     let stderr_file = std::fs::File::create(log_dir.join("daemon.err.log"))?;
 
-    let child = std::process::Command::new("hearth-daemon")
+    // Resolve hearth-daemon as a sibling of the current `hearth` binary first,
+    // then fall back to PATH. Without sibling-first resolution, a stale brew
+    // install of `hearth-daemon` on PATH shadows a fresh `cargo install` build
+    // and the CLI silently talks to the wrong daemon (variants mismatch).
+    let daemon_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("hearth-daemon")))
+        .filter(|p| p.is_file())
+        .map(|p| p.into_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("hearth-daemon"));
+    let child = std::process::Command::new(&daemon_bin)
         .stdin(std::process::Stdio::null())
         .stdout(stdout_file)
         .stderr(stderr_file)
         .spawn()
-        .context("Failed to start hearth-daemon. Is it installed and on PATH?")?;
+        .context("Failed to start hearth-daemon. Is it installed next to the `hearth` binary or on PATH?")?;
 
     let pid = child.id();
     println!("Daemon starting (PID {})...", pid);
