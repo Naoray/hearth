@@ -664,8 +664,8 @@ async fn run_add(
     let answers = match package {
         AddPackage::Telescope => telescope_prompts(yes)?,
         AddPackage::Horizon => horizon_prompts(yes)?,
+        AddPackage::Reverb => reverb_prompts(yes)?,
         AddPackage::Pulse => anyhow::bail!("hearth add pulse: recipe arrives in v0.3.0 Task 6"),
-        AddPackage::Reverb => anyhow::bail!("hearth add reverb: recipe arrives in v0.3.0 Task 5"),
     };
 
     // Up-front message so the user knows composer-require can take 30-90s. The actual
@@ -761,6 +761,83 @@ fn horizon_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
         })
         .interact_text()?;
     answers.horizon_max_processes = Some(max_processes);
+
+    Ok(answers)
+}
+
+/// Collect Reverb-specific answers. With `--yes`: host=0.0.0.0, port=8080
+/// (auto-bump 8080..=8099 if busy), scheme=http. Bracketed-error if all 20 ports
+/// in the range are busy.
+fn reverb_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
+    use hearth_lib::add::prompt::{first_free_port, port_is_free};
+    let mut answers = AddAnswers::default();
+
+    if yes {
+        answers.reverb_host = Some("0.0.0.0".to_string());
+        answers.reverb_scheme = Some("http".to_string());
+        // Auto-bump if 8080 busy (scratchpad 796 B6).
+        let port = if port_is_free(8080) {
+            8080
+        } else {
+            first_free_port(8080, 8099, 20)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "ports 8080..=8099 are all busy; pass --site and rerun without --yes"
+                ))?
+        };
+        answers.reverb_port = Some(port);
+        return Ok(answers);
+    }
+
+    let host: String = dialoguer::Input::new()
+        .with_prompt("Reverb host")
+        .default("0.0.0.0".to_string())
+        .interact_text()?;
+    answers.reverb_host = Some(host);
+
+    let port: u16 = loop {
+        let candidate: u16 = dialoguer::Input::new()
+            .with_prompt("Reverb port")
+            .default(8080)
+            .validate_with(|n: &u16| -> Result<(), &str> {
+                if (1024..=65535).contains(n) {
+                    Ok(())
+                } else {
+                    Err("must be 1024-65535")
+                }
+            })
+            .interact_text()?;
+        if port_is_free(candidate) {
+            break candidate;
+        }
+        if dialoguer::Confirm::new()
+            .with_prompt(format!("Port {candidate} is busy. Try {}?", candidate + 1))
+            .default(true)
+            .interact()?
+        {
+            // Loop and re-prompt with the suggested port as the next default. We do
+            // this by writing the prompt again rather than threading state through.
+            continue;
+        } else {
+            anyhow::bail!("Reverb port {candidate} busy; rerun and choose a free port");
+        }
+    };
+    answers.reverb_port = Some(port);
+
+    let hostname: String = dialoguer::Input::new()
+        .with_prompt("Reverb hostname (sent to the JS client)")
+        .allow_empty(true)
+        .interact_text()?;
+    if !hostname.is_empty() {
+        answers.reverb_hostname = Some(hostname);
+    }
+
+    let schemes = ["http", "https"];
+    let idx = dialoguer::Select::new()
+        .with_prompt("Reverb scheme")
+        .items(&schemes)
+        .default(0)
+        .interact()?;
+    answers.reverb_scheme = Some(schemes[idx].to_string());
 
     Ok(answers)
 }
