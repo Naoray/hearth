@@ -19,7 +19,7 @@ pub struct ValetCli;
 /// nullable parameters). These are harmless noise — strip them so users
 /// only see real errors.
 fn filter_stderr(output: &Output) -> String {
-    let stderr = filter_stderr(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     stderr
         .lines()
         .filter(|line| !line.starts_with("Deprecated:"))

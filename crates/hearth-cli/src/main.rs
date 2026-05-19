@@ -30,7 +30,7 @@ impl AddPackage {
 }
 
 #[derive(Parser)]
-#[command(name = "hearth", about = "Unified Laravel development command center")]
+#[command(name = "hearth", version, about = "Unified Laravel development command center")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
