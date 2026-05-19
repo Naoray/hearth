@@ -12,5 +12,6 @@
 
 pub mod health;
 pub mod init;
+pub mod mysql;
 pub mod postgres;
 pub mod redis;
