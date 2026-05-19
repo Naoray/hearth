@@ -2,6 +2,45 @@
 
 All notable changes to Hearth will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **`hearth db` subcommand** with `start`, `stop`, `restart`, `status [--json]`
+  for MySQL/MariaDB, PostgreSQL, and Redis. Engines are supervised process
+  groups with the existing 3-in-60s circuit breaker.
+- Postgres engine: resolver chain (Hearth cache → Homebrew `postgresql@N`,
+  highest version wins, Apple Silicon + Intel prefixes). `initdb` runs once
+  via an idempotent wrapper script (atomic sentinel + portable mkdir-lock,
+  `--locale=C --encoding=UTF8` to dodge macOS US-ASCII clash). Shutdown via
+  `pg_ctl stop -m fast` for a clean checkpoint, with SIGTERM + 20s grace
+  fallback.
+- MySQL/MariaDB engine: resolver detects flavor (filename or `--version`
+  probe). MariaDB init invokes `<basedir>/scripts/mariadb-install-db` with
+  `--auth-root-authentication-method=normal`; real MySQL uses
+  `--initialize-insecure`. Runtime args include `--skip-name-resolve`.
+  Shutdown grace 20s to protect InnoDB flush.
+- Redis engine: dataless; runtime args `--appendonly no`, pidfile under
+  `~/.config/hearth/run/redis.pid`.
+- Port-in-use guard at registration AND inside daemon dispatch — surfaces a
+  typed `DaemonResponse::Conflict { engine, port, owner_hint }` so port
+  collisions don't burn the circuit breaker.
+- 3 new MCP tools (`hearth_db_start`, `hearth_db_stop`, `hearth_db_status`)
+  bring the tool count to 11.
+- `ShutdownStrategy` enum on `ManagedService` (`Default`, `LongGrace`,
+  `Postgres { datadir, pg_ctl_binary }`); supervisor `stop()` now sends real
+  SIGTERM via `nix::killpg`, honors the per-engine grace window, then
+  SIGKILLs the whole process group.
+- `HearthConfig` gains `mysql_port`, `postgres_port`, `redis_port`. Legacy
+  configs without these keys backfill the standard defaults.
+- `data_dir()` helper alongside `run_dir()` / `log_dir()`; pre-created at
+  daemon boot.
+- `scripts/spike-mysql-init.sh` + `scripts/spike-results/SPIKE_NOTES.md`
+  documenting the MariaDB-vs-MySQL init branch discovery from Day-1 spike.
+
+### Changed
+- `ManagedService::stop()` now blocks for the strategy's grace window
+  (previously SIGKILLed immediately after a single non-blocking `try_wait`).
+
 ## [0.2.3] - 2026-03-23
 
 ### Added

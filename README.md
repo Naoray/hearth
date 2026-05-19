@@ -25,9 +25,31 @@ hearth php list                           — show installed versions
 hearth php config memory_limit 512M       — edit php.ini + restart FPM
 hearth dump                               — stream VarDumper output with timestamps
 hearth mail                               — open Mailpit UI in browser
+hearth db status [--json]                 — show DB engine state, ports, data dirs
+hearth db start  [mysql|postgres|redis]   — start one DB engine, or all when omitted
+hearth db stop   [mysql|postgres|redis]   — stop one or all DB engines
 hearth add horizon                        — guided install with opinionated config
 hearth laravel new myapp                  — scaffold a new Laravel project
 ```
+
+### DB engines (MySQL/MariaDB, PostgreSQL, Redis)
+
+Hearth supervises locally installed DB engines using the same circuit-breaker
+process-group machinery as nginx/php-fpm. No client libraries are linked — Hearth
+spawns the engine binaries, manages their data directories under
+`~/.config/hearth/data/{engine}/`, and probes health via TCP.
+
+Install the engines via Homebrew (cache-based install lands in a later phase):
+
+```bash
+brew install postgresql@17 redis mysql
+```
+
+Hearth picks them up automatically. Port collisions with Herd Pro Services panel
+are auto-detected: when the configured port is already bound, that engine is
+skipped at registration and `hearth db status` reports `conflict_port: true` so
+you know to stop the colliding service (`brew services stop ...` or quit Herd's
+panel).
 
 ## Install
 
@@ -96,6 +118,10 @@ dns_port = 5354
 dump_port = 9912
 mail_smtp_port = 1025
 mail_ui_port = 8025
+mcp_port = 9900
+mysql_port = 3306
+postgres_port = 5432
+redis_port = 6379
 ```
 
 ## PHP resolution
