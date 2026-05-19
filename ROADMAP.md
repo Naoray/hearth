@@ -12,11 +12,11 @@ Source of truth for phase numbering. See [docs/NORTH_STAR.md](docs/NORTH_STAR.md
 
 ## Future (not in v0.3.0)
 
-Explicit non-goals for the renewal sprint:
+Explicit non-goals for the v0.3.0 sprint:
 
 - Log Viewer (per-site streaming)
 - XDebug detection / toggle
 
 ## Current phase
 
-Phase 3 (`hearth add`). Deadline 2026-05-26 (Herd Pro renewal).
+Phase 3 (`hearth add`) + Phase 4 (`hearth db`). v0.3.0 ship date 2026-05-26.

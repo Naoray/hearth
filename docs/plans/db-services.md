@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship CLI-managed MySQL, Postgres, and Redis services supervised by the Hearth daemon so the maintainer can cancel Herd Pro on 2026-05-26 without losing the "Services panel for DBs" workflow.
+**Goal:** Ship CLI-managed MySQL, Postgres, and Redis services supervised by the Hearth daemon, giving solo Laravel devs a daemon-driven local database stack with sane defaults and zero ongoing cost.
 
 **Architecture:** Each engine becomes a supervised process group registered conditionally in `default_services()`, mirroring the Mailpit pattern. Hearth never imports an engine client crate — it only spawns binaries, manages their data directories, and TCP-polls health. CLI surface `hearth db {start|stop|restart|status|config}` maps to existing `ServiceKind` variants via the supervisor.
 
@@ -29,7 +29,7 @@
 - **No replication, no clustering, no read-replicas.**
 - **No engine version manager.** One binary per engine, resolved at start. Multi-version support is Phase 4+.
 - **No write access to client config (`~/.my.cnf`, `~/.pgpass`).** Hearth touches only its own data dirs.
-- **No persistent root password rotation.** MySQL/Postgres start with empty/trust auth on `127.0.0.1` — same posture as Herd Pro.
+- **No persistent root password rotation.** MySQL/Postgres start with empty/trust auth on `127.0.0.1` — standard local-dev posture.
 
 ---
 
@@ -107,7 +107,7 @@ If only one of the two binaries is found, resolver returns `None` (both must com
     └── redis/                             # dump.rdb location only
 ```
 
-`download.rs` is **not** extended for v0.3.0. Users install engines via Homebrew (`brew install mysql postgresql@17 redis`) and Hearth picks them up. Cache-based downloads are a Phase 4 follow-up — out of renewal-sprint scope.
+`download.rs` is **not** extended for v0.3.0. Users install engines via Homebrew (`brew install mysql postgresql@17 redis`) and Hearth picks them up. Cache-based downloads are a Phase 4 follow-up — out of v0.3.0 scope.
 
 ---
 
@@ -230,7 +230,7 @@ pub async fn tcp_probe(port: u16, timeout_ms: u64) -> bool {
 
 ## 7. Herd Coexistence
 
-`is_herd_running()` already exists. New helper `port_in_use(host, port) -> bool` (sync TCP probe with 200ms timeout) handles the finer-grained case where Herd Pro's Services panel owns the standard DB port.
+`is_herd_running()` already exists. New helper `port_in_use(host, port) -> bool` (sync TCP probe with 200ms timeout) handles the finer-grained case where another tool already owns the standard DB port.
 
 Rules:
 
@@ -242,7 +242,7 @@ Rules:
 
 Detection sequence at daemon startup:
 1. `is_herd_running()` — informational log only; we no longer hard-skip mysql.
-2. `port_in_use(...)` — authoritative; this catches Herd Pro Services panel, Homebrew services, and ad-hoc processes equally.
+2. `port_in_use(...)` — authoritative; this catches Herd's services panel, Homebrew services, and ad-hoc processes equally.
 3. If skipped, the service is **not** registered at all (mirrors the Mailpit-binary-missing case), so `hearth db start mysql` returns "service not registered" — pointing the user at the conflict.
 
 `hearth db status --json` includes a `conflict_port: bool` flag derived from port-in-use so the CLI can render `mysql: skipped (port 3306 owned by another process)`.
@@ -413,7 +413,7 @@ Implement in this order. Each engine ships in its own PR/commit chain so dogfood
 4. **MySQL (Task block D — 1.5 days)**
    - Last because: MariaDB-as-mysqld via Herd needs runtime branching (the binary self-identifies on `--version`), and `--initialize-insecure` write-out is fragile on macOS APFS.
    - Implement `db/mysql.rs`, register, arm.
-   - **Dogfood checkpoint:** Laravel app reads/writes against Hearth mysql while Herd Pro is shut down.
+   - **Dogfood checkpoint:** Laravel app reads/writes against Hearth mysql with no other DB service running.
 
 5. **MCP tools (Task block E — 0.5 day)**
    - Three tools in `mcp.rs`. Touches all three engines so it lands last to avoid intermediate "8 → 9 → 10 → 11" tool-count test churn.
@@ -429,13 +429,13 @@ Implement in this order. Each engine ships in its own PR/commit chain so dogfood
 
 1. **macOS firewall popup on first DB start.** `mysqld`/`postgres`/`redis-server` aren't code-signed by us; macOS will prompt. *Mitigation:* document the prompt in README; bind explicitly to `127.0.0.1` so the firewall message is at most a one-time annoyance, not a recurring loop.
 
-2. **Port collisions with Herd Pro Services panel.** Renewal-week users still have Herd Pro running. *Mitigation:* §7 port-in-use guard. Skipped registration is loud (status shows `conflict_port: true`) so the user knows what to do.
+2. **Port collisions with another tool's services panel.** Users may have Herd or `brew services` already managing a DB on the standard port. *Mitigation:* §7 port-in-use guard. Skipped registration is loud (status shows `conflict_port: true`) so the user knows what to do.
 
 3. **MariaDB vs MySQL `mysqld` divergence.** Herd ships MariaDB-as-mysqld; `--initialize-insecure` semantics differ between MySQL 8 and MariaDB 10+. *Mitigation:* probe `mysqld --version` at init; branch the init args. Acceptance: works for MariaDB 10.6+ (Herd) and MySQL 8.0+ (Homebrew). Older versions out of scope.
 
 4. **Postgres init creates user matching `$USER`.** If `$USER` is unusual (CI: `runner`), Laravel `.env` needs `DB_USERNAME` matched. *Mitigation:* document in README; `hearth db status` prints the data-dir's `pg_role` so the user can copy it into `.env`. Do not try to auto-rewrite Laravel `.env`.
 
-5. **Data-dir corruption on hard kill.** Circuit breaker still SIGKILLs after 5s. Postgres + MySQL recover via crash-recovery on next start; redis loses last <1s of writes if AOF disabled. *Mitigation:* document; default redis to `appendonly no` (matches Herd Pro default); do not try to flip SIGKILL → SIGTERM-only for DB engines (would violate the "no orphan processes" invariant from NORTH_STAR).
+5. **Data-dir corruption on hard kill.** Circuit breaker still SIGKILLs after 5s. Postgres + MySQL recover via crash-recovery on next start; redis loses last <1s of writes if AOF disabled. *Mitigation:* document; default redis to `appendonly no` (standard dev-env posture); do not try to flip SIGKILL → SIGTERM-only for DB engines (would violate the "no orphan processes" invariant from NORTH_STAR).
 
 6. **Init step blocks supervisor start_all for >5s on first run.** `initdb` on macOS can take 3–10s. *Mitigation:* run init in `ManagedService::start` synchronously; accept the one-time delay. If users complain in dogfood, Phase 4 introduces an async `pre_start` hook.
 
@@ -445,4 +445,4 @@ Implement in this order. Each engine ships in its own PR/commit chain so dogfood
 
 9. **Test flakiness from real port binding.** `port_in_use` tests bind real sockets. *Mitigation:* use OS-assigned port (`:0`) plus retrieve via `local_addr()`; never hardcode 3306/5432/6379 in tests.
 
-10. **Renewal-week scope creep.** Tempting to add `hearth db reset`, `hearth db shell`, `hearth db backup`. *Mitigation:* explicit non-goals in §1. These are Phase 4. If a stakeholder pushes, point at NORTH_STAR decision principle #1 ("Cancel-renewal beats everything else this week").
+10. **Sprint scope creep.** Tempting to add `hearth db reset`, `hearth db shell`, `hearth db backup`. *Mitigation:* explicit non-goals in §1. These are Phase 4 follow-ups. If a stakeholder pushes, point at NORTH_STAR decision principle #1 ("Ship the maintainer's daily workflow first").
