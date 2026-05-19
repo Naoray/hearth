@@ -22,10 +22,11 @@ hearth-daemon (always-on, owns all processes via process groups)
 | Module | Purpose |
 |--------|---------|
 | `config.rs` | `HearthConfig` with TOML persistence, `#[serde(default)]` for migration safety |
-| `mcp.rs` | `HearthMcpServer` with 8 MCP tools via rmcp `#[tool_router]` |
-| `service/supervisor.rs` | Process group supervisor with circuit breaker |
-| `service/manager.rs` | Default service registration (nginx, php-fpm, dnsmasq, mailpit) |
+| `mcp.rs` | `HearthMcpServer` with 11 MCP tools via rmcp `#[tool_router]` |
+| `service/supervisor.rs` | Process group supervisor with circuit breaker + per-engine `ShutdownStrategy` |
+| `service/manager.rs` | Default service registration (nginx, php-fpm, dnsmasq, mailpit, db engines) |
 | `mailpit.rs` | Binary resolution chain (Hearth cache → system PATH) |
+| `db.rs` + `db/{health,init,postgres,redis,mysql}.rs` | DB engines (Phase 4): TCP probe, init wrapper scripts with mkdir-lock + sentinel, per-engine resolvers (Postgres/Redis/MySQL+MariaDB) |
 | `download.rs` | GitHub Release downloader (tar.gz/zip) |
 | `dump.rs` | VarDumper TCP relay with broadcast + timestamped CLI streaming |
 | `php.rs` + `php/resolver.rs` | PHP version management + binary resolution chain |
@@ -78,7 +79,7 @@ The daemon serves an MCP (Model Context Protocol) server on `127.0.0.1:9900` via
 
 For IDEs that only support stdio transport, use the bridge: `hearth mcp` (reads JSON-RPC from stdin, POSTs to the HTTP endpoint).
 
-### MCP Tools (8)
+### MCP Tools (11)
 
 | Tool | Description |
 |------|-------------|
@@ -90,6 +91,9 @@ For IDEs that only support stdio transport, use the bridge: `hearth mcp` (reads 
 | `hearth_site_unlink` | Unlink a site |
 | `hearth_service_restart` | Restart one or all services |
 | `hearth_php_config` | Set php.ini value + restart FPM |
+| `hearth_db_start` | Start a DB engine (postgres/redis/mysql) |
+| `hearth_db_stop` | Stop a DB engine |
+| `hearth_db_status` | Per-engine status with port/data_dir/conflict info |
 
 ## Configuration
 
