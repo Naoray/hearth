@@ -135,12 +135,12 @@ fn build_exec_line(binary: &Path, args: &[String]) -> String {
     parts.join(" ")
 }
 
-fn shell_quote(path: &Path) -> String {
+pub(crate) fn shell_quote(path: &Path) -> String {
     shell_quote_str(&path.to_string_lossy())
 }
 
 /// POSIX single-quoted string escape. `'` is replaced with `'\''`.
-fn shell_quote_str(s: &str) -> String {
+pub(crate) fn shell_quote_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for ch in s.chars() {

@@ -80,6 +80,24 @@ pub fn default_services(config: &HearthConfig, config_dir: &std::path::Path) -> 
         ));
     }
 
+    // Postgres — register only if binaries resolve AND nothing else owns
+    // the configured port (Herd Pro Services panel, Homebrew services, etc.).
+    if let Some(pg) = crate::db::postgres::resolve_postgres_binaries(config_dir) {
+        if crate::db::health::port_in_use("127.0.0.1", config.postgres_port) {
+            info!(
+                port = config.postgres_port,
+                "postgres port already in use — skipping registration"
+            );
+        } else {
+            match crate::db::postgres::managed_service(&pg, config, config_dir) {
+                Ok(svc) => services.push(svc),
+                Err(e) => {
+                    info!(error = %e, "failed to build postgres ManagedService — skipping")
+                }
+            }
+        }
+    }
+
     services
 }
 
@@ -116,5 +134,58 @@ mod tests {
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(!kinds.contains(&ServiceKind::Mailpit));
+    }
+
+    fn write_fake_pg_install(bin_dir: &std::path::Path) {
+        std::fs::create_dir_all(bin_dir).unwrap();
+        for name in ["postgres", "initdb", "pg_ctl"] {
+            std::fs::write(bin_dir.join(name), "fake").unwrap();
+        }
+    }
+
+    #[test]
+    fn default_services_registers_postgres_when_binaries_present_and_port_free() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fake_pg_install(&tmp.path().join("services/postgresql/bin"));
+
+        // Pick an OS-assigned port we know is free (bind+drop releases it; brief
+        // window for races but acceptable for unit scope).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let free_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = HearthConfig {
+            postgres_port: free_port,
+            ..HearthConfig::default()
+        };
+        let services = default_services(&config, tmp.path());
+        let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
+        assert!(
+            kinds.contains(&ServiceKind::Postgresql),
+            "postgres should be registered, got: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn default_services_skips_postgres_when_port_in_use() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fake_pg_install(&tmp.path().join("services/postgresql/bin"));
+
+        // Hold the listener over the call so port_in_use sees it bound.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy_port = listener.local_addr().unwrap().port();
+
+        let config = HearthConfig {
+            postgres_port: busy_port,
+            ..HearthConfig::default()
+        };
+        let services = default_services(&config, tmp.path());
+        drop(listener);
+
+        let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
+        assert!(
+            !kinds.contains(&ServiceKind::Postgresql),
+            "postgres should be skipped on port collision, got: {kinds:?}"
+        );
     }
 }
