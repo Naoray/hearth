@@ -2,7 +2,7 @@
 
 All notable changes to Hearth will be documented in this file.
 
-## [0.3.0] - 2026-05-26
+## [0.3.0] - 2026-05-20
 
 ### Added
 - **`hearth add <package>`** — guided Laravel package installer for `horizon`,
