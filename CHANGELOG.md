@@ -2,6 +2,23 @@
 
 All notable changes to Hearth will be documented in this file.
 
+## [0.3.1] - 2026-07-18
+
+### Changed
+- Site management is now Herd-aware: when Herd.app is running, the `link`,
+  `unlink`, `park`, `secure`, and `unsecure` commands are delegated to
+  Herd's CLI (resolved from `~/Library/Application Support/Herd/bin/herd`)
+  instead of Valet, because a Herd-managed Valet installation hides those
+  commands. `isolate` deliberately remains Valet-only — Herd's CLI does not
+  expose a compatible isolate command. If Herd is running but its CLI
+  cannot be resolved, the affected commands fail with an explicit error
+  instead of silently falling back to Valet. (#22)
+
+### Fixed
+- CHANGELOG date drift: the `[0.3.0]` entry now records the actual ship
+  date of 2026-05-20. The correction landed on main after the v0.3.0 tag
+  was cut, so v0.3.1 is the first release whose tarball includes it.
+
 ## [0.3.0] - 2026-05-20
 
 ### Added
