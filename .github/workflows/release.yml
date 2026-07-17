@@ -58,3 +58,26 @@ jobs:
         with:
           files: hearth-*.tar.gz
           generate_release_notes: true
+
+  bump-homebrew-tap:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Homebrew tap token
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error title=Missing HOMEBREW_TAP_TOKEN::Configure the repository Actions secret HOMEBREW_TAP_TOKEN with Contents and Pull requests write access to Naoray/homebrew-tap."
+            exit 1
+          fi
+
+      - name: Open Homebrew tap bump PR
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: .agents/tap-bump/bump-to-tag.sh "${GITHUB_REF_NAME}"
