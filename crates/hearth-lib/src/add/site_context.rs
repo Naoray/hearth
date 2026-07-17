@@ -25,7 +25,7 @@ pub enum SiteResolutionError {
     SiteNotLinked(PathBuf),
 
     #[error(
-        "site {0} has no resolved path on disk; re-run `valet link` from inside the project"
+        "site {0} has no resolved path on disk; re-run `hearth link` from inside the project"
     )]
     SiteLinkedButPathUnresolved(String),
 
