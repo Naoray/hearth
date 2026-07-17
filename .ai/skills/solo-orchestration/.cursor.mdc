@@ -1,0 +1,139 @@
+---
+description: Orchestrate Solo MCP spawned agents with push-based reporting instead of polling. TRIGGER when user mentions "spawn agent", "orchestrate", "solo spawn", multi-agent workflow, or calls `spawn_process(kind="agent")`. SKIP for single-session work, non-Solo agent frameworks, or one-off terminal spawns.
+alwaysApply: false
+---
+
+# Solo Orchestration — Push, Don't Poll
+
+Solo MCP spawned agents can report back to their orchestrator without the orchestrator polling on a timer. This skill defines the three push patterns and when to use each.
+
+## Why This Matters
+
+Polling burns tokens and cache:
+- Every `get_process_output` check is a tool round-trip on the orchestrator
+- Recurring `timer_set(..., loop=true)` injects user turns even when nothing changed
+- 5-minute poll interval × hour-long task = 12 wasted context refreshes
+
+Push-based reporting: orchestrator idle until spawn signals. Zero cost when nothing happens.
+
+## The Three Patterns
+
+### Pattern A — Idle-triggered timer (safety net)
+
+Orchestrator registers one-shot timer that fires when spawn enters idle state.
+
+```
+timer_fire_when_idle_any(
+  processes=[SPAWN_PID],
+  max_wait_ms=1800000,
+  body="Spawn SPAWN_PID went idle. Read scratchpad spawn-SPAWN_PID-status. get_process_output(SPAWN_PID, lines=80) if scratchpad missing. Decide: consume result, retry, or abort."
+)
+```
+
+Use when: spawned agent cannot call back (non-agent runtime, external process, untrusted prompt).
+
+Downside: idle != done. Spawn may be idle mid-task waiting for input.
+
+### Pattern B — `send_input` callback (true push)
+
+Spawn calls `send_input(orchestrator_pid, "...")`. Delivered as fresh user turn in orchestrator PTY.
+
+Orchestrator must share its pid with spawn at launch. Use `whoami` to get orchestrator pid, then inject into spawn prompt.
+
+Use when: spawn is a Solo agent runtime (Claude/Codex/Gemini) you control.
+
+Downside: spawn might forget to call back. Always pair with Pattern A as safety net.
+
+### Pattern C — Combo (default, recommended)
+
+1. Spawn writes progress to `scratchpad-{SPAWN_PID}-status` at milestones
+2. Spawn `send_input` orchestrator on terminal events (DONE/BLOCKED/FAILED)
+3. Orchestrator registers idle-timer with generous `max_wait_ms` as safety net
+4. Orchestrator reads scratchpad on callback, not live output
+
+Cheapest steady state. Resilient to spawn forgetting callback.
+
+## Spawn Prompt Template
+
+Prepend to first `send_input` after `spawn_process(kind="agent")`. Also prepend the `agent_instructions` returned by `spawn_process`.
+
+```
+You are spawn process {SPAWN_PID}. Orchestrator pid: {ORCH_PID}.
+
+Task: {TASK_DESCRIPTION}
+
+Reporting contract:
+1. Write progress to scratchpad "spawn-{SPAWN_PID}-status" at milestones.
+   Use scratchpad_append for incremental updates.
+2. On terminal event (DONE, BLOCKED, FAILED) call:
+   send_input(
+     process_id={ORCH_PID},
+     input="SPAWN {SPAWN_PID} {status}: {one-line summary}. Scratchpad: spawn-{SPAWN_PID}-status"
+   )
+3. Do NOT send_input for intermediate progress — scratchpad only.
+4. Do NOT spam scratchpad either — milestone granularity.
+
+Orchestrator has idle-timer safety net. send_input is preferred path.
+Expected work duration: {DURATION_ESTIMATE}.
+```
+
+## Orchestrator Recipe
+
+```
+# 1. Spawn
+result = spawn_process(kind="agent", agent_tool_id=N, name="worker-1")
+spawn_pid = result.process_id
+
+# 2. Resolve own pid
+me = whoami()
+orch_pid = me.process_id
+
+# 3. Seed spawn with reporting contract
+send_input(spawn_pid, AGENT_INSTRUCTIONS + "\n\n" + SPAWN_PROMPT_FILLED)
+
+# 4. Register safety-net timer
+timer_fire_when_idle_any(
+  processes=[spawn_pid],
+  max_wait_ms=2 * expected_duration_ms,
+  body=f"Spawn {spawn_pid} idle. If no send_input received, read scratchpad spawn-{spawn_pid}-status. Decide next step."
+)
+
+# 5. Stop orchestrator activity. Wait for user-turn injection from either path.
+```
+
+## Efficiency Rules
+
+- Scratchpad > send_input for progress. `send_input` injects user turn = full orchestrator re-render cost.
+- Reserve `send_input` for terminal events only. One call per spawn lifecycle is ideal.
+- Single scratchpad per spawn. Name `spawn-{pid}-status`. Orchestrator reads once on callback.
+- `max_wait_ms` = 2× expected duration. Too short = premature fires. Too long = no safety.
+- Close spawn process after result consumed: `close_process(spawn_pid)`. Prevents pid leak.
+- Parallel spawns: one timer per spawn OR `timer_fire_when_idle_all([pids...])` if orchestrator waits for full fan-in.
+
+## Anti-Patterns
+
+Do NOT:
+- `timer_set(60000, "check spawn", loop=true)` — burns cache on empty ticks
+- `get_process_output` in a sleep loop — same as above
+- Poll scratchpad with recurring timer — push model makes this pointless
+- Short `max_wait_ms` (<30s) as retry mechanism — use Pattern B callback instead
+- Forget `close_process` — orphaned pids accumulate
+
+## When To Skip This Skill
+
+- Single orchestrator session, no spawns
+- Terminal-only spawns (`kind="terminal"`) — no agent runtime to bind timers to
+- External processes registered via `register_agent` — cannot receive timer wake-ups
+- Synchronous subtask via Agent tool (different mechanism, handled by host)
+
+## Quick Reference
+
+| Need | Use |
+|------|-----|
+| Spawn will call back | Pattern B (send_input) |
+| Spawn can't call back | Pattern A (idle-timer) |
+| Mixed / untrusted / default | Pattern C (combo) |
+| Wait for all parallel spawns | `timer_fire_when_idle_all` |
+| Wait for first done | `timer_fire_when_idle_any` |
+| Progress visibility mid-task | scratchpad_append |
+| Terminal event signal | send_input to orch_pid |
