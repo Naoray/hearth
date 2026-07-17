@@ -150,8 +150,8 @@ impl HearthMcpServer {
         Ok(lines.join("\n"))
     }
 
-    /// List all linked Valet sites.
-    #[tool(name = "hearth_sites", description = "List all linked Valet sites with their paths, TLS status, and PHP version")]
+    /// List all linked Valet and Herd sites.
+    #[tool(name = "hearth_sites", description = "List all linked Valet and Herd sites with their paths, TLS status, and PHP version")]
     async fn hearth_sites(&self) -> Result<String, String> {
         let sm = self.site_manager.lock().await;
         match sm.list_sites() {
@@ -237,13 +237,13 @@ impl HearthMcpServer {
         Ok(format!("Switched to PHP {version}"))
     }
 
-    /// Link a directory as a Valet site.
-    #[tool(name = "hearth_site_link", description = "Link a directory as a Valet site")]
+    /// Link a directory through the active Valet or Herd backend.
+    #[tool(name = "hearth_site_link", description = "Link a directory through the active Valet or Herd backend")]
     async fn hearth_site_link(
         &self,
         Parameters(params): Parameters<SiteLinkParams>,
     ) -> Result<String, String> {
-        // Run valet link in a blocking task since it calls an external process.
+        // Run the site CLI in a blocking task since it calls an external process.
         // Uses link_in() with Command::current_dir() instead of set_current_dir()
         // to avoid mutating global process state (safe for concurrent MCP requests).
         let name = params.name.clone();
@@ -260,8 +260,8 @@ impl HearthMcpServer {
         }
     }
 
-    /// Unlink a Valet site.
-    #[tool(name = "hearth_site_unlink", description = "Unlink a Valet site by name")]
+    /// Unlink a site through the active Valet or Herd backend.
+    #[tool(name = "hearth_site_unlink", description = "Unlink a site through the active Valet or Herd backend by name")]
     async fn hearth_site_unlink(
         &self,
         Parameters(params): Parameters<SiteUnlinkParams>,

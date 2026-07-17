@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Represents a linked site managed by Valet.
+/// Represents a linked site managed by Valet or Herd.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Site {
     pub name: String,
@@ -42,7 +42,7 @@ impl SiteManager {
         let mut sites = Vec::new();
 
         for valet_home in &self.valet_homes {
-            // Read Sites/ directory (symlinks from `valet link`)
+            // Read Sites/ directory (symlinks from the active site CLI).
             let sites_dir = valet_home.join("Sites");
             if sites_dir.exists() {
                 for entry in std::fs::read_dir(&sites_dir)? {

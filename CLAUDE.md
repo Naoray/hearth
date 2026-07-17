@@ -31,12 +31,12 @@ hearth-daemon (always-on, owns all processes via process groups)
 | `dump.rs` | VarDumper TCP relay with broadcast + timestamped CLI streaming |
 | `php.rs` + `php/resolver.rs` | PHP version management + binary resolution chain |
 | `site.rs` | Multi-home site enumeration (reads from both Valet and Herd config dirs) |
-| `valet.rs` | Valet CLI wrapper (link, unlink, park, secure, unsecure) |
+| `valet.rs` | Herd-aware site CLI wrapper (Valet fallback; link, unlink, park, secure, unsecure) |
 | `socket.rs` | `DaemonRequest`/`DaemonResponse` protocol types |
 
 ## Key Design Decisions
 
-1. Valet is a managed dependency (Composer global). Hearth wraps Valet CLI for site management.
+1. Valet is a managed dependency (Composer global). Hearth uses Valet for site management unless Herd is running, then routes Herd-owned commands through Herd's CLI.
 2. Process groups via `command-group` crate — guarantees no orphan processes.
 3. Circuit breaker: 3 failures in 60s = service stopped, manual restart required.
 4. Health poll every 5 seconds.
@@ -87,7 +87,7 @@ For IDEs that only support stdio transport, use the bridge: `hearth mcp` (reads 
 | `hearth_sites` | List linked sites with paths, SSL, PHP version |
 | `hearth_php_list` | List installed PHP versions |
 | `hearth_php_switch` | Switch global PHP version + restart FPM |
-| `hearth_site_link` | Link a directory as a Valet site |
+| `hearth_site_link` | Link a directory through the active Valet/Herd backend |
 | `hearth_site_unlink` | Unlink a site |
 | `hearth_service_restart` | Restart one or all services |
 | `hearth_php_config` | Set php.ini value + restart FPM |
@@ -105,4 +105,3 @@ Key ports (all configurable):
 - `mail_smtp_port`: 1025 (Mailpit SMTP)
 - `mail_ui_port`: 8025 (Mailpit web UI)
 - `mcp_port`: 9900 (MCP Streamable HTTP)
-
