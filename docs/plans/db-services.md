@@ -16,7 +16,7 @@
 - `hearth db start|stop|restart|status` works for `mysql`, `postgres`, `redis`, or `all`.
 - Engines run as supervised process groups with the existing circuit breaker (3-in-60s).
 - Binary resolution chain mirrors `mailpit.rs`: Hearth cache → Herd bin (where applicable) → Homebrew → `which`.
-- Data directories live under `~/.config/hearth/data/{engine}/` and survive daemon restarts.
+- Data directories live under `~/Library/Application Support/hearth/data/{engine}/` and survive daemon restarts.
 - New `HearthConfig` fields are forward-compatible (`#[serde(default)]`) — legacy configs load unchanged.
 - MCP tools `hearth_db_start`, `hearth_db_stop`, `hearth_db_status` expose the same surface to agents.
 - Health checks via TCP connect on the engine's port (no client lib needed).
@@ -71,7 +71,7 @@ DbConfig  { engine: String, key: String, value: String }
 One resolver per engine, each in its own file under `crates/hearth-lib/src/db/`. Pattern is copy-paste of `mailpit.rs::resolve_mailpit_binary` with engine-specific paths.
 
 ### MySQL/MariaDB → `mysqld`
-1. Hearth cache: `~/.config/hearth/services/mysql/bin/mysqld`
+1. Hearth cache: `~/Library/Application Support/hearth/services/mysql/bin/mysqld`
 2. Herd bin: `~/Library/Application Support/Herd/bin/mysqld` (Herd ships MariaDB-as-mysqld — confirmed on dev machine)
 3. Homebrew (priority list):
    - `/opt/homebrew/opt/mysql/bin/mysqld`
@@ -79,7 +79,7 @@ One resolver per engine, each in its own file under `crates/hearth-lib/src/db/`.
 4. `which mysqld`
 
 ### Postgres → `postgres` + `initdb` (both required)
-1. Hearth cache: `~/.config/hearth/services/postgresql/bin/{postgres,initdb}`
+1. Hearth cache: `~/Library/Application Support/hearth/services/postgresql/bin/{postgres,initdb}`
 2. Herd bin: skipped — Herd does **not** ship postgres (confirmed via `ls ~/Library/.../Herd/bin/`).
 3. Homebrew: glob `/opt/homebrew/opt/postgresql@*/bin/` — pick highest version number; resolver returns `(postgres_path, initdb_path, version_string)`.
 4. `which postgres` + `which initdb`
@@ -87,15 +87,15 @@ One resolver per engine, each in its own file under `crates/hearth-lib/src/db/`.
 If only one of the two binaries is found, resolver returns `None` (both must come from the same install).
 
 ### Redis → `redis-server`
-1. Hearth cache: `~/.config/hearth/services/redis/bin/redis-server`
+1. Hearth cache: `~/Library/Application Support/hearth/services/redis/bin/redis-server`
 2. Herd bin: skipped (Herd does not ship redis).
 3. Homebrew: `/opt/homebrew/opt/redis/bin/redis-server`
 4. `which redis-server`
 
-### Cache layout under `~/.config/hearth/`
+### Cache layout under `~/Library/Application Support/hearth/`
 
 ```
-~/.config/hearth/
+~/Library/Application Support/hearth/
 ├── services/
 │   ├── mailpit/mailpit                    # existing
 │   ├── mysql/bin/mysqld                   # new — populated by `hearth install` or manual
@@ -113,36 +113,36 @@ If only one of the two binaries is found, resolver returns `None` (both must com
 
 ## 4. Data Directories & Init Flow
 
-All under `~/.config/hearth/data/{engine}/`. Created lazily on first start. Idempotent: if dir is non-empty and engine-specific sentinel exists, init is skipped.
+All under `~/Library/Application Support/hearth/data/{engine}/`. Created lazily on first start. Idempotent: if dir is non-empty and engine-specific sentinel exists, init is skipped.
 
 ### MySQL (`data/mysql/`)
 Sentinel: `data/mysql/mysql/user.MYD` (or `user.ibd` on MariaDB 10.4+). Init when missing:
 ```bash
-mysqld --initialize-insecure --datadir=~/.config/hearth/data/mysql
+mysqld --initialize-insecure --datadir="$HOME/Library/Application Support/hearth/data/mysql"
 ```
 Runtime args:
 ```bash
 mysqld \
-  --datadir=~/.config/hearth/data/mysql \
-  --socket=~/.config/hearth/run/mysql.sock \
+  --datadir="$HOME/Library/Application Support/hearth/data/mysql" \
+  --socket="$HOME/Library/Application Support/hearth/run/mysql.sock" \
   --port={config.mysql_port} \
   --bind-address=127.0.0.1 \
-  --pid-file=~/.config/hearth/run/mysql.pid \
-  --log-error=~/.config/hearth/log/mysql.err
+  --pid-file="$HOME/Library/Application Support/hearth/run/mysql.pid" \
+  --log-error="$HOME/Library/Application Support/hearth/log/mysql.err"
 ```
 
 ### Postgres (`data/postgresql/`)
 Sentinel: `data/postgresql/PG_VERSION`. Init when missing:
 ```bash
-initdb -D ~/.config/hearth/data/postgresql --auth-host=trust --auth-local=trust -U $USER --encoding=UTF8
+initdb -D "$HOME/Library/Application Support/hearth/data/postgresql" --auth-host=trust --auth-local=trust -U $USER --encoding=UTF8
 ```
 Runtime args:
 ```bash
 postgres \
-  -D ~/.config/hearth/data/postgresql \
+  -D "$HOME/Library/Application Support/hearth/data/postgresql" \
   -p {config.postgres_port} \
   -h 127.0.0.1 \
-  -k ~/.config/hearth/run     # socket dir
+  -k "$HOME/Library/Application Support/hearth/run"     # socket dir
 ```
 
 ### Redis (`data/redis/`)
@@ -151,10 +151,10 @@ No init step — dataless engine. Args:
 redis-server \
   --port {config.redis_port} \
   --bind 127.0.0.1 \
-  --dir ~/.config/hearth/data/redis \
+  --dir "$HOME/Library/Application Support/hearth/data/redis" \
   --dbfilename dump.rdb \
   --daemonize no \
-  --pidfile ~/.config/hearth/run/redis.pid
+  --pidfile "$HOME/Library/Application Support/hearth/run/redis.pid"
 ```
 
 Init runs synchronously in `ManagedService::start` for now. If init takes >5s the supervisor's health check will see Starting → Running gap; acceptable for v0.3.0. Phase 4 may introduce a `pre_start` hook on `ManagedService`.
@@ -176,7 +176,7 @@ pub struct HearthConfig {
     /// Port for Redis (default: 6379)
     pub redis_port: u16,
 
-    /// Optional data-dir override per engine (defaults to ~/.config/hearth/data/{engine})
+    /// Optional data-dir override per engine (defaults to ~/Library/Application Support/hearth/data/{engine})
     pub mysql_data_dir: Option<PathBuf>,
     pub postgres_data_dir: Option<PathBuf>,
     pub redis_data_dir: Option<PathBuf>,

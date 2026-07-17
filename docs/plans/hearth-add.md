@@ -640,7 +640,7 @@ Ship in tight TDD slices. Each task ends with a green `cargo test` + a commit. O
 
 ### R2 — Composer is slow (multi-minute installs)
 **Risk:** Our current daemon process model doesn't stream long-running command output to the CLI; user sees a hung terminal.
-**Mitigation:** In Task 1's `composer.rs`, run with piped stdout+stderr and stream lines back to the daemon's tracing log AND to the CLI via a new `DaemonResponse::Progress { line: String }` (extend the socket protocol to support a stream-then-final-result pattern, or use a temporary log file the CLI tails). MVP fallback: write to `~/.config/hearth/log/add-<package>.log` and tell the user `"see log: <path>"` if it takes more than 30s. Decision: ship the log-file fallback for v0.3.0; streaming protocol is Phase 4.
+**Mitigation:** In Task 1's `composer.rs`, run with piped stdout+stderr and stream lines back to the daemon's tracing log AND to the CLI via a new `DaemonResponse::Progress { line: String }` (extend the socket protocol to support a stream-then-final-result pattern, or use a temporary log file the CLI tails). MVP fallback: write to `~/Library/Application Support/hearth/log/add-<package>.log` and tell the user `"see log: <path>"` if it takes more than 30s. Decision: ship the log-file fallback for v0.3.0; streaming protocol is Phase 4.
 
 ### R3 — Laravel version detection is approximate
 **Risk:** Pulse needs L10+, Reverb needs L11+. Parsing `composer.json` `require.laravel/framework` (e.g. `"^10.0"`) tells us the floor, not the installed version.

@@ -97,7 +97,7 @@ For IDEs that only support stdio transport, use the bridge: `hearth mcp` (reads 
 
 ## Configuration
 
-Config file: `~/.config/hearth/config.toml`
+Config file: `~/Library/Application Support/hearth/config.toml`
 
 Key ports (all configurable):
 - `dns_port`: 5354 (dnsmasq)
