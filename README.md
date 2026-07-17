@@ -37,7 +37,7 @@ hearth laravel new myapp                  — scaffold a new Laravel project
 Hearth supervises locally installed DB engines using the same circuit-breaker
 process-group machinery as nginx/php-fpm. No client libraries are linked — Hearth
 spawns the engine binaries, manages their data directories under
-`~/.config/hearth/data/{engine}/`, and probes health via TCP.
+`~/Library/Application Support/hearth/data/{engine}/`, and probes health via TCP.
 
 Install the engines via Homebrew (cache-based install lands in a later phase):
 
@@ -109,7 +109,7 @@ A circuit breaker prevents restart loops: 3 crashes in 60 seconds marks a servic
 
 ## Configuration
 
-`~/.config/hearth/config.toml` — all ports are configurable:
+`~/Library/Application Support/hearth/config.toml` — all ports are configurable:
 
 ```toml
 tld = "test"
@@ -128,7 +128,7 @@ redis_port = 6379
 
 Hearth finds PHP binaries in this order:
 
-1. `~/.config/hearth/php/{version}/php` — own cached binaries
+1. `~/Library/Application Support/hearth/php/{version}/php` — own cached binaries
 2. `~/Library/Application Support/Herd/bin/php{version}` — reuse existing binaries
 3. `/opt/homebrew/opt/php@{version}/bin/php` — Homebrew fallback
 

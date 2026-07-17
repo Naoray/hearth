@@ -33,7 +33,7 @@ Real MariaDB 11.8.6 install root: `/Users/Shared/Herd/services/mariadb/11.8.6/`.
 ## Resolver chain for Block D
 
 ```
-1. ~/.config/hearth/services/mysql/bin/{mysqld,mariadbd}    (Hearth cache)
+1. ~/Library/Application Support/hearth/services/mysql/bin/{mysqld,mariadbd}    (Hearth cache)
 2. ~/Library/Application Support/Herd/bin/mysqld            (real MySQL if symlink valid)
 3. ~/Library/Application Support/Herd/bin/mariadbd          (Herd MariaDB)
 4. /opt/homebrew/opt/mysql/bin/mysqld

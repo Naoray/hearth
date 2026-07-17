@@ -52,7 +52,7 @@ All notable changes to Hearth will be documented in this file.
   `--initialize-insecure`. Runtime args include `--skip-name-resolve`.
   Shutdown grace 20s to protect InnoDB flush.
 - Redis engine: dataless; runtime args `--appendonly no`, pidfile under
-  `~/.config/hearth/run/redis.pid`.
+  `~/Library/Application Support/hearth/run/redis.pid`.
 - Port-in-use guard at registration AND inside daemon dispatch — surfaces a
   typed `DaemonResponse::Conflict { engine, port, owner_hint }` so port
   collisions don't burn the circuit breaker.
