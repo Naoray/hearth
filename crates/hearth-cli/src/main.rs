@@ -556,9 +556,14 @@ fn render_php_config_report(
 }
 
 async fn send_to_daemon(request: DaemonRequest) -> anyhow::Result<DaemonResponse> {
-    let socket_path = hearth_lib::socket::socket_path();
+    send_to_daemon_at(&hearth_lib::socket::socket_path(), request).await
+}
 
-    let stream = UnixStream::connect(&socket_path)
+async fn send_to_daemon_at(
+    socket_path: &std::path::Path,
+    request: DaemonRequest,
+) -> anyhow::Result<DaemonResponse> {
+    let stream = UnixStream::connect(socket_path)
         .await
         .context("Daemon not running. Start with: hearth daemon start")?;
 
@@ -893,35 +898,70 @@ async fn run_install() -> anyhow::Result<()> {
 
 async fn run_daemon(command: DaemonCommands) -> anyhow::Result<()> {
     match command {
-        DaemonCommands::Start => daemon_start().await,
-        DaemonCommands::Stop => daemon_stop().await,
+        // B6-1 (review 5594 rev6): mutating lifecycle commands obtain ONE
+        // validated root snapshot BEFORE any mkdir/log-create/remove/kill/
+        // spawn — a root-validation failure is a typed error with zero
+        // mutation. Status stays on the read-only seam: pid-file read +
+        // signal-0 probe + socket ping; no mutation, no launch.
+        DaemonCommands::Start => daemon_start(&DaemonLifecyclePaths::detect()?).await,
+        DaemonCommands::Stop => daemon_stop(&DaemonLifecyclePaths::detect()?).await,
         DaemonCommands::Status => daemon_status().await,
     }
 }
 
-/// Read the daemon PID file and check if the process is alive.
-fn daemon_pid() -> Option<u32> {
-    let pid_path = hearth_lib::run_dir().join("daemon.pid");
-    let content = std::fs::read_to_string(&pid_path).ok()?;
+/// Validated daemon-lifecycle paths (review 5594 B6-1): the log dir, pid
+/// file, and socket spellings all derive from the validated `roots.hearth`
+/// of a single `ProviderRoots` snapshot — never from a second raw
+/// `config_dir()`/`log_dir()`/`run_dir()`/`socket_path()` env read.
+struct DaemonLifecyclePaths {
+    log_dir: std::path::PathBuf,
+    pid_file: std::path::PathBuf,
+    socket: std::path::PathBuf,
+}
+
+impl DaemonLifecyclePaths {
+    fn from_roots(roots: &hearth_lib::php::targets::ProviderRoots) -> Self {
+        Self {
+            log_dir: roots.hearth.join("log"),
+            pid_file: roots.hearth.join("run").join("daemon.pid"),
+            socket: roots.hearth.join("hearth.sock"),
+        }
+    }
+
+    fn detect() -> anyhow::Result<Self> {
+        let roots = hearth_lib::php::targets::ProviderRoots::detect()
+            .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?;
+        Ok(Self::from_roots(&roots))
+    }
+}
+
+/// Read a daemon PID file and check whether that process is alive.
+/// Signal 0 checks liveness without sending an actual signal — probe only.
+fn daemon_pid_at(pid_file: &std::path::Path) -> Option<u32> {
+    let content = std::fs::read_to_string(pid_file).ok()?;
     let pid: u32 = content.trim().parse().ok()?;
 
-    // Signal 0 checks if process is alive without actually sending a signal
     let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
     let alive = nix::sys::signal::kill(nix_pid, None).is_ok();
     if alive { Some(pid) } else { None }
 }
 
-async fn daemon_start() -> anyhow::Result<()> {
-    if let Some(pid) = daemon_pid() {
+/// Read-only liveness probe on the raw path seam (status/display only —
+/// mutating lifecycle paths go through [`DaemonLifecyclePaths`]).
+fn daemon_pid() -> Option<u32> {
+    daemon_pid_at(&hearth_lib::run_dir().join("daemon.pid"))
+}
+
+async fn daemon_start(paths: &DaemonLifecyclePaths) -> anyhow::Result<()> {
+    if let Some(pid) = daemon_pid_at(&paths.pid_file) {
         println!("Daemon is already running (PID {})", pid);
         return Ok(());
     }
 
-    let log_dir = hearth_lib::log_dir();
-    std::fs::create_dir_all(&log_dir)?;
+    std::fs::create_dir_all(&paths.log_dir)?;
 
-    let stdout_file = std::fs::File::create(log_dir.join("daemon.out.log"))?;
-    let stderr_file = std::fs::File::create(log_dir.join("daemon.err.log"))?;
+    let stdout_file = std::fs::File::create(paths.log_dir.join("daemon.out.log"))?;
+    let stderr_file = std::fs::File::create(paths.log_dir.join("daemon.err.log"))?;
 
     // Resolve hearth-daemon as a sibling of the current `hearth` binary first,
     // then fall back to PATH. Without sibling-first resolution, a stale brew
@@ -960,11 +1000,11 @@ async fn daemon_start() -> anyhow::Result<()> {
     let pid = child.id();
     println!("Daemon starting (PID {})...", pid);
 
-    // Wait briefly for the socket to appear
-    let socket_path = hearth_lib::socket::socket_path();
+    // Wait briefly for the socket to appear — same validated spelling the
+    // spawned daemon derives from its own boot snapshot.
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if socket_path.exists() {
+        if paths.socket.exists() {
             println!("Daemon is running.");
             return Ok(());
         }
@@ -972,19 +1012,19 @@ async fn daemon_start() -> anyhow::Result<()> {
 
     println!(
         "Daemon started but socket not yet available. Check logs at {}",
-        log_dir.display()
+        paths.log_dir.display()
     );
     Ok(())
 }
 
-async fn daemon_stop() -> anyhow::Result<()> {
-    let Some(pid) = daemon_pid() else {
+async fn daemon_stop(paths: &DaemonLifecyclePaths) -> anyhow::Result<()> {
+    let Some(pid) = daemon_pid_at(&paths.pid_file) else {
         println!("Daemon is not running.");
         return Ok(());
     };
 
     // Gracefully stop all supervised services before killing the daemon
-    if let Ok(_) = send_to_daemon(DaemonRequest::Stop).await {
+    if let Ok(_) = send_to_daemon_at(&paths.socket, DaemonRequest::Stop).await {
         println!("Services stopped.");
     }
 
@@ -1001,8 +1041,8 @@ async fn daemon_stop() -> anyhow::Result<()> {
         let alive = nix::sys::signal::kill(nix_pid, None).is_ok();
         if !alive {
             // Clean up stale files
-            let _ = std::fs::remove_file(hearth_lib::run_dir().join("daemon.pid"));
-            let _ = std::fs::remove_file(hearth_lib::socket::socket_path());
+            let _ = std::fs::remove_file(&paths.pid_file);
+            let _ = std::fs::remove_file(&paths.socket);
             println!("Daemon stopped.");
             return Ok(());
         }
@@ -1791,5 +1831,84 @@ mod tests {
             print_response(DaemonResponse::PhpConfigReport(refused)),
             ExitClass::Failure
         );
+    }
+
+    #[test]
+    fn daemon_lifecycle_paths_derive_from_validated_snapshot() {
+        // B6-1: every mutating lifecycle path spelling comes from the
+        // validated snapshot's hearth root — no raw env-derived helper.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let roots = hearth_lib::php::targets::ProviderRoots::isolated(
+            &base,
+            base.join("hearth"),
+            base.join("herd"),
+            base.join("homebrew"),
+        )
+        .unwrap();
+        let paths = DaemonLifecyclePaths::from_roots(&roots);
+        assert_eq!(paths.log_dir, base.join("hearth/log"));
+        assert_eq!(paths.pid_file, base.join("hearth/run/daemon.pid"));
+        assert_eq!(paths.socket, base.join("hearth/hearth.sock"));
+        for p in [&paths.log_dir, &paths.pid_file, &paths.socket] {
+            assert!(p.starts_with(&roots.hearth), "derived from roots.hearth");
+        }
+    }
+
+    #[test]
+    fn daemon_lifecycle_detect_fails_closed_before_any_mutation() {
+        // B6-1 red at 2651cdd: a relative HEARTH_CONFIG_DIR made
+        // `daemon start` create CWD-relative log dirs/files and spawn the
+        // daemon. Post-fix, path construction itself is the gate: detect()
+        // returns the typed error and daemon_start/daemon_stop (which only
+        // accept an already-validated DaemonLifecyclePaths) are never
+        // reached — zero mkdir/create/remove/kill/spawn.
+        //
+        // This is the only env-mutating test in this crate; exact prior
+        // values are restored below (no other test reads these keys).
+        let keys = [
+            "HEARTH_CONFIG_DIR",
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+        ];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+
+        // SAFETY: single env-mutating test in this binary.
+        unsafe {
+            std::env::remove_var("HEARTH_ISOLATED_ROOT");
+            std::env::remove_var("HEARTH_HERD_ROOT");
+            std::env::remove_var("HEARTH_HOMEBREW_ROOT");
+            std::env::set_var("HEARTH_CONFIG_DIR", "relative-b6-cfg");
+        }
+        let relative = DaemonLifecyclePaths::detect();
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var("HEARTH_HERD_ROOT", "/tmp/lone-override");
+            std::env::remove_var("HEARTH_CONFIG_DIR");
+        }
+        let lone = DaemonLifecyclePaths::detect();
+        // SAFETY: as above — restore the exact prior values.
+        unsafe {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+
+        let err = relative.err().expect("relative override must fail closed");
+        assert!(
+            err.to_string()
+                .contains("provider-root configuration invalid"),
+            "typed actionable error, got: {err}"
+        );
+        assert!(
+            !std::path::Path::new("relative-b6-cfg").exists(),
+            "zero mutation on rejection"
+        );
+        assert!(lone.is_err(), "lone discovery override must fail closed");
     }
 }
