@@ -141,13 +141,25 @@ impl HearthConfig {
 
     /// Save to a specific path. Atomic: same-dir exclusive temp file + rename,
     /// so a crash mid-save can never truncate an existing config.toml.
+    ///
+    /// The config can carry credentials (`ploi_api_token`), so the replacement
+    /// preserves an existing target's Unix mode exactly and a brand-new config
+    /// is created 0600 regardless of umask. No path — including error/retry
+    /// paths — ever widens permissions.
     pub fn save_to(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
             _ => std::path::PathBuf::from("."),
         };
         std::fs::create_dir_all(&parent)?;
         let content = toml::to_string_pretty(self)?;
+
+        // Existing target: keep its mode. New target: restrictive 0600.
+        let target_mode = std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0o600);
 
         let file_name = path
             .file_name()
@@ -161,9 +173,11 @@ impl HearthConfig {
                 std::process::id(),
                 attempt
             ));
+            // Born 0600 (minus umask) — never wider than the final mode.
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                .mode(0o600)
                 .open(&candidate)
             {
                 Ok(file) => break (candidate, file),
@@ -174,7 +188,10 @@ impl HearthConfig {
             }
         };
 
-        let result = Self::write_and_rename(file, &content, &tmp_path, path);
+        let result =
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(target_mode))
+                .map_err(Into::into)
+                .and_then(|()| Self::write_and_rename(file, &content, &tmp_path, path));
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp_path);
         }
@@ -625,5 +642,61 @@ installed_at = "2026-05-20T12:00:00Z"
 
         let loaded = HearthConfig::load_from(&config_path).unwrap();
         assert_eq!(loaded.tld, "test");
+    }
+
+    #[test]
+    fn save_preserves_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        // Existing credential-bearing config locked down to 0600.
+        std::fs::write(&config_path, "tld = \"old\"").unwrap();
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        HearthConfig::default().save_to(&config_path).unwrap();
+
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "atomic replacement must not widen 0600");
+    }
+
+    #[test]
+    fn save_preserves_other_restrictive_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "tld = \"old\"").unwrap();
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        HearthConfig::default().save_to(&config_path).unwrap();
+
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "existing mode must be preserved exactly");
+    }
+
+    #[test]
+    fn new_config_saved_group_world_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        HearthConfig::default().save_to(&config_path).unwrap();
+
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a new config may hold credentials — 0600 regardless of umask"
+        );
     }
 }
