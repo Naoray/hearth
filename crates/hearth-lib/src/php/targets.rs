@@ -474,6 +474,14 @@ mod tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
+        // macOS stalls the FIRST exec of a fresh unsigned executable for
+        // seconds while syspolicyd assesses it. Absorb that one-time cost
+        // here (unbounded) so probe timeouts measure the probe itself.
+        let _ = std::process::Command::new(&path)
+            .arg("--warmup")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         path
     }
 
