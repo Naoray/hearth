@@ -1,3 +1,4 @@
+pub mod ini_guard;
 pub mod resolver;
 
 use std::path::PathBuf;
