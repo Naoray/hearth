@@ -2,6 +2,7 @@ pub mod add;
 pub mod config;
 pub mod db;
 pub mod download;
+pub(crate) mod fsync;
 pub mod dump;
 pub mod mailpit;
 pub mod mcp;

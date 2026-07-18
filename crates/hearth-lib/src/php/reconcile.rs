@@ -164,7 +164,12 @@ fn atomic_write(dir: &Path, final_path: &Path, bytes: &[u8], mode: u32) -> anyho
     let result = (|| -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
-        std::fs::rename(&tmp_path, final_path)
+        std::fs::rename(&tmp_path, final_path)?;
+        crate::fsync::note_rename(final_path);
+        // Durability barrier: the rename commits only once the containing
+        // directory is synced. Failures propagate — never report success
+        // past a failed barrier.
+        crate::fsync::sync_dir(dir)
     })();
     if let Err(e) = result {
         let _ = std::fs::remove_file(&tmp_path);
@@ -596,7 +601,14 @@ fn delete_channel_file(
             error: format!("could not journal pending delete: {e}"),
         });
     }
-    if let Err(e) = std::fs::remove_file(file_path) {
+    // Removal barrier: the unlink is durable only after the containing
+    // directory syncs; ownership is dropped only past that barrier.
+    let removal = std::fs::remove_file(file_path).and_then(|()| {
+        crate::fsync::note_remove(file_path);
+        let parent = file_path.parent().unwrap_or(Path::new("."));
+        crate::fsync::sync_dir(parent)
+    });
+    if let Err(e) = removal {
         return finalize_failure(manifest, manifest_path, file_path, e.to_string());
     }
     let idx = manifest.entry_index(file_path).unwrap();
@@ -616,25 +628,34 @@ pub fn unmanage(manifest_path: &Path) -> anyhow::Result<Vec<FileAction>> {
     for entry in manifest.files.drain(..) {
         match file_sha256(&entry.path) {
             None => {} // already gone — drop the entry silently
-            Some(actual) if actual == entry.sha256 => match std::fs::remove_file(&entry.path) {
-                Ok(()) => actions.push(FileAction {
-                    path: entry.path.clone(),
-                    php_version: entry.php_version.clone(),
-                    channel: entry.channel.clone(),
-                    outcome: WriteOutcome::Deleted,
-                }),
-                Err(e) => {
-                    actions.push(FileAction {
+            Some(actual) if actual == entry.sha256 => {
+                // Ownership is dropped only after the unlink is durable in
+                // its containing directory.
+                let removal = std::fs::remove_file(&entry.path).and_then(|()| {
+                    crate::fsync::note_remove(&entry.path);
+                    let parent = entry.path.parent().unwrap_or(Path::new("."));
+                    crate::fsync::sync_dir(parent)
+                });
+                match removal {
+                    Ok(()) => actions.push(FileAction {
                         path: entry.path.clone(),
                         php_version: entry.php_version.clone(),
                         channel: entry.channel.clone(),
-                        outcome: WriteOutcome::Failed {
-                            error: e.to_string(),
-                        },
-                    });
-                    keep.push(entry);
+                        outcome: WriteOutcome::Deleted,
+                    }),
+                    Err(e) => {
+                        actions.push(FileAction {
+                            path: entry.path.clone(),
+                            php_version: entry.php_version.clone(),
+                            channel: entry.channel.clone(),
+                            outcome: WriteOutcome::Failed {
+                                error: e.to_string(),
+                            },
+                        });
+                        keep.push(entry);
+                    }
                 }
-            },
+            }
             Some(_) => {
                 actions.push(FileAction {
                     path: entry.path.clone(),
@@ -768,6 +789,12 @@ pub fn migrate_legacy_inis(
             backup = legacy.with_file_name(format!("php.ini.migrated.bak.{counter}"));
         }
         std::fs::rename(&legacy, &backup)?;
+        crate::fsync::note_rename(&backup);
+        // Retirement is complete only once the source directory entry change
+        // is durable. Canonical values are already durable, so a failure here
+        // returns an error and the surviving php.ini retries idempotently.
+        let source_dir = legacy.parent().unwrap_or(Path::new("."));
+        crate::fsync::sync_dir(source_dir)?;
         report.migrated_files.push(legacy);
     }
 
@@ -1279,6 +1306,279 @@ mod tests {
         assert!(
             Manifest::load(&manifest_path).unwrap().files.is_empty(),
             "stale entry (file no longer exists) must be dropped"
+        );
+    }
+
+    // ---- durability barriers (round-2) ----
+
+    use crate::fsync::test_hooks as barriers;
+
+    #[test]
+    fn pending_manifest_sync_failure_prevents_channel_mutation() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
+
+        barriers::reset();
+        barriers::fail_sync_of(&manifest_dir);
+        let report = reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            &[verified_target(
+                PhpProvider::Hearth,
+                "8.4",
+                PhpSapi::Cli,
+                &dir,
+            )],
+            &manifest_path,
+            &roots,
+        );
+        let events = barriers::events();
+        barriers::reset();
+
+        let file = dir.join(CHANNEL_FILE_NAME);
+        assert!(
+            matches!(outcome_for(&report, &file), WriteOutcome::Failed { .. }),
+            "{report:?}"
+        );
+        assert!(
+            !file.exists(),
+            "channel must not be mutated when the pending journal is not durable"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e == &format!("rename:{}", file.display())),
+            "no channel rename may precede a durable pending journal: {events:?}"
+        );
+    }
+
+    #[test]
+    fn channel_sync_failure_leaves_recoverable_pending_state() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        let ini = simple_ini("8.4", "memory_limit", "2G");
+
+        barriers::reset();
+        barriers::fail_sync_of(&dir);
+        let report = reconcile(
+            &ini,
+            &[verified_target(
+                PhpProvider::Hearth,
+                "8.4",
+                PhpSapi::Cli,
+                &dir,
+            )],
+            &manifest_path,
+            &roots,
+        );
+        barriers::reset();
+
+        let file = dir.join(CHANNEL_FILE_NAME);
+        assert!(
+            matches!(outcome_for(&report, &file), WriteOutcome::Failed { .. }),
+            "channel dir sync failure must be a typed failure: {report:?}"
+        );
+        let manifest = Manifest::load(&manifest_path).unwrap();
+        let entry = manifest.files.iter().find(|e| e.path == file).unwrap();
+        assert_eq!(
+            entry.state,
+            EntryState::Pending,
+            "ownership must NOT be finalized past a failed channel barrier"
+        );
+
+        // The durable pending journal must remain recoverable: with the
+        // failpoint cleared, recovery finalizes from the on-disk state.
+        let actions = recover_pending(&manifest_path).unwrap();
+        assert!(matches!(actions[0].outcome, RecoveryOutcome::Finalized));
+        let manifest = Manifest::load(&manifest_path).unwrap();
+        assert_eq!(manifest.files[0].state, EntryState::Applied);
+    }
+
+    #[test]
+    fn reconcile_barrier_ordering_is_pending_channel_final() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
+
+        barriers::reset();
+        let report = reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            &[verified_target(
+                PhpProvider::Hearth,
+                "8.4",
+                PhpSapi::Cli,
+                &dir,
+            )],
+            &manifest_path,
+            &roots,
+        );
+        let events = barriers::events();
+        barriers::reset();
+
+        let file = dir.join(CHANNEL_FILE_NAME);
+        assert!(matches!(outcome_for(&report, &file), WriteOutcome::Written));
+
+        let manifest_sync = format!("sync:{}", manifest_dir.display());
+        let manifest_sync_idxs: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| **e == manifest_sync)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            manifest_sync_idxs.len() >= 2,
+            "pending AND final manifest saves must both sync the manifest dir: {events:?}"
+        );
+        let rename_channel = barriers::index_of(&events, &format!("rename:{}", file.display()));
+        let sync_channel = barriers::index_of(&events, &format!("sync:{}", dir.display()));
+        assert!(
+            manifest_sync_idxs[0] < rename_channel
+                && rename_channel < sync_channel
+                && sync_channel < *manifest_sync_idxs.last().unwrap(),
+            "required order: pending manifest sync → channel rename → channel dir sync → final manifest sync; got {events:?}"
+        );
+    }
+
+    #[test]
+    fn delete_sync_failure_prevents_ownership_finalization() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        let target = verified_target(PhpProvider::Hearth, "8.4", PhpSapi::Cli, &dir);
+
+        reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            std::slice::from_ref(&target),
+            &manifest_path,
+            &roots,
+        );
+        let file = dir.join(CHANNEL_FILE_NAME);
+        assert!(file.exists());
+
+        barriers::reset();
+        barriers::fail_sync_of(&dir);
+        let report = reconcile(
+            &PhpIniSettings::default(),
+            std::slice::from_ref(&target),
+            &manifest_path,
+            &roots,
+        );
+        barriers::reset();
+
+        assert!(
+            matches!(outcome_for(&report, &file), WriteOutcome::Failed { .. }),
+            "{report:?}"
+        );
+        let manifest = Manifest::load(&manifest_path).unwrap();
+        assert!(
+            manifest.files.iter().any(|e| e.path == file),
+            "ownership must be retained until the removal is durable"
+        );
+
+        // Recovery (barrier restored) resolves the journaled delete.
+        recover_pending(&manifest_path).unwrap();
+        assert!(
+            Manifest::load(&manifest_path).unwrap().files.is_empty(),
+            "recovery finalizes the durable delete"
+        );
+    }
+
+    #[test]
+    fn unmanage_sync_failure_keeps_ownership() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        let manifest_path = base.join("hearth/php/manifest.toml");
+
+        reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            &[verified_target(
+                PhpProvider::Hearth,
+                "8.4",
+                PhpSapi::Cli,
+                &dir,
+            )],
+            &manifest_path,
+            &roots,
+        );
+        let file = dir.join(CHANNEL_FILE_NAME);
+
+        barriers::reset();
+        barriers::fail_sync_of(&dir);
+        let actions = unmanage(&manifest_path).unwrap();
+        barriers::reset();
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.path == file && matches!(a.outcome, WriteOutcome::Failed { .. })),
+            "{actions:?}"
+        );
+        assert!(
+            Manifest::load(&manifest_path)
+                .unwrap()
+                .files
+                .iter()
+                .any(|e| e.path == file),
+            "unmanage must not drop ownership past a failed removal barrier"
+        );
+    }
+
+    #[test]
+    fn config_sync_failure_prevents_legacy_rename() {
+        let (_tmp, base) = canon_tmp();
+        let php_dir = base.join("php");
+        std::fs::create_dir_all(php_dir.join("8.4")).unwrap();
+        std::fs::write(php_dir.join("8.4/php.ini"), "[php]\nmemory_limit=1G\n").unwrap();
+        let config_dir = base.join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        barriers::reset();
+        barriers::fail_sync_of(&config_dir);
+        let mut config = crate::config::HearthConfig::default();
+        let result = migrate_legacy_inis(&mut config, &config_dir.join("config.toml"), &php_dir);
+        barriers::reset();
+
+        assert!(result.is_err(), "config barrier failure must propagate");
+        assert!(
+            php_dir.join("8.4/php.ini").exists(),
+            "legacy source must be untouched when the canonical config is not durable"
+        );
+        assert!(!php_dir.join("8.4/php.ini.migrated.bak").exists());
+    }
+
+    #[test]
+    fn legacy_rename_followed_by_source_dir_sync() {
+        let (_tmp, base) = canon_tmp();
+        let php_dir = base.join("php");
+        let version_dir = php_dir.join("8.4");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("php.ini"), "[php]\nmemory_limit=1G\n").unwrap();
+        let config_dir = base.join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        barriers::reset();
+        let mut config = crate::config::HearthConfig::default();
+        migrate_legacy_inis(&mut config, &config_dir.join("config.toml"), &php_dir).unwrap();
+        let events = barriers::events();
+        barriers::reset();
+
+        let config_sync = barriers::index_of(&events, &format!("sync:{}", config_dir.display()));
+        let backup = version_dir.join("php.ini.migrated.bak");
+        let backup_rename = barriers::index_of(&events, &format!("rename:{}", backup.display()));
+        let source_sync = barriers::index_of(&events, &format!("sync:{}", version_dir.display()));
+        assert!(
+            config_sync < backup_rename && backup_rename < source_sync,
+            "required order: config dir sync → legacy rename → source dir sync; got {events:?}"
         );
     }
 

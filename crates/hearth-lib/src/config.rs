@@ -209,6 +209,14 @@ impl HearthConfig {
         file.sync_all()?;
         drop(file);
         std::fs::rename(tmp_path, path)?;
+        crate::fsync::note_rename(path);
+        // The rename itself is only durable once the parent directory entry
+        // is synced — without this, a crash can resurrect the old config.
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => std::path::Path::new("."),
+        };
+        crate::fsync::sync_dir(parent)?;
         Ok(())
     }
 
@@ -679,6 +687,23 @@ installed_at = "2026-05-20T12:00:00Z"
             .mode()
             & 0o777;
         assert_eq!(mode, 0o640, "existing mode must be preserved exactly");
+    }
+
+    #[test]
+    fn config_parent_sync_failure_is_reported() {
+        // The rename is only durable once the containing directory is synced;
+        // a failed barrier must surface as a save error, never silent success.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        crate::fsync::test_hooks::reset();
+        crate::fsync::test_hooks::fail_sync_of(&dir);
+
+        let result = HearthConfig::default().save_to(&dir.join("config.toml"));
+        crate::fsync::test_hooks::reset();
+        assert!(
+            result.is_err(),
+            "directory-sync failure must be reported, not swallowed"
+        );
     }
 
     #[test]
