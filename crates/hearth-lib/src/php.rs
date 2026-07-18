@@ -1,3 +1,4 @@
+pub mod engine;
 pub mod ini_guard;
 pub mod reconcile;
 pub mod resolver;

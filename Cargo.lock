@@ -904,6 +904,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "signal-hook-tokio",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

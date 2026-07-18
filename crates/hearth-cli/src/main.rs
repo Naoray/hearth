@@ -6,7 +6,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use hearth_lib::add::AddAnswers;
-use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
+use hearth_lib::socket::{
+    DaemonRequest, DaemonResponse, DbEngineStatus, FileWriteResult, FpmRestartOutcome,
+};
 
 /// Closed enum of packages accepted by `hearth add`. Validated at parse time so users
 /// get a clean clap error rather than a runtime "unknown package".
@@ -303,7 +305,16 @@ async fn send_to_daemon(request: DaemonRequest) -> anyhow::Result<DaemonResponse
     let mut line = String::new();
     reader.read_line(&mut line).await?;
 
-    let response: DaemonResponse = serde_json::from_str(line.trim())?;
+    // Protocol window: an old daemon closes without responding to an unknown
+    // request variant (EOF → empty line), or answers with a shape this CLI
+    // cannot parse. Either way the remediation is the same.
+    const MISMATCH: &str =
+        "hearth CLI and daemon versions differ — run 'hearth daemon restart' and retry.";
+    if line.trim().is_empty() {
+        anyhow::bail!("{MISMATCH}");
+    }
+    let response: DaemonResponse =
+        serde_json::from_str(line.trim()).map_err(|_| anyhow::anyhow!("{MISMATCH}"))?;
     Ok(response)
 }
 
@@ -361,6 +372,47 @@ fn print_response(response: DaemonResponse) {
                  Hint: stop the colliding process (e.g. `brew services stop {engine}`) or change the port in ~/.config/hearth/config.toml."
             );
             std::process::exit(1);
+        }
+        DaemonResponse::PhpConfigReport(outcome) => {
+            // Interim rendering — Task 7 replaces this with the pure
+            // renderer + ExitClass surface.
+            if outcome.persisted == Some(true) {
+                println!("Configuration persisted.");
+            }
+            for file in &outcome.files {
+                match &file.result {
+                    FileWriteResult::Refused { reason } => {
+                        eprintln!("refused: {} — {reason}", file.path)
+                    }
+                    FileWriteResult::Failed { error } => {
+                        eprintln!("failed: {} — {error}", file.path)
+                    }
+                    other => println!("{}: {other:?}", file.path),
+                }
+            }
+            for row in &outcome.rows {
+                println!(
+                    "{:<9} {:<5} {:<4} {:<10} {}",
+                    row.provider, row.version, row.sapi, row.context, row.coverage
+                );
+            }
+            match &outcome.fpm {
+                FpmRestartOutcome::Restarted => println!("php-fpm restarted"),
+                FpmRestartOutcome::NotRegistered { herd_hint: true } => {
+                    println!("php-fpm not restarted: not registered (Herd manages PHP-FPM)")
+                }
+                FpmRestartOutcome::NotRegistered { herd_hint: false } => {
+                    println!("php-fpm not restarted: not registered")
+                }
+                FpmRestartOutcome::LaunchBlocked { reason } => {
+                    println!("php-fpm not restarted: launch-blocked ({reason})")
+                }
+                FpmRestartOutcome::Failed { message } => {
+                    eprintln!("Error: php-fpm restart failed: {message}");
+                    std::process::exit(1);
+                }
+                FpmRestartOutcome::NotAttempted => {}
+            }
         }
         DaemonResponse::Pong => println!("Daemon is running"),
     }

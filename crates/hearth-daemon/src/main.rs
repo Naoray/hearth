@@ -11,6 +11,8 @@ use hearth_lib::config::{AddedPackage, HearthConfig};
 use hearth_lib::db::health::port_in_use;
 use hearth_lib::mcp::HearthMcpServer;
 use hearth_lib::php::PhpManager;
+use hearth_lib::php::engine::PhpConfigEngine;
+use hearth_lib::php::targets::ProviderRoots;
 use hearth_lib::service::manager::{default_services, prune_added_packages};
 use hearth_lib::service::supervisor::{ManagedService, ServiceSupervisor};
 use hearth_lib::service::{ServiceKind, ServiceState};
@@ -20,6 +22,8 @@ use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
 use rmcp::transport::StreamableHttpServerConfig;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::StreamableHttpService;
+
+mod php_config;
 
 /// Shared state accessible by all daemon request handlers.
 ///
@@ -38,6 +42,12 @@ struct DaemonState {
     site_manager: Arc<Mutex<SiteManager>>,
     php_manager: Arc<Mutex<PhpManager>>,
     add_lock: Arc<Mutex<()>>,
+    /// Shared php-config engine (daemon socket handler + MCP tools route
+    /// through the same instance; its op lock serializes both).
+    php_engine: Arc<PhpConfigEngine>,
+    /// Injected config persistence path — handlers must never call the
+    /// global-path `HearthConfig::save()`.
+    config_path: PathBuf,
 }
 
 #[tokio::main]
@@ -55,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
     // expect `run/` and `data/` to be present on first start; pre-creating
     // them once per daemon boot keeps the wrapper scripts simple.
     let config_dir = hearth_lib::config_dir();
+    let config_path = config_dir.join("config.toml");
     std::fs::create_dir_all(hearth_lib::run_dir())?;
     std::fs::create_dir_all(hearth_lib::log_dir())?;
     std::fs::create_dir_all(hearth_lib::data_dir())?;
@@ -65,16 +76,40 @@ async fn main() -> anyhow::Result<()> {
     if !dropped.is_empty() {
         info!(count = dropped.len(), "pruned stale AddedPackage entries from config");
         config.added_packages = kept;
-        if let Err(e) = config.save() {
+        if let Err(e) = config.save_to(&config_path) {
             warn!(error = %e, "failed to persist pruned config");
         }
     }
 
-    // Build supervisor with default services. Per-package supervised registration
-    // lands in Task 4 (Horizon) and Task 5 (Reverb).
+    // Capture read-only fields before wrapping config in Arc<Mutex<>>
+    let tld = config.tld.clone();
+    let dump_port = config.dump_port;
+    let mcp_port = config.mcp_port;
+
+    let config = Arc::new(Mutex::new(config));
+
+    // Shared php-config engine + boot hook: pending-journal recovery, guarded
+    // legacy INI migration, and channel reconcile run BEFORE default_services
+    // so the supervisor only ever sees reconciled state.
+    let php_engine = Arc::new(PhpConfigEngine::new(
+        Arc::clone(&config),
+        config_path.clone(),
+        config_dir.clone(),
+        ProviderRoots::detect(),
+        Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        std::time::Duration::from_secs(5),
+    ));
+    if let Err(e) = php_engine.boot_sync().await {
+        warn!(error = %e, "php-config boot reconcile failed — continuing without it");
+    }
+
+    // Build supervisor with default services.
     let mut supervisor = ServiceSupervisor::new();
-    for svc in default_services(&config, &config_dir) {
-        supervisor.register(svc);
+    {
+        let cfg = config.lock().await;
+        for svc in default_services(&cfg, &config_dir) {
+            supervisor.register(svc);
+        }
     }
 
     // Valet home directories for site enumeration (Valet + Herd)
@@ -84,18 +119,15 @@ async fn main() -> anyhow::Result<()> {
     if herd_valet.exists() {
         valet_homes.push(herd_valet);
     }
-    let tld = config.tld.clone();
-
-    // Capture ports before wrapping config in Arc<Mutex<>>
-    let dump_port = config.dump_port;
-    let mcp_port = config.mcp_port;
 
     let state = Arc::new(DaemonState {
         supervisor: Arc::new(Mutex::new(supervisor)),
-        config: Arc::new(Mutex::new(config)),
+        config,
         site_manager: Arc::new(Mutex::new(SiteManager::with_homes(valet_homes, tld))),
         php_manager: Arc::new(Mutex::new(PhpManager::new(hearth_lib::config_dir()))),
         add_lock: Arc::new(Mutex::new(())),
+        php_engine,
+        config_path,
     });
 
     // Remove stale socket
@@ -138,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
     let mcp_site_manager = Arc::clone(&state.site_manager);
     let mcp_php_manager = Arc::clone(&state.php_manager);
     let mcp_config = Arc::clone(&state.config);
+    let mcp_engine = Arc::clone(&state.php_engine);
     tokio::spawn(async move {
         let mcp_server_config = StreamableHttpServerConfig::default();
 
@@ -145,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
         let sm = mcp_site_manager;
         let pm = mcp_php_manager;
         let cfg = mcp_config;
+        let engine = mcp_engine;
 
         let service: StreamableHttpService<HearthMcpServer, LocalSessionManager> =
             StreamableHttpService::new(
@@ -154,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
                         Arc::clone(&sm),
                         Arc::clone(&pm),
                         Arc::clone(&cfg),
+                        Arc::clone(&engine),
                     ))
                 },
                 Arc::new(LocalSessionManager::default()),
@@ -484,7 +519,7 @@ async fn process_request(
                     let park_path = PathBuf::from(&path);
                     if !cfg.parked_paths.contains(&park_path) {
                         cfg.parked_paths.push(park_path);
-                        if let Err(e) = cfg.save() {
+                        if let Err(e) = cfg.save_to(&state.config_path) {
                             return DaemonResponse::Error {
                                 message: format!("parked but failed to save config: {e}"),
                             };
@@ -553,42 +588,12 @@ async fn process_request(
         }
 
         DaemonRequest::PhpConfig { version, key, value } => {
-            // Lock ordering: config -> php_manager -> supervisor
-            let resolved_version = {
-                let cfg = state.config.lock().await;
-                if version == "active" {
-                    cfg.default_php.clone()
-                } else {
-                    version
-                }
-            };
-            // Drop config lock before acquiring php_manager
-
-            {
-                let pm = state.php_manager.lock().await;
-                if let Err(e) = pm.set_ini_value(&resolved_version, &key, &value) {
-                    return DaemonResponse::Error { message: e.to_string() };
-                }
-            }
-            // Drop php_manager lock before acquiring supervisor
-
-            let mut sup = state.supervisor.lock().await;
-            // Restart PHP-FPM to pick up INI changes
-            if let Err(e) = sup.stop_service(hearth_lib::service::ServiceKind::PhpFpm) {
-                return DaemonResponse::Error {
-                    message: format!("INI updated but php-fpm stop failed: {e}"),
-                };
-            }
-            if let Err(e) = sup.start_service(hearth_lib::service::ServiceKind::PhpFpm) {
-                return DaemonResponse::Error {
-                    message: format!("INI updated but php-fpm restart failed: {e}"),
-                };
-            }
-
-            DaemonResponse::Ok {
-                message: Some(format!("Set {key}={value} for PHP {resolved_version} and restarted php-fpm")),
-            }
+            // Legacy protocol window: mapped to a V2 Set, answered with a
+            // legacy Ok/Error response (old CLIs keep working).
+            php_config::php_config_legacy(state, version, key, value).await
         }
+
+        DaemonRequest::PhpConfigV2 { action } => php_config::php_config(state, action).await,
 
         DaemonRequest::DbStart { engine } => {
             db_start(state, engine).await
@@ -731,7 +736,7 @@ async fn process_request(
                         args: spec.args.clone(),
                         installed_at: now,
                     });
-                    if let Err(e) = cfg.save() {
+                    if let Err(e) = cfg.save_to(&state.config_path) {
                         return DaemonResponse::Error {
                             message: format!(
                                 "recipe ran but failed to persist AddedPackage: {e}"
@@ -784,13 +789,21 @@ async fn process_request(
             {
                 let mut cfg = state.config.lock().await;
                 cfg.default_php = version.clone();
-                if let Err(e) = cfg.save() {
+                if let Err(e) = cfg.save_to(&state.config_path) {
                     return DaemonResponse::Error {
                         message: format!("failed to save config: {e}"),
                     };
                 }
             }
-            // Drop config lock before acquiring supervisor
+            // Reconcile channel files for the newly active version BEFORE any
+            // supervisor acquisition (lock order: config → … → supervisor).
+            if let Err(e) = state
+                .php_engine
+                .apply(hearth_lib::socket::PhpConfigAction::Sync)
+                .await
+            {
+                warn!(error = %e, "post-switch php-config reconcile failed");
+            }
 
             let mut sup = state.supervisor.lock().await;
 
