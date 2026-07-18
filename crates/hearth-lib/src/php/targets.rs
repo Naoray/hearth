@@ -99,7 +99,9 @@ impl ProviderRoots {
         }
     }
 
-    fn allowed_prefixes(&self) -> Vec<PathBuf> {
+    /// Canonicalized channel-verification allowlist derived from the roots
+    /// (all under `$HOME` or `/opt/homebrew` in production).
+    pub fn allowed_prefixes(&self) -> Vec<PathBuf> {
         [&self.hearth, &self.herd, &self.homebrew]
             .into_iter()
             .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
