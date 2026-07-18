@@ -12,10 +12,12 @@ All notable changes to Hearth will be documented in this file.
   and guarded migration of the legacy per-version Hearth `php.ini` files.
   New actions: `--global`, `--php <V>`, `--show`, `--status`, `--unset`,
   `--sync`, `--unmanage`, plus the `hearth php exec` launch shim.
-- **Launch-probed observation**: `--show`/`--status` report per-target
-  observed values by executing each CLI binary under its exact launch
-  environments (`-r 'echo ini_get(...)'`) and Hearth's supervised FPM via
-  `php-fpm -i` under the exact service env. Four-state vocabulary
+- **Launch-probed observation**: `--show [key]` and `--status [key]` report
+  per-target observed values by executing each CLI binary under its exact
+  launch environments (`-r 'echo ini_get(...)'`) and Hearth's supervised FPM
+  via `php-fpm -i` under the exact service env; a keyless `--status` stays
+  the pure coverage table. FPM binaries are never executed for
+  classification — ambient (Herd/Homebrew) FPM is structurally unprobed. Four-state vocabulary
   (`configured` / `materialized` / `launch-probed` / `live-observed`), a
   truthful `pending restart` marker (manifest materialization timestamp vs
   the supervisor's own FPM spawn time), and `[not running]` for a
@@ -25,6 +27,9 @@ All notable changes to Hearth will be documented in this file.
   never writes for. No universal coverage is claimed anywhere.
 
 ### Changed
+- `hearth php use` never touches PHP-FPM while Herd owns it: the switch
+  persists the version and reconciles channels, then truthfully skips all
+  FPM supervisor mutation (`php-fpm untouched (Herd manages PHP-FPM)`).
 - Protocol-mismatch remediation now names only supported commands
   (`hearth daemon stop && hearth daemon start`); there is no
   `hearth daemon restart` command.

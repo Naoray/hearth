@@ -103,7 +103,14 @@ pub enum PhpConfigAction {
     /// Report configured (and, where materialized, observed) values. Read-only.
     Show { key: Option<String> },
     /// Per-target coverage table. Read-only; only reports `sync pending`.
-    Status,
+    /// With `key` (C1-3), eligible rows additionally carry configured +
+    /// launch-probed values; a keyless Status never fakes values. The field
+    /// defaults + is omitted when None, so the wire form of a keyless
+    /// Status is byte-identical to the legacy unit variant.
+    Status {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
     /// Force journal recovery + legacy migration + reconcile.
     Sync,
     /// Remove every Hearth-written channel file (manifest-tracked, exact-hash).
@@ -411,7 +418,10 @@ mod tests {
         cases.push(PhpConfigAction::Show {
             key: Some("memory_limit".to_string()),
         });
-        cases.push(PhpConfigAction::Status);
+        cases.push(PhpConfigAction::Status { key: None });
+        cases.push(PhpConfigAction::Status {
+            key: Some("memory_limit".to_string()),
+        });
         cases.push(PhpConfigAction::Sync);
         cases.push(PhpConfigAction::Unmanage);
 
@@ -420,6 +430,17 @@ mod tests {
             let back: PhpConfigAction = serde_json::from_str(&json).unwrap();
             assert_eq!(action, back, "round-trip mismatch for {json}");
         }
+    }
+
+    /// C1-3 protocol window: a keyless Status keeps the LEGACY wire form
+    /// byte-for-byte (`{"action":"Status"}`), and the legacy form parses to
+    /// `key: None` — old CLI ↔ new daemon and vice versa stay compatible.
+    #[test]
+    fn status_keyless_wire_form_is_legacy_byte_identical() {
+        let json = serde_json::to_string(&PhpConfigAction::Status { key: None }).unwrap();
+        assert_eq!(json, r#"{"action":"Status"}"#);
+        let back: PhpConfigAction = serde_json::from_str(r#"{"action":"Status"}"#).unwrap();
+        assert_eq!(back, PhpConfigAction::Status { key: None });
     }
 
     #[test]

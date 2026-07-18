@@ -4,12 +4,33 @@ use super::supervisor::ManagedService;
 use super::ServiceKind;
 use crate::config::{AddedPackage, HearthConfig};
 
-/// Detect whether Laravel Herd is running by checking for its process.
+/// Detect whether Laravel Herd owns the web/PHP services.
+///
+/// Production detection is the Herd.app process check. A deterministic
+/// override seam exists for the isolated smoke gate ONLY: it is honored
+/// exclusively while `HEARTH_ISOLATED_ROOT` (the typed isolated runtime) is
+/// set, so no ambient environment variable can flip Herd-coexistence
+/// behavior of a production daemon (C1-1/C1-4, review 5650).
 pub fn is_herd_running() -> bool {
+    if let Some(forced) = isolated_herd_ownership_override() {
+        return forced;
+    }
     std::process::Command::new("pgrep")
         .args(["-q", "-f", "Herd\\.app"])
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// `HEARTH_HERD_OWNERSHIP=1|0` — deterministic Herd-ownership answer for the
+/// isolated smoke daemon. `None` (ignored) unless the process runs in the
+/// typed isolated runtime; unparseable values are ignored, never guessed.
+fn isolated_herd_ownership_override() -> Option<bool> {
+    std::env::var_os("HEARTH_ISOLATED_ROOT")?;
+    match std::env::var("HEARTH_HERD_OWNERSHIP").ok()?.as_str() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
 }
 
 /// Filter `added_packages` to only entries whose `<site_path>/vendor/<vendor>/<pkg>`

@@ -23,7 +23,7 @@ hearth secure / unsecure                  — SSL certificates (trusted locally)
 hearth php use 8.3                        — switch PHP version instantly
 hearth php list                           — show installed versions
 hearth php config --global memory_limit 1G — set a PHP INI value across versions
-hearth php config --status                — per-target coverage + observed values
+hearth php config --status [key]          — per-target coverage (+values with a key)
 hearth dump                               — stream VarDumper output with timestamps
 hearth mail                               — open Mailpit UI in browser
 hearth db status [--json]                 — show DB engine state, ports, data dirs
@@ -144,7 +144,8 @@ hearth php config --global memory_limit 1G     # applies to every version
 hearth php config --php 8.3 memory_limit 512M  # one version's override
 hearth php config memory_limit 512M            # shorthand: the active version
 hearth php config --show [key]                 # configured + observed values
-hearth php config --status                     # per-target coverage table
+hearth php config --status [key]               # coverage table; a key adds
+                                               # per-target configured/observed
 hearth php config --unset [--global|--php V] <key>
 hearth php config --sync                       # force re-reconcile
 hearth php config --unmanage                   # remove every Hearth-written file

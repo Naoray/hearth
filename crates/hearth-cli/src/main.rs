@@ -183,7 +183,8 @@ enum PhpCommands {
         /// Remove a directive from the selected scope
         #[arg(long)]
         unset: bool,
-        /// Per-target coverage/status table
+        /// Per-target coverage/status table; with a key, each eligible row
+        /// also shows the configured and launch-probed value
         #[arg(long)]
         status: bool,
         /// Force journal recovery + reconcile of channel files
@@ -388,23 +389,28 @@ fn build_php_config_action(
         PhpScope::Active
     };
 
-    if status || sync || unmanage {
-        let name = if status {
-            "--status"
-        } else if sync {
-            "--sync"
-        } else {
-            "--unmanage"
-        };
+    // C1-3: --status takes an optional key so the coverage table can carry
+    // per-target configured + launch-probed values (todo #2321 acceptance).
+    // Keyless --status stays the pure coverage table; it never fakes values.
+    if status {
+        if value.is_some() {
+            return Err("--status takes an optional key but no value".to_string());
+        }
+        if global || php.is_some() {
+            return Err("--status takes no --global/--php scope".to_string());
+        }
+        return Ok(PhpConfigAction::Status { key });
+    }
+
+    if sync || unmanage {
+        let name = if sync { "--sync" } else { "--unmanage" };
         if key.is_some() || value.is_some() {
             return Err(format!("{name} takes no key or value"));
         }
         if global || php.is_some() {
             return Err(format!("{name} takes no --global/--php scope"));
         }
-        return Ok(if status {
-            PhpConfigAction::Status
-        } else if sync {
+        return Ok(if sync {
             PhpConfigAction::Sync
         } else {
             PhpConfigAction::Unmanage
@@ -523,6 +529,11 @@ fn render_php_config_report(
                     let _ = write!(line, "  observed={observed} ({observed_label})");
                 }
                 (None, None) => {}
+            }
+            // C1-5: pending restart is a runtime fact independent of probe
+            // success — a failed/keyless observation must still surface it.
+            if row.pending_restart && row.observed.is_none() {
+                let _ = write!(line, " [pending restart]");
             }
             let _ = writeln!(out, "{line}");
             if row.coverage.starts_with("UNMANAGED: privileged-dir") {
@@ -1459,11 +1470,12 @@ mod tests {
             )
             .is_err()
         );
-        // Status/Sync/Unmanage take no key/value/scope.
+        // Status takes an optional key (C1-3) but never a value; Sync/
+        // Unmanage take no key/value/scope.
         assert!(
             build(
                 Some("k"),
-                None,
+                Some("v"),
                 false,
                 None,
                 false,
@@ -1650,8 +1662,41 @@ mod tests {
         );
         assert_eq!(
             build(None, None, false, None, false, false, true, false, false),
-            Ok(PhpConfigAction::Status)
+            Ok(PhpConfigAction::Status { key: None })
         );
+        // C1-3: --status accepts an optional key selector…
+        assert_eq!(
+            build(
+                Some("k"),
+                None,
+                false,
+                None,
+                false,
+                false,
+                true,
+                false,
+                false
+            ),
+            Ok(PhpConfigAction::Status {
+                key: Some("k".to_string())
+            })
+        );
+        // …but still no value and no scope flags.
+        assert!(
+            build(
+                Some("k"),
+                Some("v"),
+                false,
+                None,
+                false,
+                false,
+                true,
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(build(None, None, true, None, false, false, true, false, false).is_err());
         assert_eq!(
             build(None, None, false, None, false, false, false, true, false),
             Ok(PhpConfigAction::Sync)
@@ -1815,6 +1860,40 @@ mod tests {
         let (out, _err, exit) = render_php_config_report(&outcome_with_rows(vec![stopped]));
         assert!(out.contains("[not running]"), "got: {out}");
         assert_eq!(exit, ExitClass::Success, "run state alone never fails");
+    }
+
+    /// C1-5 (review 5650): pending restart renders independently of probe
+    /// success — a failed probe (configured, observed=n/a) and a keyless
+    /// row both still surface the truthful marker.
+    #[test]
+    fn render_pending_restart_survives_probe_failure_and_keyless_rows() {
+        let mut probe_failed = row("supervised (scan-dir env at launch)");
+        probe_failed.sapi = "fpm".to_string();
+        probe_failed.context = "launched".to_string();
+        probe_failed.channel = None;
+        probe_failed.configured = Some("2G".to_string());
+        probe_failed.observed = None;
+        probe_failed.pending_restart = true;
+        probe_failed.run_state = Some("running".to_string());
+        let (out, _err, exit) = render_php_config_report(&outcome_with_rows(vec![probe_failed]));
+        assert!(out.contains("observed=n/a"), "got: {out}");
+        assert!(
+            out.contains("[pending restart]"),
+            "probe failure must not suppress the marker: {out}"
+        );
+        assert_eq!(exit, ExitClass::Success);
+
+        let mut keyless = row("supervised (scan-dir env at launch)");
+        keyless.sapi = "fpm".to_string();
+        keyless.context = "launched".to_string();
+        keyless.channel = None;
+        keyless.pending_restart = true;
+        keyless.run_state = Some("running".to_string());
+        let (out, _err, _exit) = render_php_config_report(&outcome_with_rows(vec![keyless]));
+        assert!(
+            out.contains("[pending restart]"),
+            "keyless row must still surface the marker: {out}"
+        );
     }
 
     #[test]

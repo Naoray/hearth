@@ -52,10 +52,15 @@ async fn annotate_fpm_runtime(state: &Arc<DaemonState>, outcome: &mut PhpConfigO
     };
     let snapshot = {
         let sup = state.supervisor.lock().await;
-        sup.service(ServiceKind::PhpFpm)
-            .map(|svc| (svc.state.clone(), svc.started_at()))
+        sup.service(ServiceKind::PhpFpm).map(|svc| {
+            (
+                svc.state.clone(),
+                svc.started_at(),
+                std::path::PathBuf::from(svc.command()),
+            )
+        })
     };
-    let Some((service_state, started_at)) = snapshot else {
+    let Some((service_state, started_at, supervised_binary)) = snapshot else {
         // Unregistered FPM keeps its truthful static row (LAUNCH-BLOCKED /
         // herd-owned); there is no run state to report.
         return;
@@ -65,7 +70,7 @@ async fn annotate_fpm_runtime(state: &Arc<DaemonState>, outcome: &mut PhpConfigO
         ServiceState::Running { .. } => {
             row.run_state = Some("running".to_string());
             row.pending_restart = pending_restart_marker(
-                channel_applied_at_ms(state, &row.version),
+                channel_applied_at_ms(state, &row.version, &supervised_binary),
                 started_at.and_then(unix_ms),
             );
         }
@@ -95,22 +100,41 @@ fn unix_ms(t: SystemTime) -> Option<u64> {
         .map(|d| d.as_millis() as u64)
 }
 
-/// Materialization timestamp of the Hearth channel file feeding the
-/// supervised FPM (Belt E scan dir for `version`), from the manifest.
-fn channel_applied_at_ms(state: &Arc<DaemonState>, version: &str) -> Option<u64> {
+/// Newest materialization timestamp among the Hearth-managed channel files
+/// the supervised FPM actually loads: always the Hearth conf.d (Belt E scan
+/// dir for `version`), plus — when the supervised binary registered by THIS
+/// supervisor is a provider build — that provider's verified channel file
+/// (C1-5, review 5650). The binary path comes from the supervisor's own
+/// registration, and every timestamp is a Hearth-written manifest entry;
+/// ambient process evidence is never consulted.
+fn channel_applied_at_ms(
+    state: &Arc<DaemonState>,
+    version: &str,
+    supervised_binary: &std::path::Path,
+) -> Option<u64> {
+    use hearth_lib::php::targets::{PhpProvider, expected_channel_dir};
+
     let engine = &state.php_engine;
-    let channel_file = engine
-        .config_dir()
-        .join("php")
-        .join(version)
-        .join("conf.d")
-        .join(CHANNEL_FILE_NAME);
+    let roots = engine.provider_roots();
+    let mut candidates =
+        vec![expected_channel_dir(PhpProvider::Hearth, version, roots).join(CHANNEL_FILE_NAME)];
+    let provider = if supervised_binary.starts_with(&roots.herd) {
+        Some(PhpProvider::Herd)
+    } else if supervised_binary.starts_with(&roots.homebrew) {
+        Some(PhpProvider::Homebrew)
+    } else {
+        None
+    };
+    if let Some(provider) = provider {
+        candidates.push(expected_channel_dir(provider, version, roots).join(CHANNEL_FILE_NAME));
+    }
     let manifest = Manifest::load(&engine.manifest_path()).ok()?;
     manifest
         .files
         .iter()
-        .find(|e| e.path == channel_file)
-        .and_then(|e| e.applied_at_unix_ms)
+        .filter(|e| candidates.iter().any(|c| c == &e.path))
+        .filter_map(|e| e.applied_at_unix_ms)
+        .max()
 }
 
 /// Handle the legacy `PhpConfig { version, key, value }` request (protocol
@@ -605,6 +629,103 @@ mod tests {
         let row = &outcome.rows[0];
         assert_eq!(row.run_state.as_deref(), Some("not running"));
         assert!(!row.pending_restart, "nothing running can be stale");
+    }
+
+    /// C1-5 (review 5650): the pending-restart timestamp follows the ACTUAL
+    /// supervised binary. A provider-backed FPM (registered command under
+    /// the herd root) is pending when the HERD channel file materialized
+    /// after spawn; a hearth-backed FPM ignores that unrelated provider
+    /// timestamp entirely.
+    #[tokio::test]
+    async fn annotate_uses_provider_backed_channel_timestamp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use hearth_lib::php::reconcile::{EntryState, LastOutcome, Manifest, ManifestEntry};
+        use hearth_lib::php::targets::{PhpProvider, expected_channel_dir};
+        use hearth_lib::service::supervisor::ManagedService;
+
+        let (tmp, _config_path, state) = state_fixture();
+        let base = tmp.path().canonicalize().unwrap();
+        let default_php = state.config.lock().await.default_php.clone();
+
+        // Spawnable fake FPM under the ISOLATED herd root.
+        let herd_bin = base.join("herd/bin/php84-fpm");
+        std::fs::create_dir_all(herd_bin.parent().unwrap()).unwrap();
+        std::fs::write(&herd_bin, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&herd_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.register(ManagedService::new(
+                hearth_lib::service::ServiceKind::PhpFpm,
+                herd_bin.to_string_lossy().to_string(),
+                vec![],
+            ));
+            sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+        }
+
+        // Only the HERD channel file has a (newer) materialization stamp.
+        let roots = state.php_engine.provider_roots().clone();
+        let herd_channel =
+            expected_channel_dir(PhpProvider::Herd, &default_php, &roots).join(CHANNEL_FILE_NAME);
+        let manifest = Manifest {
+            version: hearth_lib::php::reconcile::MANIFEST_VERSION,
+            files: vec![ManifestEntry {
+                path: herd_channel,
+                php_version: default_php.clone(),
+                channel: "herd-user".to_string(),
+                sha256: "abc".to_string(),
+                state: EntryState::Applied,
+                expected_old_sha256: None,
+                desired_sha256: None,
+                last_outcome: LastOutcome::Written,
+                applied_at_unix_ms: Some(i64::MAX as u64),
+            }],
+        };
+        manifest.save(&state.php_engine.manifest_path()).unwrap();
+
+        let mut outcome = outcome_with(vec![launched_row(&default_php)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        assert_eq!(outcome.rows[0].run_state.as_deref(), Some("running"));
+        assert!(
+            outcome.rows[0].pending_restart,
+            "provider-backed FPM must honor its provider channel timestamp"
+        );
+
+        // Hearth-backed FPM ignores the unrelated provider timestamp.
+        let hearth_bin = state
+            .php_engine
+            .config_dir()
+            .join("php")
+            .join(&default_php)
+            .join("php-fpm");
+        std::fs::create_dir_all(hearth_bin.parent().unwrap()).unwrap();
+        std::fs::write(&hearth_bin, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&hearth_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.stop_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+            sup.reconfigure_service(
+                hearth_lib::service::ServiceKind::PhpFpm,
+                hearth_bin.to_string_lossy().to_string(),
+                vec![],
+                vec![],
+            );
+            sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+        }
+        let mut outcome = outcome_with(vec![launched_row(&default_php)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        assert!(
+            !outcome.rows[0].pending_restart,
+            "hearth-backed FPM must ignore an unrelated provider channel stamp"
+        );
+
+        let mut sup = state.supervisor.lock().await;
+        sup.stop_service(hearth_lib::service::ServiceKind::PhpFpm)
+            .unwrap();
     }
 
     #[tokio::test]

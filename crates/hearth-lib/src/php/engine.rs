@@ -24,8 +24,8 @@ use crate::php::reconcile::{
 };
 use crate::php::targets::{
     ChannelClass, EffectiveContext, PhpProvider, PhpSapi, PhpTarget, ProbeInfo, ProviderRoots,
-    classify_channel, discover_provider_targets, probe_cli_effective, probe_fpm_effective,
-    probe_scan_dirs,
+    classify_channel, discover_provider_targets, expected_channel_dir, probe_cli_effective,
+    probe_fpm_effective, probe_scan_dirs, verify_user_channel,
 };
 use crate::service::ServiceKind;
 use crate::service::supervisor::ServiceSupervisor;
@@ -136,7 +136,7 @@ impl PhpConfigEngine {
             }
             PhpConfigAction::Unset { scope, key } => self.mutate(scope, &key, None).await,
             PhpConfigAction::Show { key } => self.observe(key.as_deref()).await,
-            PhpConfigAction::Status => self.observe(None).await,
+            PhpConfigAction::Status { key } => self.observe(key.as_deref()).await,
             PhpConfigAction::Sync => self.sync_locked().await,
             PhpConfigAction::Unmanage => self.unmanage_locked(),
         }
@@ -378,6 +378,39 @@ impl PhpConfigEngine {
 
         let mut targets = Vec::with_capacity(ids.len());
         for id in ids {
+            // C1-2 (review 5650): NO FPM binary is EVER executed for
+            // classification — `-i` runs only as the launch probe of the
+            // registrable service under its exact service env. External FPM
+            // identity is known from the provider layout alone (Round-4:
+            // ambient observation can grant nothing anyway), and the Hearth
+            // FPM write channel is the deterministic verified Hearth conf.d
+            // — no execution required for either.
+            if id.sapi == PhpSapi::Fpm {
+                let is_external_fpm = id.provider != PhpProvider::Hearth;
+                let reason = "fpm binaries are never executed for classification — \
+                              FPM runs `-i` only as the service launch probe";
+                let write_channel = if is_external_fpm {
+                    None
+                } else {
+                    let dir = expected_channel_dir(id.provider, &id.version, &self.provider_roots);
+                    verify_user_channel(&dir, &self.provider_roots.allowed_prefixes())
+                        .ok()
+                        .map(|_| dir)
+                };
+                targets.push(PhpTarget {
+                    id,
+                    probe: ProbeInfo::default(),
+                    normal_channel: ChannelClass::BestEffort {
+                        reason: reason.to_string(),
+                    },
+                    sanitized_channel: ChannelClass::BestEffort {
+                        reason: reason.to_string(),
+                    },
+                    write_channel,
+                });
+                continue;
+            }
+
             let probe = self.probe_cached(&id.binary, id.sapi).await;
             let normal_channel = classify_channel(
                 id.provider,
@@ -393,18 +426,10 @@ impl PhpConfigEngine {
                 context_failure(&probe, "sanitized probe:"),
                 &self.provider_roots,
             );
-            // Round-4 locked design: an ambient (non-Hearth) FPM target is
-            // NEVER a write target in Stage B — no observation of an
-            // external process can grant authority.
-            let is_external_fpm = id.provider != PhpProvider::Hearth && id.sapi == PhpSapi::Fpm;
-            let write_channel = if is_external_fpm {
-                None
-            } else {
-                match (&normal_channel, &sanitized_channel) {
-                    (ChannelClass::Verified { dir }, _) => Some(dir.clone()),
-                    (_, ChannelClass::Verified { dir }) => Some(dir.clone()),
-                    _ => None,
-                }
+            let write_channel = match (&normal_channel, &sanitized_channel) {
+                (ChannelClass::Verified { dir }, _) => Some(dir.clone()),
+                (_, ChannelClass::Verified { dir }) => Some(dir.clone()),
+                _ => None,
             };
             targets.push(PhpTarget {
                 id,
@@ -514,6 +539,14 @@ impl PhpConfigEngine {
                     pending_restart: false,
                     run_state: None,
                 });
+                continue;
+            }
+
+            // C1-2: Hearth's own FPM has exactly ONE launch surface — the
+            // supervised service row appended below. Terminal-context rows
+            // would imply classification coverage FPM never gets (its
+            // binaries are never executed outside the service launch probe).
+            if target.id.sapi == PhpSapi::Fpm {
                 continue;
             }
 
@@ -776,6 +809,19 @@ impl PhpConfigEngine {
         // order; op lock stays held for the whole transaction).
         require_reconciled(self.sync_locked().await)
             .map_err(|e| format!("switched default_php to {version} (persisted), but: {e}"))?;
+
+        // C1-1 (review 5650): an ordinary version switch must NEVER take FPM
+        // ownership while Herd owns it — the North Star coexistence
+        // invariant has no takeover flag. Version selection + reconcile
+        // above stand; FPM handling becomes a truthful skip with ZERO
+        // supervisor mutation (no stop/register/start/remove). Ownership
+        // comes from the same injected probe the daemon's service
+        // registration consults — never mutable process titles.
+        if self.herd_running() {
+            return Ok(format!(
+                "Switched to PHP {version}; php-fpm untouched (Herd manages PHP-FPM)"
+            ));
+        }
 
         let mut sup = supervisor.lock().await;
         let _ = sup.stop_service(ServiceKind::PhpFpm);
@@ -1122,7 +1168,11 @@ mod tests {
     #[tokio::test]
     async fn status_reports_hearth_fpm_launch_blocked_with_todo() {
         let fx = fixture(false);
-        let outcome = fx.engine.apply(PhpConfigAction::Status).await.unwrap();
+        let outcome = fx
+            .engine
+            .apply(PhpConfigAction::Status { key: None })
+            .await
+            .unwrap();
         let fpm_row = outcome
             .rows
             .iter()
@@ -1143,7 +1193,11 @@ mod tests {
     #[tokio::test]
     async fn status_under_herd_has_no_hearth_fpm_service_row() {
         let fx = fixture(true);
-        let outcome = fx.engine.apply(PhpConfigAction::Status).await.unwrap();
+        let outcome = fx
+            .engine
+            .apply(PhpConfigAction::Status { key: None })
+            .await
+            .unwrap();
         assert!(outcome.rows.iter().all(|r| r.context != "launched"));
     }
 
@@ -1370,7 +1424,11 @@ mod tests {
             .global
             .insert("memory_limit".to_string(), "1G".to_string());
 
-        let outcome = fx.engine.apply(PhpConfigAction::Status).await.unwrap();
+        let outcome = fx
+            .engine
+            .apply(PhpConfigAction::Status { key: None })
+            .await
+            .unwrap();
         assert!(outcome.files.is_empty(), "status is read-only");
         assert!(
             !fx.engine
@@ -1509,7 +1567,11 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = fx.engine.apply(PhpConfigAction::Status).await.unwrap();
+        let outcome = fx
+            .engine
+            .apply(PhpConfigAction::Status { key: None })
+            .await
+            .unwrap();
         let fpm_rows: Vec<_> = outcome
             .rows
             .iter()
@@ -1565,7 +1627,11 @@ mod tests {
             "ambient external FPM must NEVER be a write target in Stage B"
         );
 
-        let status = fx.engine.apply(PhpConfigAction::Status).await.unwrap();
+        let status = fx
+            .engine
+            .apply(PhpConfigAction::Status { key: None })
+            .await
+            .unwrap();
         let fpm_row = status
             .rows
             .iter()
@@ -1893,13 +1959,13 @@ echo "Scan for additional .ini files in: {}"
     }
 
     #[tokio::test]
-    async fn ambient_external_fpm_is_never_effective_probed_and_never_writable() {
+    async fn ambient_external_fpm_is_structurally_never_executed_and_never_writable() {
         let fx = fixture(false);
         let herd = fx.engine.provider_roots.herd.clone();
         let user_channel = herd.join("config/php/84");
         std::fs::create_dir_all(&user_channel).unwrap();
         let log = herd.join("invocations.log");
-        // FPM-only ambient provider; every non-warmup exec is logged.
+        // FPM-only ambient provider; every non-warmup exec is logged FIRST.
         write_executable(
             &herd.join("bin/php84-fpm"),
             &format!(
@@ -1912,34 +1978,17 @@ echo "Scan for additional .ini files in: {}"
                 user_channel.display()
             ),
         );
-
-        let first = fx
-            .engine
-            .apply(PhpConfigAction::Show {
-                key: Some("memory_limit".to_string()),
-            })
-            .await
-            .unwrap();
-        let external = first
-            .rows
-            .iter()
-            .find(|r| r.provider == "herd" && r.sapi == "fpm")
-            .expect("external FPM row");
-        assert_eq!(external.context, "external");
-        assert_eq!(external.observed, None);
-        assert_eq!(external.observed_state, "n/a");
-        assert!(external.channel.is_none());
-
-        // Classification probes are cached on (binary, mtime): a second
-        // Show-with-key adds ZERO invocations — proof the effective-value
-        // pass never executes an ambient FPM binary.
         let count = |path: &Path| {
             std::fs::read_to_string(path)
                 .map(|s| s.lines().count())
                 .unwrap_or(0)
         };
-        let after_first = count(&log);
-        let second = fx
+        assert_eq!(count(&log), 0, "warmup must not log");
+
+        // C1-2 (review 5650): the FIRST Status/Show call — classification
+        // included — must execute the ambient FPM binary ZERO times. This is
+        // the structural no-exec proof, not a cached-second-call proof.
+        let first = fx
             .engine
             .apply(PhpConfigAction::Show {
                 key: Some("memory_limit".to_string()),
@@ -1948,25 +1997,126 @@ echo "Scan for additional .ini files in: {}"
             .unwrap();
         assert_eq!(
             count(&log),
-            after_first,
-            "ambient external FPM must never be launch-probed"
+            0,
+            "ambient external FPM must be structurally unexecuted on the FIRST call"
         );
-        let external = second
+        let external = first
             .rows
             .iter()
             .find(|r| r.provider == "herd" && r.sapi == "fpm")
-            .unwrap();
+            .expect("external FPM row");
+        assert_eq!(external.context, "external");
+        assert_eq!(external.coverage, EXTERNAL_FPM_COVERAGE);
+        assert_eq!(external.observed, None);
         assert_eq!(external.observed_state, "n/a");
+        assert!(external.channel.is_none());
 
-        // And it can never acquire a write channel: a global Set must not
-        // materialize anything in the ambient FPM's scan dir.
+        // Mutating paths execute it exactly as often: never. And it can
+        // never acquire a write channel.
         fx.engine
             .apply(set_global("memory_limit", "1G"))
             .await
             .unwrap();
+        assert_eq!(count(&log), 0, "Set must not execute ambient FPM either");
         assert!(
             !user_channel.join(CHANNEL_FILE_NAME).exists(),
             "no write authority may derive from an ambient FPM target"
+        );
+    }
+
+    // ---- C1-3 (review 5650): keyed status carries values ----
+
+    #[tokio::test]
+    async fn status_with_key_fills_configured_and_probed_values() {
+        let fx = fixture(false);
+        install_fake_homebrew_php_with_values(&fx, "8.4");
+        fx.engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+
+        let keyed = fx
+            .engine
+            .apply(PhpConfigAction::Status {
+                key: Some("memory_limit".to_string()),
+            })
+            .await
+            .unwrap();
+        let normal = keyed
+            .rows
+            .iter()
+            .find(|r| r.provider == "homebrew" && r.sapi == "cli" && r.context == "normal")
+            .expect("homebrew cli normal row");
+        assert_eq!(normal.configured.as_deref(), Some("1G"));
+        assert_eq!(normal.observed.as_deref(), Some("1G"));
+        assert_eq!(normal.observed_state, "launch-probed");
+        let sanitized = keyed
+            .rows
+            .iter()
+            .find(|r| r.provider == "homebrew" && r.sapi == "cli" && r.context == "sanitized")
+            .unwrap();
+        assert_eq!(sanitized.observed.as_deref(), Some("777M"));
+        assert_eq!(sanitized.observed_state, "launch-probed");
+
+        // A keyless Status never fakes values (C1-3 contract).
+        let keyless = fx
+            .engine
+            .apply(PhpConfigAction::Status { key: None })
+            .await
+            .unwrap();
+        for row in &keyless.rows {
+            assert_eq!(
+                row.configured, None,
+                "keyless status fakes no value: {row:?}"
+            );
+            assert_eq!(row.observed, None, "keyless status fakes no value: {row:?}");
+            assert_eq!(row.observed_state, "n/a");
+        }
+    }
+
+    // ---- C1-1 (review 5650): switch under Herd ----
+
+    #[tokio::test]
+    async fn switch_under_herd_performs_zero_fpm_supervisor_mutation() {
+        use crate::service::supervisor::ManagedService;
+
+        let fx = fixture(true); // Herd owns FPM
+        write_executable(&fx.config_dir.join("php/8.3/php"), "#!/bin/sh\nexit 0\n");
+
+        // A pre-existing registration (e.g. left from a Herd-absent boot)
+        // must survive completely untouched: no stop, no replace, no
+        // remove, no start.
+        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        supervisor.lock().await.register(ManagedService::new(
+            ServiceKind::PhpFpm,
+            "/bin/echo".to_string(),
+            vec!["sentinel".to_string()],
+        ));
+
+        let msg = fx.engine.switch(&supervisor, "8.3").await.unwrap();
+        assert!(msg.contains("php-fpm untouched"), "got: {msg}");
+        assert!(msg.contains("Herd manages PHP-FPM"), "got: {msg}");
+
+        {
+            let sup = supervisor.lock().await;
+            let svc = sup
+                .service(ServiceKind::PhpFpm)
+                .expect("registration must survive a Herd-guarded switch");
+            assert_eq!(svc.command(), "/bin/echo", "no replacement");
+            assert!(svc.started_at().is_none(), "never spawned");
+        }
+
+        // Version selection itself is preserved and persisted.
+        assert_eq!(fx.config.lock().await.default_php, "8.3");
+        let reloaded = HearthConfig::load_from(&fx.config_path).unwrap();
+        assert_eq!(reloaded.default_php, "8.3");
+
+        // And an empty supervisor gains NO registration either.
+        let empty = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        fx.engine.switch(&empty, "8.3").await.unwrap();
+        assert!(
+            empty.lock().await.service(ServiceKind::PhpFpm).is_none(),
+            "switch under Herd must never register FPM"
         );
     }
 }

@@ -422,7 +422,10 @@ impl HearthMcpServer {
         description = "Report per-target PHP configuration coverage (provider/version/sapi/context) with truthful managed/UNMANAGED/LAUNCH-BLOCKED labels"
     )]
     async fn hearth_php_config_status(&self) -> Result<String, String> {
-        let outcome = self.engine.apply(PhpConfigAction::Status).await?;
+        let outcome = self
+            .engine
+            .apply(PhpConfigAction::Status { key: None })
+            .await?;
         if outcome.rows.is_empty() {
             return Ok("No PHP targets discovered.".to_string());
         }
