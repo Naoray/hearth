@@ -688,7 +688,12 @@ pub fn migrate_legacy_inis(
         return Ok(report); // nothing to migrate
     };
 
-    let mut changed = false;
+    // Stage phase: parse, guard, and import everything in memory. Nothing on
+    // disk is touched until the canonical config has been persisted — the
+    // legacy php.ini is the only automatic import source, so it must survive
+    // any persistence failure for a restart to retry.
+    let snapshot = config.php_ini.clone();
+    let mut to_rename: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let version = entry.file_name().to_string_lossy().into_owned();
         let legacy = entry.path().join("php.ini");
@@ -736,7 +741,26 @@ pub fn migrate_legacy_inis(
             }
         }
 
-        // Unique no-clobber backup path: .bak, .bak.1, .bak.2, …
+        to_rename.push(legacy);
+    }
+
+    if to_rename.is_empty() {
+        return Ok(report);
+    }
+
+    // Persist the canonical config BEFORE renaming any legacy source. On
+    // failure, revert the staged imports and leave every php.ini untouched.
+    if config.php_ini != snapshot
+        && let Err(e) = config.save_to(config_path)
+    {
+        config.php_ini = snapshot;
+        return Err(e);
+    }
+
+    // Canonical values are durable — now retire the sources with unique
+    // no-clobber backups (.bak, .bak.1, …). A rename failure here is safe:
+    // the surviving php.ini re-imports as a no-op and the rename retries.
+    for legacy in to_rename {
         let mut backup = legacy.with_file_name("php.ini.migrated.bak");
         let mut counter = 0u32;
         while backup.exists() {
@@ -745,12 +769,8 @@ pub fn migrate_legacy_inis(
         }
         std::fs::rename(&legacy, &backup)?;
         report.migrated_files.push(legacy);
-        changed = true;
     }
 
-    if changed {
-        config.save_to(config_path)?;
-    }
     Ok(report)
 }
 
@@ -1361,6 +1381,49 @@ mod tests {
             Some(&"4G".to_string()),
             "second run must be a no-op"
         );
+    }
+
+    #[test]
+    fn migration_save_failure_leaves_legacy_source_intact() {
+        let (_tmp, base) = canon_tmp();
+        let php_dir = base.join("php");
+        std::fs::create_dir_all(php_dir.join("8.4")).unwrap();
+        std::fs::write(php_dir.join("8.4/php.ini"), "[php]\nmemory_limit=1G\n").unwrap();
+
+        // Force config persistence to fail: the config path's parent is a
+        // regular file, so create_dir_all/save must error.
+        std::fs::write(base.join("blocker"), "not a directory").unwrap();
+        let bad_config_path = base.join("blocker/config.toml");
+
+        let mut config = crate::config::HearthConfig::default();
+        let result = migrate_legacy_inis(&mut config, &bad_config_path, &php_dir);
+        assert!(result.is_err(), "save failure must surface as an error");
+
+        // The only automatic import source must be untouched — no rename, no
+        // backup, so a restart can still discover and import it.
+        assert!(php_dir.join("8.4/php.ini").exists());
+        assert!(!php_dir.join("8.4/php.ini.migrated.bak").exists());
+        assert!(
+            config.php_ini.overrides.is_empty(),
+            "failed migration must not leave staged imports in the in-memory config"
+        );
+
+        // A fresh/restarted migration must succeed and import the value.
+        let mut fresh = crate::config::HearthConfig::default();
+        let config_path = base.join("config.toml");
+        let report = migrate_legacy_inis(&mut fresh, &config_path, &php_dir).unwrap();
+        assert_eq!(report.migrated_files.len(), 1);
+        assert_eq!(
+            fresh
+                .php_ini
+                .overrides
+                .get("8.4")
+                .and_then(|m| m.get("memory_limit")),
+            Some(&"1G".to_string())
+        );
+        assert!(config_path.exists());
+        assert!(!php_dir.join("8.4/php.ini").exists());
+        assert!(php_dir.join("8.4/php.ini.migrated.bak").exists());
     }
 
     // ---- unmanage ----
