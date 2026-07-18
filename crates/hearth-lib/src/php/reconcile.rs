@@ -477,10 +477,11 @@ fn write_channel_file(
 
     // 2. Re-verify the channel and write via exclusive temp + rename.
     //    Only Hearth-owned conf.d dirs may be created by Hearth.
-    if provider == PhpProvider::Hearth && !dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            return finalize_failure(manifest, manifest_path, file_path, e.to_string());
-        }
+    if provider == PhpProvider::Hearth
+        && !dir.exists()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        return finalize_failure(manifest, manifest_path, file_path, e.to_string());
     }
     let verified = match verify_user_channel(dir, allowed) {
         Ok(v) => v,
@@ -895,7 +896,7 @@ mod tests {
         let ini = simple_ini("8.4", "memory_limit", "2G");
         let target = verified_target(PhpProvider::Hearth, "8.4", PhpSapi::Cli, &dir);
 
-        reconcile(&ini, &[target.clone()], &manifest_path, &roots);
+        reconcile(&ini, std::slice::from_ref(&target), &manifest_path, &roots);
         let file = dir.join(CHANNEL_FILE_NAME);
         let before = std::fs::read(&file).unwrap();
 
@@ -953,7 +954,7 @@ mod tests {
 
         reconcile(
             &simple_ini("8.4", "memory_limit", "2G"),
-            &[target.clone()],
+            std::slice::from_ref(&target),
             &manifest_path,
             &roots,
         );
@@ -1127,7 +1128,7 @@ mod tests {
         // Track only the hearth file through a real reconcile.
         reconcile(
             &simple_ini("8.4", "memory_limit", "2G"),
-            &[hearth_target.clone()],
+            std::slice::from_ref(&hearth_target),
             &manifest_path,
             &roots,
         );

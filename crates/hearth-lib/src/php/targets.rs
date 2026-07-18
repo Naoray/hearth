@@ -800,7 +800,7 @@ echo "Scan this dir for additional .ini files => {dir}"
         let link = base.join("link-conf.d");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let err = verify_user_channel(&link, &[base.clone()]).unwrap_err();
+        let err = verify_user_channel(&link, std::slice::from_ref(&base)).unwrap_err();
         assert!(
             err.reason.to_lowercase().contains("symlink"),
             "rejection must name the symlink: {}",
@@ -817,7 +817,7 @@ echo "Scan this dir for additional .ini files => {dir}"
         let dir = allowed.join("mid/conf.d");
 
         assert!(
-            verify_user_channel(&dir, &[allowed.clone()]).is_err(),
+            verify_user_channel(&dir, std::slice::from_ref(&allowed)).is_err(),
             "canonicalization must expose the ancestor symlink escaping the allowlist"
         );
     }
@@ -831,7 +831,7 @@ echo "Scan this dir for additional .ini files => {dir}"
         perms.set_mode(0o775);
         std::fs::set_permissions(&dir, perms).unwrap();
 
-        let err = verify_user_channel(&dir, &[base.clone()]).unwrap_err();
+        let err = verify_user_channel(&dir, std::slice::from_ref(&base)).unwrap_err();
         assert!(
             err.reason.to_lowercase().contains("writable"),
             "rejection must explain the write-mask problem: {}",
