@@ -2,6 +2,40 @@
 
 All notable changes to Hearth will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Global PHP configuration** (`hearth php config`): one canonical INI store
+  in `config.toml` (`[php_ini.global]` + `[php_ini.overrides."X.Y"]`,
+  override > global) materialized into per-version `zz-hearth.ini` scan-dir
+  channel files with exact-hash manifest ownership, crash-safe journaling,
+  and guarded migration of the legacy per-version Hearth `php.ini` files.
+  New actions: `--global`, `--php <V>`, `--show`, `--status`, `--unset`,
+  `--sync`, `--unmanage`, plus the `hearth php exec` launch shim.
+- **Launch-probed observation**: `--show`/`--status` report per-target
+  observed values by executing each CLI binary under its exact launch
+  environments (`-r 'echo ini_get(...)'`) and Hearth's supervised FPM via
+  `php-fpm -i` under the exact service env. Four-state vocabulary
+  (`configured` / `materialized` / `launch-probed` / `live-observed`), a
+  truthful `pending restart` marker (manifest materialization timestamp vs
+  the supervisor's own FPM spawn time), and `[not running]` for a
+  registered-but-stopped FPM. Probe failures render `n/a` and never fail
+  the command. Live FPM-worker observation is deferred to todo #2343;
+  ambient (non-Hearth-launched) FPM remains an unverified row that Hearth
+  never writes for. No universal coverage is claimed anywhere.
+
+### Changed
+- Protocol-mismatch remediation now names only supported commands
+  (`hearth daemon stop && hearth daemon start`); there is no
+  `hearth daemon restart` command.
+
+### Removed
+- The legacy `PhpConfig { version, key, value }` socket request survives one
+  compatibility window (old CLI ↔ new daemon) and will be removed after it.
+  **Downgrade warning**: a pre-`[php_ini]` binary reads the new config but
+  its next `config.save()` silently drops the `[php_ini]` tables —
+  downgrading is write-destructive; back up `config.toml` first.
+
 ## [0.3.1] - 2026-07-18
 
 ### Changed

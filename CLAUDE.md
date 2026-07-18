@@ -29,7 +29,11 @@ hearth-daemon (always-on, owns all processes via process groups)
 | `db.rs` + `db/{health,init,postgres,redis,mysql}.rs` | DB engines (Phase 4): TCP probe, init wrapper scripts with mkdir-lock + sentinel, per-engine resolvers (Postgres/Redis/MySQL+MariaDB) |
 | `download.rs` | GitHub Release downloader (tar.gz/zip) |
 | `dump.rs` | VarDumper TCP relay with broadcast + timestamped CLI streaming |
-| `php.rs` + `php/resolver.rs` | PHP version management + binary resolution chain |
+| `php.rs` + `php/resolver.rs` | PHP version management + binary resolution chain + Belt-E `scan_dir_env` |
+| `php/targets.rs` | Provider-explicit target discovery, scan-dir/env-honor probing, channel verification/classification, launch-probed effective-value probes (`-r` CLI / `-i` FPM) |
+| `php/engine.rs` | `PhpConfigEngine`: op-locked Set/Unset/Show/Status/Sync/Unmanage, row building with truthful coverage labels, launch-probe fill, conditional FPM restart |
+| `php/reconcile.rs` | Manifest+journal channel-file reconciliation: atomic writes, exact-hash ownership, crash recovery, legacy INI migration, `applied_at_unix_ms` materialization stamps |
+| `php/ini_guard.rs` | INI key/value validation (denylist, length, injection safety) — the single choke point before persistence and probes |
 | `site.rs` | Multi-home site enumeration (reads from both Valet and Herd config dirs) |
 | `valet.rs` | Herd-aware site CLI wrapper (Valet fallback; link, unlink, park, secure, unsecure) |
 | `socket.rs` | `DaemonRequest`/`DaemonResponse` protocol types |
@@ -106,3 +110,13 @@ Key ports (all configurable):
 - `mail_smtp_port`: 1025 (Mailpit SMTP)
 - `mail_ui_port`: 8025 (Mailpit web UI)
 - `mcp_port`: 9900 (MCP Streamable HTTP)
+
+PHP INI store (canonical source for `hearth php config`):
+- `[php_ini.global]` — directives applied to every version
+- `[php_ini.overrides."X.Y"]` — sparse per-version overrides (override > global)
+- Dotted directive keys must be TOML-quoted (`"date.timezone" = "..."`); an
+  unquoted dotted key is rejected with an actionable error
+- Materialized into per-version `php/{v}/conf.d/zz-hearth.ini` channel files,
+  tracked exact-hash in `php/manifest.toml`; older binaries read this config
+  but their next `config.save()` drops `[php_ini]` (downgrade is
+  write-destructive — back up config.toml first)

@@ -599,8 +599,10 @@ async fn send_to_daemon_at(
     // Protocol window: an old daemon closes without responding to an unknown
     // request variant (EOF → empty line), or answers with a shape this CLI
     // cannot parse. Either way the remediation is the same.
-    const MISMATCH: &str =
-        "hearth CLI and daemon versions differ — run 'hearth daemon restart' and retry.";
+    // `hearth daemon restart` does not exist (DaemonCommands = start/stop/
+    // status) — the remediation must name only supported commands.
+    const MISMATCH: &str = "hearth CLI and daemon versions differ — run \
+        'hearth daemon stop && hearth daemon start' and retry.";
     if line.trim().is_empty() {
         anyhow::bail!("{MISMATCH}");
     }

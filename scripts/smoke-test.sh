@@ -342,6 +342,13 @@ elif echo "$OUTPUT" | grep -q "hearth" && echo "$OUTPUT" | grep -q "8.3" \
 else
     fail "S1: expected hearth 8.3/8.4 rows, got: $OUTPUT"
 fi
+if echo "$OUTPUT" | grep -q "Coverage: Hearth guarantees" \
+    && echo "$OUTPUT" | grep -q "outside that guarantee" \
+    && ! echo "$OUTPUT" | grep -qi "universal"; then
+    pass "S1: coverage footer states the guarantee boundary (never universal)"
+else
+    fail "S1: coverage footer missing or overclaiming: $OUTPUT"
+fi
 
 # ── S2. Set + actual materialization ─────────────────────────────
 info "S2: --global set materializes channel files..."
@@ -366,6 +373,11 @@ if echo "$OUTPUT" | grep -q "configured=1G"; then
     pass "S3: show reports configured=1G"
 else
     fail "S3: got: $OUTPUT"
+fi
+if echo "$OUTPUT" | grep -q "observed=1G (launch-probed)"; then
+    pass "S3: CLI targets report the launch-probed effective value"
+else
+    fail "S3: expected observed=1G (launch-probed), got: $OUTPUT"
 fi
 
 # ── S4. Sync idempotent ──────────────────────────────────────────
@@ -454,6 +466,35 @@ if [ "$LEFT" -eq 0 ]; then
 else
     fail "S9: leftover channel files"
 fi
+
+# ── S9b. LAUNCH-BLOCKED row is truthful + set still exits 0 ──────
+info "S9b: missing fpm config renders LAUNCH-BLOCKED; set stays exit 0..."
+mv "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf" "$SMOKE_ROOT/php-fpm.conf.bak"
+OUTPUT=$($CLI php config --status 2>&1)
+# The supervised-FPM row exists only when Hearth owns FPM. Ambient Herd on
+# the host machine (same pgrep probe the daemon uses) removes it — the
+# LAUNCH-BLOCKED row is then not applicable, and asserting it would test the
+# machine, not Hearth.
+if pgrep -q -f 'Herd\.app'; then
+    pass "S9b: Herd owns FPM on this host — LAUNCH-BLOCKED row not applicable (skipped)"
+elif echo "$OUTPUT" | grep -q "LAUNCH-BLOCKED" && echo "$OUTPUT" | grep -q "#2343"; then
+    pass "S9b: --status renders the LAUNCH-BLOCKED row citing todo #2343"
+else
+    fail "S9b: expected LAUNCH-BLOCKED row, got: $OUTPUT"
+fi
+if echo "$OUTPUT" | grep -q "Coverage: Hearth guarantees"; then
+    pass "S9b: coverage footer present with FPM config missing"
+else
+    fail "S9b: footer missing: $OUTPUT"
+fi
+if $CLI php config --global memory_limit 1G >/dev/null 2>&1; then
+    pass "S9b: --global set exits 0 with daemon up regardless of FPM launchability"
+else
+    fail "S9b: --global set failed while FPM launch-blocked"
+fi
+$CLI php config --global --unset memory_limit >/dev/null 2>&1
+$CLI php config --unmanage >/dev/null 2>&1
+mv "$SMOKE_ROOT/php-fpm.conf.bak" "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf"
 
 # ── S10. No privileged paths in any scenario output ──────────────
 info "S10: no privileged-path writes..."
