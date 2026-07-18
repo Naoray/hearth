@@ -40,19 +40,131 @@ pub type HerdProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 /// Injected external-FPM launch-context probe (production:
 /// [`detect_external_fpm`]). Called only for ambient-provider FPM targets;
 /// MUST derive evidence from the running process itself, never from the
-/// Hearth daemon's inherited environment (review 5594 B2-1).
-pub type ExternalFpmProbe = Arc<dyn Fn(&PhpTargetIdentity) -> ExternalFpmEvidence + Send + Sync>;
+/// Hearth daemon's inherited environment (review 5594 B2-1/B3-1). Whatever a
+/// probe returns, the engine independently re-validates exact identity and
+/// exact-expected-channel equality before any write authority or coverage.
+pub type ExternalFpmProbe =
+    Arc<dyn Fn(&PhpTargetIdentity, &ProviderRoots) -> ExternalFpmEvidence + Send + Sync>;
 
-/// Production external-FPM probe: read-only inspection of the actual running
-/// php-fpm master for this version. Evidence sources, in order:
-/// 1. the master's own environment (when the OS exposes it) — a
-///    `HERD_PHP_XY_INI_SCAN_DIR` entry proves the user channel;
-/// 2. otherwise the master is running but unprovable → `Unverified`;
-/// 3. no matching master → `NotRunning`.
-pub fn detect_external_fpm(id: &PhpTargetIdentity) -> ExternalFpmEvidence {
+/// Observable facts about one candidate process, gathered read-only.
+/// `title` is the mutable command line (NEVER evidence on its own);
+/// `executable` and `uid` are the authenticated facts.
+#[derive(Debug, Clone)]
+pub struct ExternalProcessFacts {
+    pub pid: u32,
+    pub uid: Option<u32>,
+    /// Canonicalized executable path (e.g. from lsof's txt descriptors).
+    pub executable: Option<PathBuf>,
+    pub title: String,
+    /// Raw `ps eww` line (argv + env, space-joined). Boundary-lossy, so it
+    /// is only ever used for FULL-VALUE matching of a known expected token.
+    pub env_blob: Option<String>,
+}
+
+/// Does `blob` contain `key=` followed by EXACTLY `value` (optionally with a
+/// trailing `/`), terminated by a space or end-of-string? Full-value match:
+/// spaces INSIDE the known expected value are fine; arbitrary boundary
+/// parsing is never attempted.
+fn blob_has_exact_env_value(blob: &str, key: &str, value: &str) -> bool {
+    let needle = format!("{key}=");
+    let mut search = 0;
+    while let Some(pos) = blob[search..].find(&needle) {
+        let start = search + pos + needle.len();
+        let rest = &blob[start..];
+        for candidate in [value.to_string(), format!("{value}/")] {
+            if let Some(after) = rest.strip_prefix(candidate.as_str())
+                && (after.is_empty() || after.starts_with(' ') || after.starts_with('\n'))
+            {
+                return true;
+            }
+        }
+        search = start;
+    }
+    false
+}
+
+/// Pure, fully testable evaluator (review 5594 B3-1): authenticates a
+/// candidate as THIS target's external FPM master before trusting anything.
+///
+/// Authentication requires ALL of: expected uid; canonicalized executable
+/// identity equal to the canonical target binary; an `php-fpm: master
+/// process` title carrying the EXACT expected fpm-config path for this
+/// provider/version. Forged titles, workers, CLIs, other versions, and
+/// substring look-alikes are NOT masters → `NotRunning`. An authenticated
+/// master only becomes `Verified` when its own environment exposes the exact
+/// expected channel value (full-value match); otherwise `Unverified` with
+/// the actual reason — never a privileged-dir claim without observation.
+pub fn evaluate_external_fpm(
+    id: &PhpTargetIdentity,
+    roots: &ProviderRoots,
+    expected_uid: u32,
+    candidates: &[ExternalProcessFacts],
+) -> ExternalFpmEvidence {
+    if id.provider != PhpProvider::Herd {
+        return ExternalFpmEvidence::Unverified {
+            reason: format!(
+                "no external launch-context authentication model for {:?} php-fpm — fail closed",
+                id.provider
+            ),
+        };
+    }
+    let expected_conf = roots
+        .herd
+        .join("config/fpm")
+        .join(format!("{}-fpm.conf", id.version));
+    let expected_conf_marker = format!("({})", expected_conf.display());
+
+    let master = candidates.iter().find(|c| {
+        c.uid == Some(expected_uid)
+            && c.executable.as_deref() == Some(id.binary.as_path())
+            && c.title.starts_with("php-fpm: master process")
+            && c.title.contains(&expected_conf_marker)
+    });
+    let Some(master) = master else {
+        // No AUTHENTICATED master. Look-alike titles without the
+        // authenticated executable/uid are forgeries, not masters.
+        return ExternalFpmEvidence::NotRunning;
+    };
+
     let xy = id.version.replace('.', "");
+    let key = format!("HERD_PHP_{xy}_INI_SCAN_DIR");
+    let expected_channel =
+        crate::php::targets::expected_channel_dir(id.provider, &id.version, roots);
+    match &master.env_blob {
+        Some(blob)
+            if blob_has_exact_env_value(blob, &key, &expected_channel.display().to_string()) =>
+        {
+            ExternalFpmEvidence::Verified(crate::php::targets::VerifiedExternalFpm {
+                id: id.clone(),
+                master_pid: master.pid,
+                executable: id.binary.clone(),
+                channel: expected_channel,
+            })
+        }
+        Some(_) => ExternalFpmEvidence::Unverified {
+            reason: format!(
+                "authenticated php-fpm master (pid {}) exposes no exact expected scan-dir \
+                 value; ps output cannot preserve arbitrary env boundaries — fail closed",
+                master.pid
+            ),
+        },
+        None => ExternalFpmEvidence::Unverified {
+            reason: format!(
+                "authenticated php-fpm master (pid {}) environment is not externally readable",
+                master.pid
+            ),
+        },
+    }
+}
+
+/// Production external-FPM probe: read-only, authenticated inspection of the
+/// actual running php-fpm master for this exact target via
+/// [`evaluate_external_fpm`]. Candidate facts come from `ps` (pid/uid/title),
+/// `lsof -d txt` (authenticated executable identity), and `ps eww`
+/// (boundary-lossy env blob used only for full-value matching).
+pub fn detect_external_fpm(id: &PhpTargetIdentity, roots: &ProviderRoots) -> ExternalFpmEvidence {
     let listing = std::process::Command::new("ps")
-        .args(["-axo", "pid=,command="])
+        .args(["-axo", "pid=,uid=,command="])
         .output();
     let Ok(listing) = listing else {
         return ExternalFpmEvidence::Unverified {
@@ -60,48 +172,57 @@ pub fn detect_external_fpm(id: &PhpTargetIdentity) -> ExternalFpmEvidence {
         };
     };
     let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
-    let master_pid = listing.lines().find_map(|line| {
-        let line = line.trim_start();
-        let (pid, command) = line.split_once(' ')?;
-        let command = command.trim_start();
-        if !command.starts_with("php-fpm: master process") {
-            return None;
-        }
-        // Match this version's master via its fpm config path (Herd layout
-        // embeds `X.Y-fpm.conf`).
-        if command.contains(&format!("{}-fpm.conf", id.version))
-            || command.contains(&format!("php{xy}"))
-        {
-            pid.parse::<u32>().ok()
-        } else {
-            None
-        }
-    });
-    let Some(pid) = master_pid else {
-        return ExternalFpmEvidence::NotRunning;
-    };
 
-    let env_out = std::process::Command::new("ps")
-        .args(["eww", "-o", "command=", "-p", &pid.to_string()])
-        .output();
-    let env_text = env_out
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    let wanted = format!("HERD_PHP_{xy}_INI_SCAN_DIR=");
-    if let Some(token) = env_text.split_whitespace().find(|t| t.starts_with(&wanted)) {
-        let dir = PathBuf::from(token.trim_start_matches(&wanted));
-        if !dir.as_os_str().is_empty() {
-            return ExternalFpmEvidence::Verified { dir };
+    let mut candidates = Vec::new();
+    for line in listing.lines() {
+        let line = line.trim_start();
+        let Some((pid, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some((uid, title)) = rest.split_once(' ') else {
+            continue;
+        };
+        let title = title.trim_start();
+        if !title.starts_with("php-fpm: master process") {
+            continue;
         }
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        let uid = uid.parse::<u32>().ok();
+
+        // Authenticated executable identity: the kernel-reported text
+        // mappings, not the mutable title.
+        let executable = std::process::Command::new("lsof")
+            .args(["-a", "-p", &pid.to_string(), "-d", "txt", "-Fn"])
+            .output()
+            .ok()
+            .and_then(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .find(|l| l.starts_with('n'))
+                    .map(|l| PathBuf::from(&l[1..]))
+            })
+            .and_then(|p| p.canonicalize().ok());
+
+        let env_blob = std::process::Command::new("ps")
+            .args(["eww", "-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .filter(|blob| !blob.trim().is_empty());
+
+        candidates.push(ExternalProcessFacts {
+            pid,
+            uid,
+            executable,
+            title: title.to_string(),
+            env_blob,
+        });
     }
-    // macOS exposes other-session process environments to `ps eww` only for
-    // terminal-launched processes; a bare command line means unprovable.
-    ExternalFpmEvidence::Unverified {
-        reason: format!(
-            "running php-fpm master (pid {pid}) environment is not externally \
-             readable and its config carries no scan-dir proof"
-        ),
-    }
+
+    evaluate_external_fpm(id, roots, nix::unistd::geteuid().as_raw(), &candidates)
 }
 
 /// Channel-file materialization state for one expected file, used to join
@@ -449,17 +570,15 @@ impl PhpConfigEngine {
             // including write authority — comes exclusively from the
             // independently observed launch context.
             let external = if id.provider != PhpProvider::Hearth && id.sapi == PhpSapi::Fpm {
-                Some((self.external_fpm)(&id))
+                Some((self.external_fpm)(&id, &self.provider_roots))
             } else {
                 None
             };
             let write_channel = match &external {
-                Some(ExternalFpmEvidence::Verified { dir }) => {
-                    verify_user_channel(dir, &self.provider_roots.allowed_prefixes())
-                        .ok()
-                        .map(|verified| verified.path)
-                }
-                Some(_) => None,
+                // B3-1: evidence is re-validated for EXACT identity and
+                // exact-expected-channel equality right before granting
+                // write authority; anything non-exact grants nothing.
+                Some(evidence) => self.exact_external_channel(&id, evidence),
                 None => match (&normal_channel, &sanitized_channel) {
                     (ChannelClass::Verified { dir }, _) => Some(dir.clone()),
                     (_, ChannelClass::Verified { dir }) => Some(dir.clone()),
@@ -495,6 +614,39 @@ impl PhpConfigEngine {
             .expect("probe cache poisoned")
             .insert(cache_key, info.clone());
         info
+    }
+
+    /// B3-1 exactness gate, applied immediately before BOTH write authority
+    /// and managed-coverage rendering: `Verified` evidence must carry this
+    /// target's exact identity (provider, version, SAPI, canonical binary),
+    /// an executable equal to that binary, and a channel canonically EQUAL to
+    /// the provider/version's exact expected channel — generic allowlist
+    /// membership is necessary but never sufficient. Anything else yields
+    /// `None` (fail closed, zero mutation).
+    fn exact_external_channel(
+        &self,
+        id: &PhpTargetIdentity,
+        evidence: &ExternalFpmEvidence,
+    ) -> Option<PathBuf> {
+        let ExternalFpmEvidence::Verified(verified) = evidence else {
+            return None;
+        };
+        if verified.id != *id || verified.executable != id.binary {
+            return None;
+        }
+        let expected = crate::php::targets::expected_channel_dir(
+            id.provider,
+            &id.version,
+            &self.provider_roots,
+        );
+        let canonical_expected = expected.canonicalize().ok()?;
+        let canonical_claimed = verified.channel.canonicalize().ok()?;
+        if canonical_claimed != canonical_expected {
+            return None;
+        }
+        verify_user_channel(&canonical_expected, &self.provider_roots.allowed_prefixes())
+            .ok()
+            .map(|v| v.path)
     }
 
     /// Expected-file materialization states from the manifest (read-only).
@@ -557,50 +709,45 @@ impl PhpConfigEngine {
             // independently observed launch context — never from the daemon
             // env probes, and never with env credit (B2-1).
             if let Some(evidence) = &target.external {
-                let (channel, coverage, applied) = match evidence {
-                    ExternalFpmEvidence::Verified { dir } => {
-                        match verify_user_channel(dir, &self.provider_roots.allowed_prefixes()) {
-                            Ok(verified) => {
-                                let file_state =
-                                    file_states.get(&verified.path.join(CHANNEL_FILE_NAME));
-                                let applied = matches!(file_state, Some(FileState::Applied));
-                                let coverage = coverage_label(
-                                    "external",
-                                    &ChannelClass::Verified {
-                                        dir: verified.path.clone(),
-                                    },
-                                    false,
-                                    file_state,
-                                    managed_expected,
-                                );
-                                (
-                                    Some(verified.path.to_string_lossy().to_string()),
-                                    coverage,
-                                    applied,
-                                )
-                            }
-                            Err(rejection) => (
-                                Some(dir.to_string_lossy().to_string()),
-                                format!(
-                                    "unmanaged: best-effort (external channel verification \
-                                     failed: {rejection})"
-                                ),
-                                false,
-                            ),
-                        }
+                // B3-1: exactness re-validated at RENDER time too — a
+                // non-exact/stale Verified object degrades to unverified and
+                // never renders managed. Unreadable/no-token context renders
+                // its ACTUAL reason: no privileged-dir claim is made unless
+                // that directory was observed.
+                let exact = self.exact_external_channel(&target.id, evidence);
+                let (channel, coverage, applied) = match (evidence, exact) {
+                    (ExternalFpmEvidence::Verified(_), Some(dir)) => {
+                        let file_state = file_states.get(&dir.join(CHANNEL_FILE_NAME));
+                        let applied = matches!(file_state, Some(FileState::Applied));
+                        let coverage = coverage_label(
+                            "external",
+                            &ChannelClass::Verified { dir: dir.clone() },
+                            false,
+                            file_state,
+                            managed_expected,
+                        );
+                        (Some(dir.to_string_lossy().to_string()), coverage, applied)
                     }
-                    ExternalFpmEvidence::NotRunning => (
+                    (ExternalFpmEvidence::Verified(claimed), None) => (
+                        Some(claimed.channel.to_string_lossy().to_string()),
+                        "unverified: external evidence rejected — not this target's exact \
+                         expected channel/identity (fail closed, nothing written)"
+                            .to_string(),
+                        false,
+                    ),
+                    (ExternalFpmEvidence::NotRunning, _) => (
                         None,
                         "unverified: external php-fpm not running (start it or use a \
                          Hearth-launched FPM to verify)"
                             .to_string(),
                         false,
                     ),
-                    ExternalFpmEvidence::Unverified { reason } => (
+                    (ExternalFpmEvidence::Unverified { reason }, _) => (
                         None,
                         format!(
-                            "UNMANAGED: privileged-dir (external launch context unproven: \
-                             {reason})"
+                            "unverified: external launch context unproven ({reason}) — use \
+                             `hearth php exec` or a Hearth-launched FPM; live observation \
+                             lands with todo #2343"
                         ),
                         false,
                     ),
@@ -957,9 +1104,11 @@ mod tests {
     fn fixture(herd: bool) -> Fixture {
         fixture_with_external(
             herd,
-            Arc::new(|_: &PhpTargetIdentity| ExternalFpmEvidence::Unverified {
-                reason: "test default".to_string(),
-            }),
+            Arc::new(
+                |_: &PhpTargetIdentity, _: &ProviderRoots| ExternalFpmEvidence::Unverified {
+                    reason: "test default".to_string(),
+                },
+            ),
         )
     }
 
@@ -1542,9 +1691,11 @@ mod tests {
         // the CLI rows may be managed.
         let fx = fixture_with_external(
             false,
-            Arc::new(|_: &PhpTargetIdentity| ExternalFpmEvidence::Unverified {
-                reason: "environment not readable".to_string(),
-            }),
+            Arc::new(
+                |_: &PhpTargetIdentity, _: &ProviderRoots| ExternalFpmEvidence::Unverified {
+                    reason: "environment not readable".to_string(),
+                },
+            ),
         );
         install_fake_herd_pair(&fx, "8.4");
         fx.engine
@@ -1563,11 +1714,16 @@ mod tests {
         assert!(
             fpm_rows[0]
                 .coverage
-                .starts_with("UNMANAGED: privileged-dir"),
-            "unproven external context must fail closed, got: {}",
+                .starts_with("unverified: external launch context unproven"),
+            "unproven external context must fail closed with its ACTUAL reason \
+             (no unsupported privileged-dir claim), got: {}",
             fpm_rows[0].coverage
         );
         assert!(fpm_rows[0].coverage.contains("environment not readable"));
+        assert!(
+            !fpm_rows[0].coverage.contains("privileged-dir"),
+            "must not claim privileged-dir without observing it"
+        );
         // CLI context evidence stays separate: normal row is managed.
         let cli_normal = outcome
             .rows
@@ -1587,8 +1743,13 @@ mod tests {
         let probe_dir = Arc::clone(&fx_probe_dir);
         let fx = fixture_with_external(
             false,
-            Arc::new(move |_: &PhpTargetIdentity| ExternalFpmEvidence::Verified {
-                dir: probe_dir.lock().unwrap().clone(),
+            Arc::new(move |id: &PhpTargetIdentity, _: &ProviderRoots| {
+                ExternalFpmEvidence::Verified(crate::php::targets::VerifiedExternalFpm {
+                    id: id.clone(),
+                    master_pid: 4242,
+                    executable: id.binary.clone(),
+                    channel: probe_dir.lock().unwrap().clone(),
+                })
             }),
         );
         let user_channel = install_fake_herd_pair(&fx, "8.4");
@@ -1617,10 +1778,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_exact_verified_external_evidence_is_rejected_zero_mutation() {
+        // B3-1A: evidence pointing at a user-owned, allowlisted dir that is
+        // NOT the target's exact expected channel must be rejected: no
+        // zz-hearth.ini, no outcome file, no managed row.
+        let decoy = std::sync::Arc::new(std::sync::Mutex::new(PathBuf::new()));
+        let decoy_probe = std::sync::Arc::clone(&decoy);
+        let fx = fixture_with_external(
+            false,
+            Arc::new(move |id: &PhpTargetIdentity, _: &ProviderRoots| {
+                // Typed evidence with the CORRECT identity but a decoy
+                // channel — the exactness gate must still reject it.
+                ExternalFpmEvidence::Verified(crate::php::targets::VerifiedExternalFpm {
+                    id: id.clone(),
+                    master_pid: 4242,
+                    executable: id.binary.clone(),
+                    channel: decoy_probe.lock().unwrap().clone(),
+                })
+            }),
+        );
+        let _user_channel = install_fake_herd_pair(&fx, "8.4");
+        // Decoy: allowlisted (under the isolated root), user-owned, existing —
+        // but NOT herd/config/php/84.
+        let decoy_dir = fx._tmp.path().canonicalize().unwrap().join("decoy-dir");
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+        *decoy.lock().unwrap() = decoy_dir.clone();
+
+        let outcome = fx
+            .engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        assert!(
+            !decoy_dir.join("zz-hearth.ini").exists(),
+            "non-exact external channel must NEVER be written"
+        );
+        assert!(
+            !outcome.files.iter().any(|f| f.path.contains("decoy-dir")),
+            "no outcome may be recorded for a non-exact channel: {:?}",
+            outcome.files
+        );
+        let status = fx.engine.apply(PhpConfigAction::Status).await.unwrap();
+        let fpm_row = status
+            .rows
+            .iter()
+            .find(|r| r.provider == "herd" && r.sapi == "fpm")
+            .expect("external fpm row");
+        assert!(
+            !fpm_row.coverage.starts_with("managed"),
+            "non-exact evidence must not render managed, got: {}",
+            fpm_row.coverage
+        );
+    }
+
+    #[tokio::test]
     async fn external_fpm_not_running_row_is_unverified() {
         let fx = fixture_with_external(
             false,
-            Arc::new(|_: &PhpTargetIdentity| ExternalFpmEvidence::NotRunning),
+            Arc::new(|_: &PhpTargetIdentity, _: &ProviderRoots| ExternalFpmEvidence::NotRunning),
         );
         install_fake_herd_pair(&fx, "8.4");
         let outcome = fx.engine.apply(PhpConfigAction::Status).await.unwrap();
@@ -1636,6 +1851,217 @@ mod tests {
             "got: {}",
             fpm_row.coverage
         );
+    }
+
+    // ---- B3-1 production-boundary authentication matrix ----
+
+    fn spaced_roots() -> (
+        tempfile::TempDir,
+        ProviderRoots,
+        PhpTargetIdentity,
+        PathBuf,
+        PathBuf,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        // Herd root contains a space — exact-value matching must survive it.
+        let herd = base.join("herd root");
+        std::fs::create_dir_all(herd.join("bin")).unwrap();
+        let roots = ProviderRoots::isolated(
+            &base,
+            base.join("hearth"),
+            herd.clone(),
+            base.join("homebrew"),
+        )
+        .unwrap();
+        let id = PhpTargetIdentity {
+            provider: PhpProvider::Herd,
+            version: "8.4".to_string(),
+            sapi: PhpSapi::Fpm,
+            binary: herd.join("bin/php84-fpm"),
+        };
+        let expected_conf = herd.join("config/fpm/8.4-fpm.conf");
+        let expected_channel = herd.join("config/php/84");
+        (tmp, roots, id, expected_conf, expected_channel)
+    }
+
+    fn facts(
+        uid: Option<u32>,
+        executable: Option<&Path>,
+        title: String,
+        env_blob: Option<String>,
+    ) -> ExternalProcessFacts {
+        ExternalProcessFacts {
+            pid: 4242,
+            uid,
+            executable: executable.map(Path::to_path_buf),
+            title,
+            env_blob,
+        }
+    }
+
+    #[test]
+    fn evaluate_external_fpm_rejects_every_unauthenticated_candidate() {
+        let (_tmp, roots, id, expected_conf, expected_channel) = spaced_roots();
+        let good_title = format!("php-fpm: master process ({})", expected_conf.display());
+        let uid = 501;
+
+        // Forged title on a non-FPM executable → NotRunning (never a master).
+        let forged = facts(
+            Some(uid),
+            Some(Path::new("/bin/sleep")),
+            good_title.clone(),
+            None,
+        );
+        assert_eq!(
+            evaluate_external_fpm(&id, &roots, uid, &[forged]),
+            ExternalFpmEvidence::NotRunning
+        );
+
+        // Correct executable, wrong UID → NotRunning.
+        let wrong_uid = facts(Some(0), Some(&id.binary), good_title.clone(), None);
+        assert_eq!(
+            evaluate_external_fpm(&id, &roots, uid, &[wrong_uid]),
+            ExternalFpmEvidence::NotRunning
+        );
+
+        // Worker, not master → NotRunning.
+        let worker = facts(
+            Some(uid),
+            Some(&id.binary),
+            "php-fpm: pool herd".to_string(),
+            None,
+        );
+        assert_eq!(
+            evaluate_external_fpm(&id, &roots, uid, &[worker]),
+            ExternalFpmEvidence::NotRunning
+        );
+
+        // Wrong executable (CLI twin) → NotRunning.
+        let cli_twin = facts(
+            Some(uid),
+            Some(&roots.herd.join("bin/php84")),
+            good_title.clone(),
+            None,
+        );
+        assert_eq!(
+            evaluate_external_fpm(&id, &roots, uid, &[cli_twin]),
+            ExternalFpmEvidence::NotRunning
+        );
+
+        // Substring collisions: right words, wrong exact config path.
+        for bad_conf in [
+            "/tmp/8.4-fpm.conf".to_string(),
+            "/tmp/php84/other.conf".to_string(),
+            format!("{}.bak", expected_conf.display()),
+        ] {
+            let title = format!("php-fpm: master process ({bad_conf})");
+            let collide = facts(Some(uid), Some(&id.binary), title, None);
+            assert_eq!(
+                evaluate_external_fpm(&id, &roots, uid, &[collide]),
+                ExternalFpmEvidence::NotRunning,
+                "substring collision must not authenticate: {bad_conf}"
+            );
+        }
+
+        // Wrong version master (8.3 conf) for the 8.4 target → NotRunning.
+        let other_conf = roots.herd.join("config/fpm/8.3-fpm.conf");
+        let other = facts(
+            Some(uid),
+            Some(&id.binary),
+            format!("php-fpm: master process ({})", other_conf.display()),
+            None,
+        );
+        assert_eq!(
+            evaluate_external_fpm(&id, &roots, uid, &[other]),
+            ExternalFpmEvidence::NotRunning
+        );
+
+        // Stopped: no candidates at all → NotRunning.
+        assert_eq!(
+            evaluate_external_fpm(&id, &roots, uid, &[]),
+            ExternalFpmEvidence::NotRunning
+        );
+        let _ = expected_channel;
+    }
+
+    #[test]
+    fn evaluate_external_fpm_authenticated_master_env_outcomes() {
+        let (_tmp, roots, id, expected_conf, expected_channel) = spaced_roots();
+        let good_title = format!("php-fpm: master process ({})", expected_conf.display());
+        let uid = 501;
+
+        // Authenticated master, unreadable environment → Unverified (actual
+        // reason; NEVER a privileged-dir claim).
+        let unreadable = facts(Some(uid), Some(&id.binary), good_title.clone(), None);
+        match evaluate_external_fpm(&id, &roots, uid, &[unreadable]) {
+            ExternalFpmEvidence::Unverified { reason } => {
+                assert!(reason.contains("not externally readable"), "got: {reason}");
+                assert!(!reason.contains("privileged"), "got: {reason}");
+            }
+            other => panic!("expected Unverified, got {other:?}"),
+        }
+
+        // Authenticated master, env token present but pointing at a
+        // wrong-but-allowed sibling dir → Unverified.
+        let wrong_dir_blob = format!(
+            "{good_title} HERD_PHP_84_INI_SCAN_DIR={} OTHER=1",
+            roots.herd.join("config/php/85").display()
+        );
+        let wrong_dir = facts(
+            Some(uid),
+            Some(&id.binary),
+            good_title.clone(),
+            Some(wrong_dir_blob),
+        );
+        assert!(matches!(
+            evaluate_external_fpm(&id, &roots, uid, &[wrong_dir]),
+            ExternalFpmEvidence::Unverified { .. }
+        ));
+
+        // Prefix-extension of the expected value must NOT match.
+        let extended_blob = format!(
+            "{good_title} HERD_PHP_84_INI_SCAN_DIR={}-evil OTHER=1",
+            expected_channel.display()
+        );
+        let extended = facts(
+            Some(uid),
+            Some(&id.binary),
+            good_title.clone(),
+            Some(extended_blob),
+        );
+        assert!(matches!(
+            evaluate_external_fpm(&id, &roots, uid, &[extended]),
+            ExternalFpmEvidence::Unverified { .. }
+        ));
+
+        // Exact expected value — WITH a space inside the path — proves the
+        // channel (trailing-slash form too).
+        for value in [
+            expected_channel.display().to_string(),
+            format!("{}/", expected_channel.display()),
+        ] {
+            let blob = format!("{good_title} HERD_PHP_84_INI_SCAN_DIR={value} NEXT=1");
+            let exact = facts(Some(uid), Some(&id.binary), good_title.clone(), Some(blob));
+            match evaluate_external_fpm(&id, &roots, uid, &[exact]) {
+                ExternalFpmEvidence::Verified(v) => {
+                    assert_eq!(v.id, id);
+                    assert_eq!(v.executable, id.binary);
+                    assert_eq!(v.channel, expected_channel);
+                }
+                other => panic!("expected Verified for exact value, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn evaluate_external_fpm_has_no_model_for_non_herd_providers() {
+        let (_tmp, roots, mut id, _conf, _chan) = spaced_roots();
+        id.provider = PhpProvider::Homebrew;
+        assert!(matches!(
+            evaluate_external_fpm(&id, &roots, 501, &[]),
+            ExternalFpmEvidence::Unverified { .. }
+        ));
     }
 
     #[tokio::test]

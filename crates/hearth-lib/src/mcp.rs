@@ -541,11 +541,14 @@ mod tests {
             )
             .unwrap(),
             Arc::new(|| false),
-            Arc::new(|_: &crate::php::targets::PhpTargetIdentity| {
-                crate::php::targets::ExternalFpmEvidence::Unverified {
-                    reason: "test".to_string(),
-                }
-            }),
+            Arc::new(
+                |_: &crate::php::targets::PhpTargetIdentity,
+                 _: &crate::php::targets::ProviderRoots| {
+                    crate::php::targets::ExternalFpmEvidence::Unverified {
+                        reason: "test".to_string(),
+                    }
+                },
+            ),
             std::time::Duration::from_millis(50),
         ));
 
@@ -613,11 +616,14 @@ mod tests {
             )
             .unwrap(),
             Arc::new(|| false),
-            Arc::new(|_: &crate::php::targets::PhpTargetIdentity| {
-                crate::php::targets::ExternalFpmEvidence::Unverified {
-                    reason: "test".to_string(),
-                }
-            }),
+            Arc::new(
+                |_: &crate::php::targets::PhpTargetIdentity,
+                 _: &crate::php::targets::ProviderRoots| {
+                    crate::php::targets::ExternalFpmEvidence::Unverified {
+                        reason: "test".to_string(),
+                    }
+                },
+            ),
             std::time::Duration::from_millis(50),
         ));
         let server = HearthMcpServer::new(

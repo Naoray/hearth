@@ -64,12 +64,40 @@ MUST_STAY_ABSENT=(
 )
 
 state_line() {
-    # sha256+mode or "absent" — never file contents.
+    # sha256 + mode + uid + gid + inode, or "absent" — never file contents.
     if [ -e "$1" ]; then
         printf '%s %s\n' "$(shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1)" \
-            "$(stat -f '%Sp' "$1" 2>/dev/null)"
+            "$(stat -f '%Sp %u %g %i' "$1" 2>/dev/null)"
     else
         echo "absent"
+    fi
+}
+
+# Read-only snapshot of the installed daemon + its service states. The
+# installed CLI is invoked with the isolation variables stripped so it talks
+# to the REAL daemon (status query only — never service control).
+INSTALLED_CLI="/opt/homebrew/bin/hearth"
+INSTALLED_DAEMON_PATTERN="/opt/homebrew/bin/hearth-daemon"
+installed_daemon_line() {
+    local pid alive services
+    pid="$(pgrep -f "$INSTALLED_DAEMON_PATTERN" | head -1 || true)"
+    if [ -z "$pid" ]; then
+        echo "daemon=absent"
+        return
+    fi
+    alive="no"
+    kill -0 "$pid" 2>/dev/null && alive="yes"
+    if [ -x "$INSTALLED_CLI" ]; then
+        services="$(env -u HEARTH_CONFIG_DIR -u HEARTH_ISOLATED_ROOT \
+            -u HEARTH_HERD_ROOT -u HEARTH_HOMEBREW_ROOT \
+            "$INSTALLED_CLI" status 2>/dev/null | tail -n +3 | awk '{print $1"="$2}' | sort | tr '\n' ' ')"
+        if [ -n "$services" ]; then
+            echo "daemon=pid:$pid alive:$alive responsive:yes services:[$services]"
+        else
+            echo "daemon=pid:$pid alive:$alive responsive:no"
+        fi
+    else
+        echo "daemon=pid:$pid alive:$alive responsive:unknown(no installed CLI)"
     fi
 }
 
@@ -79,6 +107,14 @@ for p in "${REAL_PATHS[@]}" "${MUST_STAY_ABSENT[@]}"; do
     printf '%s => %s\n' "$p" "$(state_line "$p")" >> "$REAL_STATE_BEFORE"
 done
 REAL_SOCK_BEFORE="$(stat -f '%i' "$REAL_SOCK" 2>/dev/null || echo absent)"
+installed_daemon_line >> "$REAL_STATE_BEFORE"
+
+# Documented exit codes:
+#   0   — all scenarios passed and the live-state guard passed
+#   N   — the original failing status, preserved, when the guard passed
+#   97  — GUARD FAILURE: the live-state guard detected a change (the original
+#         status is logged); this code is reserved for guard mismatches only.
+GUARD_FAILURE_EXIT=97
 
 GUARD_FAIL=0
 verify_real_state() {
@@ -89,9 +125,10 @@ verify_real_state() {
     done
     local sock_after
     sock_after="$(stat -f '%i' "$REAL_SOCK" 2>/dev/null || echo absent)"
+    installed_daemon_line >> "$after"
     if diff -q "$REAL_STATE_BEFORE" "$after" > /dev/null 2>&1 \
         && [ "$REAL_SOCK_BEFORE" = "$sock_after" ]; then
-        echo "  real-state guard: unchanged (hash+mode+inode)"
+        echo "  real-state guard: unchanged (sha256+mode+uid/gid+inode, absence paths, socket inode, installed daemon pid/responsiveness, service states)"
     else
         GUARD_FAIL=1
         echo "  real-state guard: REAL STATE CHANGED:"
@@ -103,16 +140,37 @@ verify_real_state() {
 
 on_exit() {
     local status=$?
-    info "EXIT: verifying real user state (always, before cleanup)..."
+    trap - EXIT
+    info "EXIT: verifying real user state (always, before cleanup; original status=$status)..."
     verify_real_state
     [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null && wait "$DAEMON_PID" 2>/dev/null
     rm -rf "$SMOKE_ROOT" 2>/dev/null
-    if [ "$status" -ne 0 ] || [ "$GUARD_FAIL" -ne 0 ] || [ "$FAIL" -gt 0 ]; then
-        exit 1
+    # Orphan check: nothing referencing the disposable root may survive.
+    if pgrep -f "$SMOKE_ROOT" >/dev/null 2>&1; then
+        echo "  ORPHAN fake processes detected for $SMOKE_ROOT"
+        GUARD_FAIL=1
+    else
+        echo "  cleanup: no orphan fixture processes"
     fi
+    if [ "$GUARD_FAIL" -ne 0 ]; then
+        echo "  exiting with guard-failure status $GUARD_FAILURE_EXIT (original status was $status)"
+        exit "$GUARD_FAILURE_EXIT"
+    fi
+    if [ "$status" -ne 0 ]; then
+        exit "$status"
+    fi
+    [ "$FAIL" -gt 0 ] && exit 1
     exit 0
 }
 trap on_exit EXIT
+
+# Supported deterministic fault-injection seam (review 5594 B3-3): forces an
+# early exit with the requested status immediately after trap installation,
+# proving the guard runs on every path and the status is preserved.
+if [ -n "${HEARTH_SMOKE_FORCE_EXIT:-}" ]; then
+    echo "fault-injection seam: forcing early exit ${HEARTH_SMOKE_FORCE_EXIT}"
+    exit "${HEARTH_SMOKE_FORCE_EXIT}"
+fi
 
 # ── Fake launchable PHP providers (Hearth tier: resolver + discovery) ─
 make_fake_php() {

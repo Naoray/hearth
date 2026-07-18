@@ -78,14 +78,34 @@ pub enum ChannelClass {
 /// environment is NEVER evidence for an external process: only the running
 /// master's actual observable environment/configuration may prove a channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedExternalFpm {
+    /// The EXACT target identity this evidence authenticates (provider,
+    /// version, FPM SAPI, canonical binary). The engine re-checks equality
+    /// with the target before any write authority or managed coverage.
+    pub id: PhpTargetIdentity,
+    /// Authenticated master PID (uid- and executable-verified).
+    pub master_pid: u32,
+    /// Authenticated executable identity — must equal `id.binary`.
+    pub executable: PathBuf,
+    /// The exact expected user channel observed in the master's own
+    /// environment (full-value match; never a prefix/substring parse).
+    pub channel: PathBuf,
+}
+
+/// Evidence about an EXTERNAL FPM launch context (review 5594 B3-1). The
+/// `Verified` constructor is intentionally NOT representable as a bare
+/// directory: it carries the exact target identity and authenticated process
+/// facts, and the engine still re-validates canonical equality with the
+/// provider/version's exact expected channel before acting on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalFpmEvidence {
-    /// The running master's own environment/configuration proves this
-    /// user-scoped scan channel (still subject to channel verification).
-    Verified { dir: PathBuf },
-    /// No matching external FPM master is running.
+    /// Exact-channel-bound, process-authenticated proof.
+    Verified(VerifiedExternalFpm),
+    /// No AUTHENTICATED matching external FPM master is running (forged
+    /// titles and unauthenticated look-alikes land here, not in Unverified).
     NotRunning,
-    /// A master is running but its environment/configuration is unreadable
-    /// or carries no channel proof — fail closed.
+    /// An authenticated master is running but its environment/configuration
+    /// is unreadable or carries no exact channel proof — fail closed.
     Unverified { reason: String },
 }
 
@@ -138,8 +158,35 @@ impl ProviderRoots {
     ///   `HEARTH_ISOLATED_ROOT` is an error — a discovery override can never
     ///   silently alter production behavior or enlarge write authority.
     pub fn detect() -> Result<Self, String> {
-        let herd_override = std::env::var_os("HEARTH_HERD_ROOT").filter(|v| !v.is_empty());
-        let brew_override = std::env::var_os("HEARTH_HOMEBREW_ROOT").filter(|v| !v.is_empty());
+        Self::detect_with_home(dirs::home_dir())
+    }
+
+    /// Injectable home resolution (review 5594 B3-2): HOME-unavailable
+    /// behavior is deterministic and fail-closed — there is NO fallback root.
+    pub fn detect_with_home(home: Option<PathBuf>) -> Result<Self, String> {
+        // Distinguish "absent" from "present but invalid": every PRESENT
+        // override is validated; empty/relative values are errors, never
+        // silently unset/defaulted.
+        let read_override = |name: &str| -> Result<Option<PathBuf>, String> {
+            match std::env::var_os(name) {
+                None => Ok(None),
+                Some(v) if v.is_empty() => Err(format!(
+                    "{name} is set but empty — unset it or point it at an absolute path"
+                )),
+                Some(v) => {
+                    let path = PathBuf::from(v);
+                    if !path.is_absolute() {
+                        return Err(format!(
+                            "{name} must be an absolute path, got {}",
+                            path.display()
+                        ));
+                    }
+                    Ok(Some(path))
+                }
+            }
+        };
+        let herd_override = read_override("HEARTH_HERD_ROOT")?;
+        let brew_override = read_override("HEARTH_HOMEBREW_ROOT")?;
 
         match std::env::var_os("HEARTH_ISOLATED_ROOT") {
             Some(root) => {
@@ -154,12 +201,8 @@ impl ProviderRoots {
                     ));
                 }
                 let hearth = crate::config_dir();
-                let herd = herd_override
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| root.join("herd"));
-                let homebrew = brew_override
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| root.join("homebrew"));
+                let herd = herd_override.unwrap_or_else(|| root.join("herd"));
+                let homebrew = brew_override.unwrap_or_else(|| root.join("homebrew"));
                 Self::isolated(&root, hearth, herd, homebrew)
             }
             None => {
@@ -171,20 +214,38 @@ impl ProviderRoots {
                             .to_string(),
                     );
                 }
-                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-                Ok(Self::production(home))
+                let home = home.ok_or_else(|| {
+                    "cannot resolve the user home directory — refusing to construct a \
+                     production write allowlist (fail closed)"
+                        .to_string()
+                })?;
+                Self::production_checked(home)
             }
         }
     }
 
-    fn production(home: PathBuf) -> Self {
+    fn production_checked(home: PathBuf) -> Result<Self, String> {
+        // `/` (or any non-absolute path) must never become write authority.
+        if !home.is_absolute() || home == Path::new("/") {
+            return Err(format!(
+                "resolved home directory {} is not a usable allowlist root — \
+                 refusing to construct a production write allowlist (fail closed)",
+                home.display()
+            ));
+        }
         let hearth = crate::config_dir();
-        Self {
+        if !hearth.is_absolute() || hearth == Path::new("/") {
+            return Err(format!(
+                "Hearth config dir {} is not a usable allowlist root",
+                hearth.display()
+            ));
+        }
+        Ok(Self {
             herd: home.join("Library/Application Support/Herd"),
             homebrew: PathBuf::from("/opt/homebrew"),
             allowed_write_roots: vec![hearth.clone(), home, PathBuf::from("/opt/homebrew")],
             hearth,
-        }
+        })
     }
 
     /// Explicit typed isolated-runtime constructor (tests/smoke). Every root
@@ -1355,6 +1416,42 @@ echo "Scan for additional .ini files in: {normal}"
     }
 
     #[test]
+    fn present_but_empty_provider_override_fails_closed() {
+        // B3-2: an explicitly present empty override is a configuration
+        // ERROR, never silently "unset".
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_CONFIG_DIR");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.set("HEARTH_HERD_ROOT", "");
+        let err = ProviderRoots::detect().unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+
+        // Same discipline for the homebrew override…
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.set("HEARTH_HOMEBREW_ROOT", "");
+        let err = ProviderRoots::detect().unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+
+        // …and in isolated mode: a present empty provider root never
+        // silently defaults beneath the runtime root.
+        let (_tmp, base) = canon_tmp();
+        std::fs::create_dir_all(base.join("hearth")).unwrap();
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.set("HEARTH_ISOLATED_ROOT", &base);
+        guard.set("HEARTH_CONFIG_DIR", base.join("hearth"));
+        guard.set("HEARTH_HERD_ROOT", "");
+        let err = ProviderRoots::detect().unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+        drop(guard);
+    }
+
+    #[test]
     fn production_write_authority_is_immutable_and_never_tmp() {
         let guard = crate::test_env::EnvGuard::capture([
             "HEARTH_ISOLATED_ROOT",
@@ -1385,6 +1482,39 @@ echo "Scan for additional .ini files in: {normal}"
             allowed.iter().any(|p| p == Path::new("/opt/homebrew")),
             "got: {allowed:?}"
         );
+    }
+
+    #[test]
+    fn home_unavailable_or_root_fails_closed_never_slash_allowlist() {
+        // B3-2: no fallback-to-`/` ever; HOME-unavailable is a typed error.
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.remove("HEARTH_CONFIG_DIR");
+
+        let err = ProviderRoots::detect_with_home(None).unwrap_err();
+        assert!(err.contains("home"), "got: {err}");
+        assert!(err.contains("fail closed"), "got: {err}");
+
+        let err = ProviderRoots::detect_with_home(Some(PathBuf::from("/"))).unwrap_err();
+        assert!(err.contains("not a usable"), "got: {err}");
+
+        // A valid home yields an allowlist that never contains `/`.
+        let (_tmp, base) = canon_tmp();
+        let roots = ProviderRoots::detect_with_home(Some(base.clone())).unwrap();
+        let allowed = roots.allowed_prefixes();
+        assert!(
+            allowed.iter().all(|p| p != Path::new("/")),
+            "`/` must never be write authority: {allowed:?}"
+        );
+        assert!(allowed.contains(&base));
+        drop(guard);
     }
 
     #[test]

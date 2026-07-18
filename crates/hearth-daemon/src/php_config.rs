@@ -132,11 +132,14 @@ mod tests {
             config_dir.clone(),
             roots,
             Arc::new(|| false),
-            Arc::new(|_: &hearth_lib::php::targets::PhpTargetIdentity| {
-                hearth_lib::php::targets::ExternalFpmEvidence::Unverified {
-                    reason: "test".to_string(),
-                }
-            }),
+            Arc::new(
+                |_: &hearth_lib::php::targets::PhpTargetIdentity,
+                 _: &hearth_lib::php::targets::ProviderRoots| {
+                    hearth_lib::php::targets::ExternalFpmEvidence::Unverified {
+                        reason: "test".to_string(),
+                    }
+                },
+            ),
             Duration::from_millis(50),
         ));
         let state = Arc::new(DaemonState {
