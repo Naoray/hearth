@@ -190,6 +190,35 @@ pub struct PhpConfigOutcome {
     pub fpm: FpmRestartOutcome,
 }
 
+impl PhpConfigOutcome {
+    /// Hard reconciliation failures — the central predicate every PHP
+    /// launch/restart hook consults (plan 5560 §2.3 hard guarantee).
+    ///
+    /// Channel files are only ever attempted for verified hard-guarantee
+    /// targets, so any `Refused`/`Failed` file outcome is a hard failure
+    /// (with path + reason). A registered FPM restart failure is hard too.
+    /// Unmanaged/best-effort/privileged rows, `NotRegistered`, and
+    /// `LaunchBlocked` are informational, never hard.
+    pub fn hard_failures(&self) -> Vec<String> {
+        let mut hard = Vec::new();
+        for file in &self.files {
+            match &file.result {
+                FileWriteResult::Refused { reason } => {
+                    hard.push(format!("{}: refused — {reason}", file.path));
+                }
+                FileWriteResult::Failed { error } => {
+                    hard.push(format!("{}: failed — {error}", file.path));
+                }
+                _ => {}
+            }
+        }
+        if let FpmRestartOutcome::Failed { message } = &self.fpm {
+            hard.push(format!("php-fpm restart failed: {message}"));
+        }
+        hard
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServiceStatus {
     pub name: String,

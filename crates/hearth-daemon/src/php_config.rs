@@ -19,7 +19,10 @@ pub async fn php_config(state: &Arc<DaemonState>, action: PhpConfigAction) -> Da
     match state.php_engine.apply(action).await {
         Err(message) => DaemonResponse::Error { message },
         Ok(mut outcome) => {
-            if restart {
+            // Hard gate (F4): never restart FPM on unreconciled channel
+            // state — the report carries the Refused/Failed files and the
+            // CLI renderer exits nonzero.
+            if restart && outcome.hard_failures().is_empty() {
                 outcome.fpm = restart_fpm_conditionally(&state.supervisor, &state.php_engine).await;
             }
             DaemonResponse::PhpConfigReport(outcome)
@@ -213,6 +216,55 @@ mod tests {
                 .and_then(|m| m.get("memory_limit")),
             Some(&"256M".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn v2_set_with_untracked_collision_skips_fpm_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, _config_path, state) = state_fixture();
+        let base = tmp.path().canonicalize().unwrap();
+        // Verified homebrew channel via a fake probe binary…
+        let conf_d = base.join("homebrew/etc/php/8.4/conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        let binary = base.join("homebrew/opt/php@8.4/bin/php");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\necho \"Scan for additional .ini files in: {}\"\n",
+                conf_d.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::process::Command::new(&binary).arg("--warmup").output();
+        // …with an untracked collision in it.
+        std::fs::write(conf_d.join("zz-hearth.ini"), "; not ours\n").unwrap();
+
+        let response = php_config(
+            &state,
+            PhpConfigAction::Set {
+                scope: hearth_lib::socket::PhpScope::Global,
+                key: "memory_limit".to_string(),
+                value: "1G".to_string(),
+            },
+        )
+        .await;
+        match response {
+            DaemonResponse::PhpConfigReport(outcome) => {
+                assert!(
+                    !outcome.hard_failures().is_empty(),
+                    "collision must be hard: {outcome:?}"
+                );
+                assert_eq!(
+                    outcome.fpm,
+                    FpmRestartOutcome::NotAttempted,
+                    "no FPM restart on unreconciled channel state"
+                );
+                assert_eq!(outcome.persisted, Some(true));
+            }
+            other => panic!("expected PhpConfigReport, got {other:?}"),
+        }
     }
 
     #[tokio::test]

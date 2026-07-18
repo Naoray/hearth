@@ -6,8 +6,17 @@
 //! Homebrew php@8.5 are co-installed realities, not duplicates).
 //!
 //! Probing runs the real binary (`--ini` for CLI, `-i` for FPM — php-fpm has
-//! no `--ini`) in two env contexts plus an env-honor canary, because
-//! Herd-patched binaries ignore `PHP_INI_SCAN_DIR` whenever `HOME` is set.
+//! no `--ini`) in two env contexts plus an env-honor canary. The canary is
+//! load-bearing because scan behavior is launcher-environment-dependent:
+//! machine ground truth (2026-07-18, exact binary hashes in PR #26) shows
+//! Herd-patched binaries ignore `PHP_INI_SCAN_DIR` whenever their own
+//! `HERD_PHP_XY_INI_SCAN_DIR` variable is present (Herd's shell integration
+//! exports it), and honor it — including leading-colon append, marker parsed
+//! last and winning — when that variable is absent, in which case their
+//! compiled default scan dir is the privileged `/usr/local/etc/php/conf.d`.
+//! `HOME` is NOT the trigger. Classification therefore never assumes
+//! provider folklore; it reports whatever the probes observe in the actual
+//! launch context.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -43,8 +52,10 @@ pub struct ProbeInfo {
     pub normal_scan_dir: Option<PathBuf>,
     /// `env_clear` + `PATH=/usr/bin:/bin`.
     pub sanitized_scan_dir: Option<PathBuf>,
-    /// Env-honor canary result: does the binary honor `PHP_INI_SCAN_DIR`
-    /// under a normal (HOME-bearing) environment? Herd-patched binaries do not.
+    /// Env-honor canary result: does the binary FUNCTIONALLY honor
+    /// `PHP_INI_SCAN_DIR` under the normal (daemon) environment — marker ini
+    /// actually parsed? Herd-patched binaries do not when their
+    /// `HERD_PHP_XY_INI_SCAN_DIR` launcher variable is present.
     pub env_honored: bool,
     /// Probe failures (timeout, spawn error) — classification degrades these
     /// to BestEffort instead of guessing.
@@ -89,13 +100,27 @@ pub struct ProviderRoots {
 }
 
 impl ProviderRoots {
-    /// Production roots.
+    /// Production roots. Part of the runtime-path seam: `hearth` follows
+    /// `HEARTH_CONFIG_DIR` (via [`crate::config_dir`]); `HEARTH_HERD_ROOT`
+    /// and `HEARTH_HOMEBREW_ROOT` override the ambient provider roots so an
+    /// isolated smoke/test daemon can never discover — let alone write —
+    /// real Herd/Homebrew channels. Production defaults are unchanged when
+    /// the variables are unset.
     pub fn detect() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let env_root = |name: &str, default: PathBuf| -> PathBuf {
+            match std::env::var_os(name) {
+                Some(v) if !v.is_empty() => PathBuf::from(v),
+                _ => default,
+            }
+        };
         Self {
             hearth: crate::config_dir(),
-            herd: home.join("Library/Application Support/Herd"),
-            homebrew: PathBuf::from("/opt/homebrew"),
+            herd: env_root(
+                "HEARTH_HERD_ROOT",
+                home.join("Library/Application Support/Herd"),
+            ),
+            homebrew: env_root("HEARTH_HOMEBREW_ROOT", PathBuf::from("/opt/homebrew")),
         }
     }
 
@@ -236,10 +261,11 @@ pub async fn probe_scan_dirs(binary: &Path, sapi: PhpSapi, timeout: Duration) ->
         Err(e) => info.failures.push(format!("sanitized probe: {e}")),
     }
 
-    // Env-honor canary (normal env): Herd-patched binaries ignore
-    // PHP_INI_SCAN_DIR whenever HOME is set; env credit requires FUNCTIONAL
-    // proof — the marker ini must appear in `Additional .ini files parsed`,
-    // never just an echoed scan-dir path.
+    // Env-honor canary (normal env): scan behavior is launcher-env-dependent
+    // (Herd-patched binaries ignore PHP_INI_SCAN_DIR when their
+    // HERD_PHP_XY_INI_SCAN_DIR variable is present); env credit requires
+    // FUNCTIONAL proof — the marker ini must appear in `Additional .ini
+    // files parsed`, never just an echoed scan-dir path.
     match probe_env_honor(binary, arg, timeout).await {
         Ok(true) => info.env_honored = true,
         Ok(false) => {
@@ -451,6 +477,122 @@ pub fn verify_user_channel(
     })
 }
 
+/// Create a missing Hearth-owned channel directory through the same trust
+/// rules as [`verify_user_channel`] — never called for ambient (Herd or
+/// Homebrew) channels, which must preexist.
+///
+/// Before any filesystem mutation: the target must be lexically under the
+/// Hearth root; the deepest EXISTING ancestor is walked component-by-component
+/// (each rejected if a symlink), canonicalized, re-checked against the Hearth
+/// root and the privileged denylist, and required to be a user-owned,
+/// non-group/other-writable directory. Only then are the missing components
+/// created (0755), and the final directory must still pass
+/// [`verify_user_channel`]. Every failure is returned as a typed rejection —
+/// callers surface it as a hard outcome, never a silent skip.
+pub fn ensure_hearth_channel_dir(
+    hearth_root: &Path,
+    dir: &Path,
+) -> Result<VerifiedDir, ChannelRejection> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !dir.starts_with(hearth_root) {
+        return Err(reject(format!(
+            "{} is outside the Hearth root {} — only Hearth-owned channels may be created",
+            dir.display(),
+            hearth_root.display()
+        )));
+    }
+    if dir.starts_with(PRIVILEGED_PREFIX) {
+        return Err(reject(format!(
+            "{} is under {PRIVILEGED_PREFIX} — never written by Hearth",
+            dir.display()
+        )));
+    }
+
+    // Deepest existing ancestor, with every component from the Hearth root
+    // down checked against symlinks BEFORE any mutation.
+    let mut ancestor = dir.to_path_buf();
+    while !ancestor.exists() {
+        match ancestor.parent() {
+            Some(parent) => ancestor = parent.to_path_buf(),
+            None => {
+                return Err(reject(format!(
+                    "{} has no existing ancestor",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    let mut walk = hearth_root.to_path_buf();
+    let relative = ancestor.strip_prefix(hearth_root).map_err(|_| {
+        reject(format!(
+            "existing ancestor {} escapes the Hearth root {}",
+            ancestor.display(),
+            hearth_root.display()
+        ))
+    })?;
+    for component in relative.components() {
+        walk.push(component);
+        let meta = std::fs::symlink_metadata(&walk)
+            .map_err(|e| reject(format!("{}: {e}", walk.display())))?;
+        if meta.file_type().is_symlink() {
+            return Err(reject(format!(
+                "{} is a symlink — refusing to create a channel dir beneath it",
+                walk.display()
+            )));
+        }
+    }
+
+    let canonical_ancestor = ancestor
+        .canonicalize()
+        .map_err(|e| reject(format!("cannot canonicalize {}: {e}", ancestor.display())))?;
+    let canonical_root = hearth_root.canonicalize().map_err(|e| {
+        reject(format!(
+            "cannot canonicalize {}: {e}",
+            hearth_root.display()
+        ))
+    })?;
+    if !canonical_ancestor.starts_with(&canonical_root) {
+        return Err(reject(format!(
+            "existing ancestor {} resolves outside the Hearth root {}",
+            canonical_ancestor.display(),
+            canonical_root.display()
+        )));
+    }
+    if canonical_ancestor.starts_with(PRIVILEGED_PREFIX) {
+        return Err(reject(format!(
+            "existing ancestor {} resolves into {PRIVILEGED_PREFIX}",
+            canonical_ancestor.display()
+        )));
+    }
+    let meta = std::fs::metadata(&canonical_ancestor)
+        .map_err(|e| reject(format!("{}: {e}", canonical_ancestor.display())))?;
+    if !meta.is_dir() {
+        return Err(reject(format!(
+            "{} is not a directory",
+            canonical_ancestor.display()
+        )));
+    }
+    if meta.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(reject(format!(
+            "{} is not owned by the current user — refusing to create beneath it",
+            canonical_ancestor.display()
+        )));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(reject(format!(
+            "{} is group/other-writable (mode {:o}) — refusing to create beneath it",
+            canonical_ancestor.display(),
+            meta.mode() & 0o7777
+        )));
+    }
+
+    std::fs::create_dir_all(dir)
+        .map_err(|e| reject(format!("creating {} failed: {e}", dir.display())))?;
+
+    verify_user_channel(dir, std::slice::from_ref(&canonical_root))
+}
+
 /// Expected user-channel layout for a (provider, version) pair.
 pub fn expected_channel_dir(
     provider: PhpProvider,
@@ -564,8 +706,13 @@ fi
         )
     }
 
-    /// Herd-patched fake: with HOME set it IGNORES PHP_INI_SCAN_DIR entirely;
-    /// only a cleared env honors the variable.
+    /// Launcher-env-patched fake, modeled on real Herd binaries: when its
+    /// vendor scan-dir variable is present in the environment (simulated
+    /// here via `$HOME` as an always-present ambient variable in the normal
+    /// probe context) it IGNORES `PHP_INI_SCAN_DIR` entirely; only a cleared
+    /// env honors the variable. Real trigger on the reference machine is
+    /// `HERD_PHP_XY_INI_SCAN_DIR`, not HOME — the mechanism under test
+    /// (canary must catch an env-ignoring binary) is identical.
     fn herd_fake(normal_dir: &Path, sanitized_dir: &Path) -> String {
         format!(
             r#"#!/bin/sh
@@ -1006,5 +1153,62 @@ echo "Scan for additional .ini files in: {normal}"
             !expected.exists(),
             "classification must never create an ambient (non-Hearth) channel dir"
         );
+    }
+
+    #[test]
+    fn ensure_hearth_channel_dir_creates_and_verifies() {
+        let (_tmp, base) = canon_tmp();
+        let hearth_root = base.join("hearth");
+        std::fs::create_dir_all(&hearth_root).unwrap();
+        let dir = hearth_root.join("php/8.4/conf.d");
+
+        let verified = ensure_hearth_channel_dir(&hearth_root, &dir).unwrap();
+        assert_eq!(verified.path, dir);
+        assert!(dir.is_dir());
+        // Idempotent on an existing dir.
+        assert!(ensure_hearth_channel_dir(&hearth_root, &dir).is_ok());
+    }
+
+    #[test]
+    fn ensure_hearth_channel_dir_rejects_outside_root() {
+        let (_tmp, base) = canon_tmp();
+        let hearth_root = base.join("hearth");
+        std::fs::create_dir_all(&hearth_root).unwrap();
+        let err =
+            ensure_hearth_channel_dir(&hearth_root, &base.join("elsewhere/conf.d")).unwrap_err();
+        assert!(err.reason.contains("outside the Hearth root"), "got: {err}");
+    }
+
+    #[test]
+    fn ensure_hearth_channel_dir_rejects_symlinked_ancestor() {
+        let (_tmp, base) = canon_tmp();
+        let hearth_root = base.join("hearth");
+        std::fs::create_dir_all(&hearth_root).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, hearth_root.join("php")).unwrap();
+
+        let err = ensure_hearth_channel_dir(&hearth_root, &hearth_root.join("php/8.4/conf.d"))
+            .unwrap_err();
+        assert!(err.reason.contains("symlink"), "got: {err}");
+        assert!(
+            !outside.join("8.4").exists(),
+            "zero mutation through the symlink"
+        );
+    }
+
+    #[test]
+    fn ensure_hearth_channel_dir_rejects_group_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, base) = canon_tmp();
+        let hearth_root = base.join("hearth");
+        let ancestor = hearth_root.join("php");
+        std::fs::create_dir_all(&ancestor).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err =
+            ensure_hearth_channel_dir(&hearth_root, &ancestor.join("8.4/conf.d")).unwrap_err();
+        assert!(err.reason.contains("group/other-writable"), "got: {err}");
+        assert!(!ancestor.join("8.4").exists());
     }
 }

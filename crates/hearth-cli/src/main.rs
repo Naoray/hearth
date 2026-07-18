@@ -292,7 +292,10 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Db { command } => {
-            return run_db(command).await;
+            if run_db(command).await? == ExitClass::Failure {
+                std::process::exit(1);
+            }
+            return Ok(());
         }
         Commands::Daemon { command } => {
             return run_daemon(command).await;
@@ -331,22 +334,19 @@ async fn main() -> anyhow::Result<()> {
             no_supervise,
             dry_run,
         } => {
-            return run_add(package, site, yes, no_supervise, dry_run).await;
+            if run_add(package, site, yes, no_supervise, dry_run).await? == ExitClass::Failure {
+                std::process::exit(1);
+            }
+            return Ok(());
         }
     };
 
     let response = send_to_daemon(request).await?;
-    if let DaemonResponse::PhpConfigReport(outcome) = &response {
-        // Pure renderer decides text + exit class; only main applies the exit.
-        let (out, err, exit) = render_php_config_report(outcome);
-        print!("{out}");
-        eprint!("{err}");
-        if exit == ExitClass::Failure {
-            std::process::exit(1);
-        }
-        return Ok(());
+    // print_response is a pure renderer (returns ExitClass); main owns the
+    // only process-exit application in the binary.
+    if print_response(response) == ExitClass::Failure {
+        std::process::exit(1);
     }
-    print_response(response);
 
     Ok(())
 }
@@ -481,7 +481,11 @@ fn render_php_config_report(
         }
     }
 
-    if !outcome.rows.is_empty() {
+    if outcome.rows.is_empty() {
+        if outcome.persisted.is_none() && outcome.files.is_empty() {
+            out.push_str("No PHP targets discovered.\n");
+        }
+    } else {
         let _ = writeln!(
             out,
             "{:<9} {:<7} {:<4} {:<10} {:<48} {}",
@@ -584,16 +588,20 @@ async fn send_to_daemon(request: DaemonRequest) -> anyhow::Result<DaemonResponse
     Ok(response)
 }
 
-fn print_response(response: DaemonResponse) {
+/// Render one daemon response. Pure with respect to process control: returns
+/// the exit class and NEVER exits — only CLI `main` applies process exits.
+#[must_use]
+fn print_response(response: DaemonResponse) -> ExitClass {
     match response {
         DaemonResponse::Ok { message } => {
             if let Some(msg) = message {
                 println!("{}", msg);
             }
+            ExitClass::Success
         }
         DaemonResponse::Error { message } => {
             eprintln!("Error: {}", message);
-            std::process::exit(1);
+            ExitClass::Failure
         }
         DaemonResponse::Status { services } => {
             println!("{:<15} {:<15} {}", "SERVICE", "STATE", "PID");
@@ -606,6 +614,7 @@ fn print_response(response: DaemonResponse) {
                     svc.pid.map(|p| p.to_string()).unwrap_or_default()
                 );
             }
+            ExitClass::Success
         }
         DaemonResponse::Sites { sites } => {
             println!("{:<30} {:<6} {}", "SITE", "SSL", "PATH");
@@ -618,15 +627,18 @@ fn print_response(response: DaemonResponse) {
                     site.path
                 );
             }
+            ExitClass::Success
         }
         DaemonResponse::PhpVersions { versions } => {
             for v in versions {
                 let marker = if v.active { " *" } else { "" };
                 println!("PHP {}{} — {}", v.version, marker, v.path);
             }
+            ExitClass::Success
         }
         DaemonResponse::DbStatus { engines } => {
             print_db_status_table(&engines);
+            ExitClass::Success
         }
         DaemonResponse::Conflict {
             engine,
@@ -641,17 +653,18 @@ fn print_response(response: DaemonResponse) {
                 "Error: port {port} for {engine} is already in use{hint}\n\
                  Hint: stop the colliding process (e.g. `brew services stop {engine}`) or change the port in ~/.config/hearth/config.toml."
             );
-            std::process::exit(1);
+            ExitClass::Failure
         }
         DaemonResponse::PhpConfigReport(outcome) => {
-            // main() handles php-config reports (incl. exit class) before
-            // reaching print_response; this arm keeps the match exhaustive
-            // for indirect callers and just prints without applying an exit.
-            let (out, err, _exit) = render_php_config_report(&outcome);
+            let (out, err, exit) = render_php_config_report(&outcome);
             print!("{out}");
             eprint!("{err}");
+            exit
         }
-        DaemonResponse::Pong => println!("Daemon is running"),
+        DaemonResponse::Pong => {
+            println!("Daemon is running");
+            ExitClass::Success
+        }
     }
 }
 
@@ -663,21 +676,21 @@ fn normalize_engine_arg(raw: Option<String>) -> Option<String> {
     }
 }
 
-async fn run_db(command: DbCommands) -> anyhow::Result<()> {
-    match command {
+async fn run_db(command: DbCommands) -> anyhow::Result<ExitClass> {
+    let exit = match command {
         DbCommands::Start { engine } => {
             let response = send_to_daemon(DaemonRequest::DbStart {
                 engine: normalize_engine_arg(engine),
             })
             .await?;
-            print_response(response);
+            print_response(response)
         }
         DbCommands::Stop { engine } => {
             let response = send_to_daemon(DaemonRequest::DbStop {
                 engine: normalize_engine_arg(engine),
             })
             .await?;
-            print_response(response);
+            print_response(response)
         }
         DbCommands::Restart { engine } => {
             let target = normalize_engine_arg(engine);
@@ -686,20 +699,24 @@ async fn run_db(command: DbCommands) -> anyhow::Result<()> {
             })
             .await?;
             let response = send_to_daemon(DaemonRequest::DbStart { engine: target }).await?;
-            print_response(response);
+            print_response(response)
         }
         DbCommands::Status { json } => {
             let response = send_to_daemon(DaemonRequest::DbStatus).await?;
             match response {
                 DaemonResponse::DbStatus { engines } if json => {
                     println!("{}", serde_json::to_string(&engines)?);
+                    ExitClass::Success
                 }
-                DaemonResponse::DbStatus { engines } => print_db_status_table(&engines),
+                DaemonResponse::DbStatus { engines } => {
+                    print_db_status_table(&engines);
+                    ExitClass::Success
+                }
                 other => print_response(other),
             }
         }
-    }
-    Ok(())
+    };
+    Ok(exit)
 }
 
 fn print_db_status_table(engines: &[DbEngineStatus]) {
@@ -748,12 +765,13 @@ async fn run_php_exec(
         std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
         std::time::Duration::from_secs(5),
     );
-    if let Err(e) = engine
-        .apply(hearth_lib::socket::PhpConfigAction::Sync)
-        .await
-    {
-        eprintln!("warning: php-config reconcile failed: {e}");
-    }
+    // Hard gate (F4): never exec PHP against unreconciled channel state.
+    hearth_lib::php::engine::require_reconciled(
+        engine
+            .apply(hearth_lib::socket::PhpConfigAction::Sync)
+            .await,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let binary = hearth_lib::php::resolver::resolve_php_binary(&version, &config_dir)
         .with_context(|| format!("PHP {version} binary not found"))?;
@@ -819,9 +837,11 @@ async fn run_install() -> anyhow::Result<()> {
         std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
         std::time::Duration::from_secs(5),
     );
-    if let Err(e) = engine.boot_sync().await {
-        eprintln!("  Warning: php-config reconcile failed: {e}");
-    }
+    // Hard gate (F4): a Refused/Failed channel outcome aborts install with a
+    // nonzero exit (the preserved config stays persisted; rerun after fixing
+    // the reported path).
+    hearth_lib::php::engine::require_reconciled(engine.boot_sync().await)
+        .map_err(|e| anyhow::anyhow!("php-config reconcile failed: {e}"))?;
 
     // 3. Setup DNS resolver (requires sudo)
     println!("\n[3/3] Setting up DNS resolver (requires sudo)...");
@@ -1045,7 +1065,7 @@ async fn run_add(
     yes: bool,
     no_supervise: bool,
     dry_run: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ExitClass> {
     use std::io::IsTerminal;
 
     if !yes && !std::io::stdin().is_terminal() {
@@ -1088,8 +1108,7 @@ async fn run_add(
     };
 
     let response = send_to_daemon(request).await?;
-    print_response(response);
-    Ok(())
+    Ok(print_response(response))
 }
 
 /// Collect Telescope-specific answers. With `--yes`, takes defaults:
@@ -1715,5 +1734,52 @@ mod tests {
             };
             assert_eq!(render_php_config_report(&ok).2, ExitClass::Success);
         }
+    }
+
+    #[test]
+    fn print_response_error_branch_returns_failure_without_exiting() {
+        // Reaching the assertion proves no process exit happened.
+        let exit = print_response(DaemonResponse::Error {
+            message: "boom".to_string(),
+        });
+        assert_eq!(exit, ExitClass::Failure);
+    }
+
+    #[test]
+    fn print_response_conflict_branch_returns_failure_without_exiting() {
+        let exit = print_response(DaemonResponse::Conflict {
+            engine: "mysql".to_string(),
+            port: 3306,
+            owner_hint: Some("homebrew.mxcl.mysql".to_string()),
+        });
+        assert_eq!(exit, ExitClass::Failure);
+    }
+
+    #[test]
+    fn print_response_success_branches_return_success() {
+        assert_eq!(
+            print_response(DaemonResponse::Ok { message: None }),
+            ExitClass::Success
+        );
+        assert_eq!(print_response(DaemonResponse::Pong), ExitClass::Success);
+    }
+
+    #[test]
+    fn print_response_php_report_propagates_renderer_exit_class() {
+        let refused = PhpConfigOutcome {
+            persisted: Some(true),
+            rows: vec![],
+            files: vec![FileOutcome {
+                path: "/x/zz-hearth.ini".to_string(),
+                result: FileWriteResult::Refused {
+                    reason: "untracked".to_string(),
+                },
+            }],
+            fpm: FpmRestartOutcome::NotAttempted,
+        };
+        assert_eq!(
+            print_response(DaemonResponse::PhpConfigReport(refused)),
+            ExitClass::Failure
+        );
     }
 }

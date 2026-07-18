@@ -214,47 +214,11 @@ impl HearthMcpServer {
         &self,
         Parameters(params): Parameters<PhpSwitchParams>,
     ) -> Result<String, String> {
-        let version = &params.version;
-        let config_dir = crate::config_dir();
-
-        // Resolve the php-fpm binary using the same resolver as the daemon
-        let fpm_binary =
-            crate::php::resolver::resolve_phpfpm_binary(version, &config_dir).ok_or_else(|| {
-                format!("PHP {version} php-fpm binary not found")
-            })?;
-
-        // Lock ordering: config first, then supervisor
-        {
-            let mut cfg = self.config.lock().await;
-            cfg.default_php = version.clone();
-            cfg.save_to(self.engine.config_path())
-                .map_err(|e| format!("Failed to save config: {e}"))?;
-        }
-
-        // Reconcile channel files for the new active version before touching
-        // the supervisor (parity with the daemon's PhpSwitch handler).
-        if let Err(e) = self.engine.apply(PhpConfigAction::Sync).await {
-            tracing::warn!(error = %e, "post-switch php-config reconcile failed");
-        }
-
-        // Stop php-fpm, reconfigure with full args, restart
-        let mut sup = self.supervisor.lock().await;
-        let _ = sup.stop_service(ServiceKind::PhpFpm);
-        sup.reconfigure_service(
-            ServiceKind::PhpFpm,
-            fpm_binary.to_string_lossy().to_string(),
-            vec![
-                "--nodaemonize".to_string(),
-                format!(
-                    "--fpm-config={}",
-                    config_dir.join("fpm/php-fpm.conf").display()
-                ),
-            ],
-        );
-        sup.start_service(ServiceKind::PhpFpm)
-            .map_err(|e| format!("Failed to start php-fpm {version}: {e}"))?;
-
-        Ok(format!("Switched to PHP {version}"))
+        // Same shared switch path as the daemon socket handler: injected
+        // engine paths, hard-gated reconcile, FPM service rebuilt with the
+        // new version's binary/args/env (F3/F4).
+        crate::php::engine::switch_php_version(&self.supervisor, &self.engine, &params.version)
+            .await
     }
 
     /// Link a directory through the active Valet or Herd backend.
@@ -422,7 +386,10 @@ impl HearthMcpServer {
             key: params.key.clone(),
             value: params.value.clone(),
         };
-        self.engine.apply(action).await?;
+        // Hard gate (F4): a Refused/Failed channel outcome is returned as an
+        // actionable error (paths + reasons) and no FPM restart happens; the
+        // canonical config remains truthfully persisted.
+        crate::php::engine::require_reconciled(self.engine.apply(action).await)?;
         let fpm = restart_fpm_conditionally(&self.supervisor, &self.engine).await;
         let fpm_note = match &fpm {
             FpmRestartOutcome::Restarted => "php-fpm restarted".to_string(),
@@ -666,8 +633,8 @@ mod tests {
 
         let err = result.expect_err("should return an error for nonexistent PHP version");
         assert!(
-            err.contains("not found"),
-            "should mention not found, got: {err}"
+            err.contains("not installed"),
+            "should mention not installed, got: {err}"
         );
     }
 

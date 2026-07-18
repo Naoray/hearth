@@ -136,8 +136,11 @@ impl PhpManager {
 
 /// Belt-E env pair for Hearth-launched PHP processes: the leading colon means
 /// "compiled-in default scan dir first, then ours", so Hearth's `zz-hearth.ini`
-/// values win on conflict. Only credited to binaries whose env-honor canary
-/// passed — Herd-patched binaries ignore this variable whenever HOME is set.
+/// values win on conflict (parse order machine-verified: default entries
+/// first, marker last). Only credited to binaries whose env-honor canary
+/// passed — Herd-patched binaries ignore this variable whenever their own
+/// `HERD_PHP_XY_INI_SCAN_DIR` launcher variable is present in the
+/// environment (NOT a HOME effect; see targets.rs module docs).
 pub fn scan_dir_env(config_dir: &std::path::Path, version: &str) -> (String, String) {
     (
         "PHP_INI_SCAN_DIR".to_string(),

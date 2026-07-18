@@ -99,15 +99,23 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(|| hearth_lib::service::manager::is_herd_running()),
         std::time::Duration::from_secs(5),
     ));
-    if let Err(e) = php_engine.boot_sync().await {
-        warn!(error = %e, "php-config boot reconcile failed — continuing without it");
-    }
+    // Boot hard gate (F4): a failed OR hard-refused reconcile disables every
+    // PHP launch (FPM + workers) while the daemon keeps serving truthful
+    // status and non-PHP services.
+    let php_launches_enabled =
+        match hearth_lib::php::engine::require_reconciled(php_engine.boot_sync().await) {
+            Ok(_) => true,
+            Err(e) => {
+                error!(error = %e, "php-config boot reconcile failed — PHP launches disabled");
+                false
+            }
+        };
 
     // Build supervisor with default services.
     let mut supervisor = ServiceSupervisor::new();
     {
         let cfg = config.lock().await;
-        for svc in default_services(&cfg, &config_dir) {
+        for svc in default_services(&cfg, &config_dir, php_launches_enabled) {
             supervisor.register(svc);
         }
     }
@@ -673,16 +681,20 @@ async fn process_request(
             // Build the per-request log file path so the CLI can `tail -f` it.
             let log_path = hearth_lib::log_dir().join(format!("add-{package}.log"));
 
-            // Cheap pre-launch reconcile so the site's version has current
-            // channel files before composer/artisan run (probe cache makes a
-            // repeat call a no-op).
+            // Pre-launch reconcile, HARD-GATED (F4): composer/artisan must
+            // never run against unreconciled channel state. Probe cache makes
+            // a repeat call cheap.
             if !dry_run
-                && let Err(e) = state
-                    .php_engine
-                    .apply(hearth_lib::socket::PhpConfigAction::Sync)
-                    .await
+                && let Err(e) = hearth_lib::php::engine::require_reconciled(
+                    state
+                        .php_engine
+                        .apply(hearth_lib::socket::PhpConfigAction::Sync)
+                        .await,
+                )
             {
-                warn!(error = %e, "pre-add php-config reconcile failed — continuing");
+                return DaemonResponse::Error {
+                    message: format!("hearth add {package}: {e}"),
+                };
             }
 
             let recipe_ctx = hearth_lib::add::recipe::RecipeContext {
@@ -793,65 +805,19 @@ async fn process_request(
         }
 
         DaemonRequest::PhpSwitch { version } => {
-            let config_dir = hearth_lib::config_dir();
-
-            // Resolve the new PHP-FPM binary (no lock needed)
-            let fpm_binary = match hearth_lib::php::resolver::resolve_phpfpm_binary(&version, &config_dir) {
-                Some(path) => path,
-                None => {
-                    return DaemonResponse::Error {
-                        message: format!("PHP {version} php-fpm binary not found"),
-                    };
-                }
-            };
-
-            // Lock ordering: config first, then supervisor
+            // Shared switch path (engine-injected paths, hard-gated reconcile,
+            // FPM service rebuilt with the new version's env — F3/F4).
+            match hearth_lib::php::engine::switch_php_version(
+                &state.supervisor,
+                &state.php_engine,
+                &version,
+            )
+            .await
             {
-                let mut cfg = state.config.lock().await;
-                cfg.default_php = version.clone();
-                if let Err(e) = cfg.save_to(&state.config_path) {
-                    return DaemonResponse::Error {
-                        message: format!("failed to save config: {e}"),
-                    };
-                }
-            }
-            // Reconcile channel files for the newly active version BEFORE any
-            // supervisor acquisition (lock order: config → … → supervisor).
-            if let Err(e) = state
-                .php_engine
-                .apply(hearth_lib::socket::PhpConfigAction::Sync)
-                .await
-            {
-                warn!(error = %e, "post-switch php-config reconcile failed");
-            }
-
-            let mut sup = state.supervisor.lock().await;
-
-            // Stop current PHP-FPM
-            let _ = sup.stop_service(hearth_lib::service::ServiceKind::PhpFpm);
-
-            // Reconfigure with new binary
-            sup.reconfigure_service(
-                hearth_lib::service::ServiceKind::PhpFpm,
-                fpm_binary.to_string_lossy().to_string(),
-                vec![
-                    "--nodaemonize".to_string(),
-                    format!(
-                        "--fpm-config={}",
-                        config_dir.join("fpm/php-fpm.conf").display()
-                    ),
-                ],
-            );
-
-            // Start new PHP-FPM
-            if let Err(e) = sup.start_service(hearth_lib::service::ServiceKind::PhpFpm) {
-                return DaemonResponse::Error {
-                    message: format!("failed to start php-fpm {version}: {e}"),
-                };
-            }
-
-            DaemonResponse::Ok {
-                message: Some(format!("Switched to PHP {version}")),
+                Ok(message) => DaemonResponse::Ok {
+                    message: Some(message),
+                },
+                Err(message) => DaemonResponse::Error { message },
             }
         }
     }

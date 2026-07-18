@@ -83,6 +83,10 @@ impl PhpConfigEngine {
         &self.config_path
     }
 
+    pub fn config_dir(&self) -> &Path {
+        &self.config_dir
+    }
+
     pub fn manifest_path(&self) -> PathBuf {
         self.config_dir.join("php").join("manifest.toml")
     }
@@ -182,15 +186,23 @@ impl PhpConfigEngine {
         };
         // Config lock dropped — probes and reconcile run without it.
 
-        let targets = self.build_targets(&snapshot).await;
+        let (targets, creation_failures) = self.build_targets(&snapshot, true).await;
         let report = reconcile::reconcile(
             &snapshot,
             &targets,
             &self.manifest_path(),
             &self.provider_roots,
         );
-        let file_states = file_states_from_report(&report);
-        let files = report
+        let mut file_states = file_states_from_report(&report);
+        for failure in &creation_failures {
+            if let FileWriteResult::Failed { error } = &failure.result {
+                file_states.insert(
+                    PathBuf::from(&failure.path),
+                    FileState::Blocked(error.clone()),
+                );
+            }
+        }
+        let mut files: Vec<FileOutcome> = report
             .files
             .iter()
             .map(|action| FileOutcome {
@@ -198,6 +210,7 @@ impl PhpConfigEngine {
                 result: wire_result(&action.outcome),
             })
             .collect();
+        files.extend(creation_failures);
         let rows = self.build_rows(&snapshot, &default_php, &targets, Some(key), &file_states);
 
         Ok(PhpConfigOutcome {
@@ -215,7 +228,7 @@ impl PhpConfigEngine {
             let cfg = self.config.lock().await;
             (cfg.php_ini.clone(), cfg.default_php.clone())
         };
-        let targets = self.build_targets(&snapshot).await;
+        let (targets, _) = self.build_targets(&snapshot, false).await;
         let file_states = self.file_states_from_manifest(&snapshot, &targets);
         let rows = self.build_rows(&snapshot, &default_php, &targets, key, &file_states);
         Ok(PhpConfigOutcome {
@@ -239,15 +252,23 @@ impl PhpConfigEngine {
             (cfg.php_ini.clone(), cfg.default_php.clone())
         };
 
-        let targets = self.build_targets(&snapshot).await;
+        let (targets, creation_failures) = self.build_targets(&snapshot, true).await;
         let report = reconcile::reconcile(
             &snapshot,
             &targets,
             &self.manifest_path(),
             &self.provider_roots,
         );
-        let file_states = file_states_from_report(&report);
-        let files = report
+        let mut file_states = file_states_from_report(&report);
+        for failure in &creation_failures {
+            if let FileWriteResult::Failed { error } = &failure.result {
+                file_states.insert(
+                    PathBuf::from(&failure.path),
+                    FileState::Blocked(error.clone()),
+                );
+            }
+        }
+        let mut files: Vec<FileOutcome> = report
             .files
             .iter()
             .map(|action| FileOutcome {
@@ -255,6 +276,7 @@ impl PhpConfigEngine {
                 result: wire_result(&action.outcome),
             })
             .collect();
+        files.extend(creation_failures);
         let rows = self.build_rows(&snapshot, &default_php, &targets, None, &file_states);
 
         Ok(PhpConfigOutcome {
@@ -284,22 +306,49 @@ impl PhpConfigEngine {
         })
     }
 
-    /// Discover + probe + classify every provider target. Hearth-owned conf.d
-    /// dirs for configured versions are ensured first (ambient channels must
-    /// preexist and are never created — Hearth's own are the one exception).
-    async fn build_targets(&self, php_ini: &PhpIniSettings) -> Vec<PhpTarget> {
+    /// Discover + probe + classify every provider target — READ-ONLY unless
+    /// `create_missing` is set (mutating hooks only). Ambient (Herd/Homebrew)
+    /// channels must preexist and are never created; a missing Hearth-owned
+    /// conf.d for a configured version is created exclusively through the
+    /// verified [`crate::php::targets::ensure_hearth_channel_dir`] mechanism,
+    /// and a refused or failed creation is returned as a typed `Failed` file
+    /// outcome so the central hard-failure gate fires (the Hearth channel is
+    /// promised hard-guarantee coverage).
+    async fn build_targets(
+        &self,
+        php_ini: &PhpIniSettings,
+        create_missing: bool,
+    ) -> (Vec<PhpTarget>, Vec<FileOutcome>) {
         let ids = discover_provider_targets(&self.provider_roots);
 
-        for id in &ids {
-            if id.provider == PhpProvider::Hearth && !php_ini.effective_for(&id.version).is_empty()
-            {
-                let conf_d = self
-                    .provider_roots
-                    .hearth
-                    .join("php")
-                    .join(&id.version)
-                    .join("conf.d");
-                let _ = std::fs::create_dir_all(conf_d);
+        let mut creation_failures: Vec<FileOutcome> = Vec::new();
+        if create_missing {
+            let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+            for id in &ids {
+                if id.provider == PhpProvider::Hearth
+                    && !php_ini.effective_for(&id.version).is_empty()
+                {
+                    let conf_d = self
+                        .provider_roots
+                        .hearth
+                        .join("php")
+                        .join(&id.version)
+                        .join("conf.d");
+                    if !seen.insert(conf_d.clone()) || conf_d.is_dir() {
+                        continue;
+                    }
+                    if let Err(rejection) = crate::php::targets::ensure_hearth_channel_dir(
+                        &self.provider_roots.hearth,
+                        &conf_d,
+                    ) {
+                        creation_failures.push(FileOutcome {
+                            path: conf_d.to_string_lossy().to_string(),
+                            result: FileWriteResult::Failed {
+                                error: format!("channel dir creation refused: {rejection}"),
+                            },
+                        });
+                    }
+                }
             }
         }
 
@@ -333,7 +382,7 @@ impl PhpConfigEngine {
                 write_channel,
             });
         }
-        targets
+        (targets, creation_failures)
     }
 
     async fn probe_cached(&self, binary: &Path, sapi: PhpSapi) -> ProbeInfo {
@@ -510,6 +559,90 @@ pub async fn restart_fpm_conditionally(
         Err(e) => FpmRestartOutcome::Failed {
             message: format!("php-fpm start failed: {e}"),
         },
+    }
+}
+
+/// Central hard-failure gate (review 5594 F4). Converts an engine outcome
+/// into an error when reconciliation hard-failed: outer errors pass through;
+/// hard-guarantee target `Refused`/`Failed` outcomes become an `Err` carrying
+/// every path + reason. Every PHP launch/restart hook (daemon boot, add
+/// pre-launch, `php exec`, install, daemon/MCP switch and config) MUST route
+/// its sync through this and abort the launch on `Err`. The canonical config
+/// stays truthfully persisted either way — only materialization failed.
+pub fn require_reconciled(
+    result: Result<PhpConfigOutcome, String>,
+) -> Result<PhpConfigOutcome, String> {
+    let outcome = result?;
+    let hard = outcome.hard_failures();
+    if hard.is_empty() {
+        Ok(outcome)
+    } else {
+        Err(format!(
+            "php-config reconciliation hard failure — PHP launch/restart aborted \
+             (canonical config remains persisted): {}",
+            hard.join("; ")
+        ))
+    }
+}
+
+/// Shared PHP version switch used by BOTH the daemon socket handler and the
+/// MCP tool (review 5594 F3): persists `default_php` via the injected engine
+/// paths, hard-gates the reconcile, then REBUILDS the FPM service from
+/// scratch for the new version — binary, args, and scan-dir env — via
+/// `manager::hearth_fpm_service`. A launch-blocked or unresolvable FPM
+/// deregisters the old service truthfully instead of leaving a stale one.
+pub async fn switch_php_version(
+    supervisor: &Arc<Mutex<ServiceSupervisor>>,
+    engine: &PhpConfigEngine,
+    version: &str,
+) -> Result<String, String> {
+    validate_version(version)?;
+    let config_dir = engine.config_dir().to_path_buf();
+    if crate::php::resolver::resolve_php_binary(version, &config_dir).is_none()
+        && crate::php::resolver::resolve_phpfpm_binary(version, &config_dir).is_none()
+    {
+        return Err(format!(
+            "PHP {version} is not installed (no CLI or FPM binary found)"
+        ));
+    }
+
+    {
+        let mut cfg = engine.config.lock().await;
+        cfg.default_php = version.to_string();
+        cfg.save_to(engine.config_path())
+            .map_err(|e| format!("failed to save config: {e}"))?;
+    }
+    // Reconcile channel files for the new active version BEFORE any
+    // supervisor acquisition (lock order), hard-gated: a Refused/Failed
+    // channel aborts the FPM restart.
+    require_reconciled(engine.apply(crate::socket::PhpConfigAction::Sync).await)
+        .map_err(|e| format!("switched default_php to {version} (persisted), but: {e}"))?;
+
+    let mut sup = supervisor.lock().await;
+    let _ = sup.stop_service(ServiceKind::PhpFpm);
+    match crate::service::manager::hearth_fpm_service(version, &config_dir) {
+        Ok(svc) => {
+            sup.register(svc);
+            sup.start_service(ServiceKind::PhpFpm)
+                .map_err(|e| format!("switched to PHP {version}, but php-fpm start failed: {e}"))?;
+            Ok(format!("Switched to PHP {version}; php-fpm restarted"))
+        }
+        Err(reason) => {
+            let removed = sup.remove_service(ServiceKind::PhpFpm);
+            let herd_note = if engine.herd_running() {
+                " (Herd manages PHP-FPM)"
+            } else {
+                ""
+            };
+            let stale_note = if removed {
+                "; previous php-fpm registration removed"
+            } else {
+                ""
+            };
+            Ok(format!(
+                "Switched to PHP {version}; php-fpm not registered: {reason}{herd_note}{stale_note}"
+            ))
+        }
     }
 }
 
@@ -882,5 +1015,334 @@ mod tests {
         let outcome = fx.engine.apply(PhpConfigAction::Unmanage).await.unwrap();
         assert!(outcome.files.is_empty());
         assert_eq!(outcome.persisted, None);
+    }
+
+    fn write_executable(path: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // One-time unbounded warm-up: macOS syspolicyd can stall the first
+        // exec of a fresh script past the injected probe timeout.
+        let _ = std::process::Command::new(path).arg("--warmup").output();
+    }
+
+    /// Fake Homebrew PHP whose probes report the given scan dir in every
+    /// context — yields a Verified channel for that dir.
+    fn install_fake_homebrew_php(fx: &Fixture, version: &str) -> PathBuf {
+        let roots_homebrew = fx.engine.provider_roots.homebrew.clone();
+        let conf_d = roots_homebrew.join("etc/php").join(version).join("conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        let binary = roots_homebrew
+            .join("opt")
+            .join(format!("php@{version}"))
+            .join("bin/php");
+        write_executable(
+            &binary,
+            &format!(
+                "#!/bin/sh\necho \"Scan for additional .ini files in: {}\"\n",
+                conf_d.display()
+            ),
+        );
+        conf_d
+    }
+
+    #[test]
+    fn require_reconciled_gates_hard_outcomes() {
+        use crate::socket::{FileOutcome, FileWriteResult};
+        let clean = PhpConfigOutcome {
+            persisted: Some(true),
+            rows: vec![],
+            files: vec![FileOutcome {
+                path: "/x/zz-hearth.ini".to_string(),
+                result: FileWriteResult::Written,
+            }],
+            fpm: FpmRestartOutcome::LaunchBlocked {
+                reason: "missing fpm config — see todo #2343".to_string(),
+            },
+        };
+        assert!(
+            require_reconciled(Ok(clean)).is_ok(),
+            "informational cells are not hard"
+        );
+
+        let refused = PhpConfigOutcome {
+            persisted: Some(true),
+            rows: vec![],
+            files: vec![FileOutcome {
+                path: "/chan/zz-hearth.ini".to_string(),
+                result: FileWriteResult::Refused {
+                    reason: "untracked collision".to_string(),
+                },
+            }],
+            fpm: FpmRestartOutcome::NotAttempted,
+        };
+        let err = require_reconciled(Ok(refused)).unwrap_err();
+        assert!(err.contains("/chan/zz-hearth.ini"), "got: {err}");
+        assert!(err.contains("untracked collision"), "got: {err}");
+        assert!(err.contains("persisted"), "got: {err}");
+
+        let failed = PhpConfigOutcome {
+            persisted: None,
+            rows: vec![],
+            files: vec![FileOutcome {
+                path: "/chan/conf.d".to_string(),
+                result: FileWriteResult::Failed {
+                    error: "io".to_string(),
+                },
+            }],
+            fpm: FpmRestartOutcome::NotAttempted,
+        };
+        assert!(require_reconciled(Ok(failed)).is_err());
+
+        assert_eq!(
+            require_reconciled(Err("outer".to_string())).unwrap_err(),
+            "outer"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_with_untracked_collision_is_hard_refused_and_gated() {
+        let fx = fixture(false);
+        let conf_d = install_fake_homebrew_php(&fx, "8.4");
+        // Untracked collision: a foreign zz-hearth.ini with no manifest entry.
+        let collision = conf_d.join("zz-hearth.ini");
+        std::fs::write(&collision, "; not ours\n").unwrap();
+
+        let outcome = fx
+            .engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.persisted,
+            Some(true),
+            "config stays truthfully persisted"
+        );
+        let hard = outcome.hard_failures();
+        assert!(
+            !hard.is_empty(),
+            "collision must be a hard failure: {outcome:?}"
+        );
+        assert!(hard[0].contains("zz-hearth.ini"), "got: {hard:?}");
+        // The foreign file was never touched.
+        assert_eq!(std::fs::read_to_string(&collision).unwrap(), "; not ours\n");
+        // And the central gate converts it into an abort.
+        assert!(require_reconciled(Ok(outcome)).is_err());
+    }
+
+    #[tokio::test]
+    async fn hearth_symlink_ancestor_escape_is_hard_failure_zero_mutation() {
+        let fx = fixture(false);
+        // hearth `php` component is a symlink escaping the root.
+        let outside = fx
+            ._tmp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("outside-target");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, fx.engine.provider_roots.hearth.join("php")).unwrap();
+        // A discoverable hearth binary through the symlink.
+        write_executable(
+            &fx.engine.provider_roots.hearth.join("php/8.4/php"),
+            "#!/bin/sh\nexit 0\n",
+        );
+
+        let outcome = fx
+            .engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        let hard = outcome.hard_failures();
+        assert!(
+            hard.iter()
+                .any(|h| h.contains("creation refused") && h.contains("symlink")),
+            "symlinked ancestor must be a typed hard failure: {hard:?}"
+        );
+        assert!(
+            !outside.join("8.4/conf.d").exists(),
+            "zero mutation outside the allowlist"
+        );
+        assert!(require_reconciled(Ok(outcome)).is_err());
+    }
+
+    #[tokio::test]
+    async fn hearth_channel_creation_failure_is_typed_and_gated() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = fixture(false);
+        let version_dir = fx.engine.provider_roots.hearth.join("php/8.4");
+        write_executable(&version_dir.join("php"), "#!/bin/sh\nexit 0\n");
+        // Read-only version dir: ancestor checks pass (owned, not group/other
+        // writable) but conf.d creation fails with EACCES.
+        std::fs::set_permissions(&version_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = fx
+            .engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        std::fs::set_permissions(&version_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hard = outcome.hard_failures();
+        assert!(
+            hard.iter().any(|h| h.contains("creation refused")),
+            "creation failure must be typed + hard: {hard:?}"
+        );
+        assert!(require_reconciled(Ok(outcome)).is_err());
+    }
+
+    #[tokio::test]
+    async fn observe_never_creates_hearth_channel_dirs() {
+        let fx = fixture(false);
+        write_executable(
+            &fx.engine.provider_roots.hearth.join("php/8.4/php"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        fx.config
+            .lock()
+            .await
+            .php_ini
+            .global
+            .insert("memory_limit".to_string(), "1G".to_string());
+
+        let outcome = fx.engine.apply(PhpConfigAction::Status).await.unwrap();
+        assert!(outcome.files.is_empty(), "status is read-only");
+        assert!(
+            !fx.engine
+                .provider_roots
+                .hearth
+                .join("php/8.4/conf.d")
+                .exists(),
+            "discovery/probing/classification must not create directories"
+        );
+    }
+
+    fn write_fake_fpm_pair(fx: &Fixture, version: &str) {
+        // Long-running fake so start_service succeeds and supervision works.
+        write_executable(
+            &fx.config_dir.join("php").join(version).join("php-fpm"),
+            "#!/bin/sh\nsleep 30\n",
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_rebuilds_fpm_service_with_new_version_env() {
+        let fx = fixture(false);
+        write_fake_fpm_pair(&fx, "8.3");
+        write_fake_fpm_pair(&fx, "8.4");
+        std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
+        std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
+        fx.config.lock().await.default_php = "8.3".to_string();
+
+        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        {
+            // Old registration carrying the OLD version's env.
+            let mut sup = supervisor.lock().await;
+            sup.register(
+                crate::service::manager::hearth_fpm_service("8.3", &fx.config_dir).unwrap(),
+            );
+            let old = sup.service(ServiceKind::PhpFpm).unwrap();
+            assert!(old.env()[0].1.contains("8.3"));
+        }
+
+        let message = switch_php_version(&supervisor, &fx.engine, "8.4")
+            .await
+            .unwrap();
+        assert!(message.contains("Switched to PHP 8.4"), "got: {message}");
+
+        let mut sup = supervisor.lock().await;
+        let svc = sup.service(ServiceKind::PhpFpm).expect("fpm registered");
+        assert!(
+            svc.command().ends_with("php/8.4/php-fpm"),
+            "new binary expected, got: {}",
+            svc.command()
+        );
+        assert_eq!(
+            svc.env(),
+            &[crate::php::scan_dir_env(&fx.config_dir, "8.4")],
+            "env must be the NEW version's scan dir, never the old one"
+        );
+        // Persisted through the injected path.
+        let reloaded = HearthConfig::load_from(&fx.config_path).unwrap();
+        assert_eq!(reloaded.default_php, "8.4");
+        let _ = sup.stop_service(ServiceKind::PhpFpm);
+    }
+
+    #[tokio::test]
+    async fn switch_to_launch_blocked_version_removes_stale_fpm() {
+        let fx = fixture(false);
+        write_fake_fpm_pair(&fx, "8.3");
+        write_fake_fpm_pair(&fx, "8.4");
+        std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
+        std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
+
+        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        supervisor
+            .lock()
+            .await
+            .register(crate::service::manager::hearth_fpm_service("8.3", &fx.config_dir).unwrap());
+
+        // Launch-block the target: fpm config gone.
+        std::fs::remove_file(fx.config_dir.join("fpm/php-fpm.conf")).unwrap();
+        let message = switch_php_version(&supervisor, &fx.engine, "8.4")
+            .await
+            .unwrap();
+        assert!(message.contains("php-fpm not registered"), "got: {message}");
+        assert!(message.contains("#2343"), "got: {message}");
+        assert!(
+            supervisor
+                .lock()
+                .await
+                .service(ServiceKind::PhpFpm)
+                .is_none(),
+            "stale registration must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_to_missing_version_errors_before_persisting() {
+        let fx = fixture(false);
+        fx.config.lock().await.default_php = "8.3".to_string();
+        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        let err = switch_php_version(&supervisor, &fx.engine, "8.2")
+            .await
+            .unwrap_err();
+        assert!(err.contains("not installed"), "got: {err}");
+        assert_eq!(
+            fx.config.lock().await.default_php,
+            "8.3",
+            "no persist on refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_aborts_fpm_restart_on_hard_reconcile_failure() {
+        let fx = fixture(false);
+        write_fake_fpm_pair(&fx, "8.4");
+        std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
+        std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
+        // Configure a value + a colliding untracked channel file.
+        fx.engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        let conf_d = install_fake_homebrew_php(&fx, "8.4");
+        std::fs::write(conf_d.join("zz-hearth.ini"), "; not ours\n").unwrap();
+
+        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        let err = switch_php_version(&supervisor, &fx.engine, "8.4")
+            .await
+            .unwrap_err();
+        assert!(err.contains("persisted"), "got: {err}");
+        assert!(err.contains("hard failure"), "got: {err}");
+        assert!(
+            supervisor
+                .lock()
+                .await
+                .service(ServiceKind::PhpFpm)
+                .is_none(),
+            "no FPM registration/restart after a hard reconcile failure"
+        );
     }
 }

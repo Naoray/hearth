@@ -56,7 +56,16 @@ pub fn vendor_path_for(package: &str) -> String {
 /// When Herd is detected, nginx/php-fpm/dnsmasq are skipped — Herd
 /// manages those. Hearth only registers its own services (Mailpit, etc.).
 /// The dump server and MCP server are Tokio tasks, not supervised processes.
-pub fn default_services(config: &HearthConfig, config_dir: &std::path::Path) -> Vec<ManagedService> {
+///
+/// `php_launches_enabled = false` (daemon boot after a HARD php-config
+/// reconciliation failure) skips every PHP process registration — FPM and
+/// Horizon/Reverb workers — so no PHP launches with unreconciled channel
+/// state; non-PHP services and status access stay available.
+pub fn default_services(
+    config: &HearthConfig,
+    config_dir: &std::path::Path,
+    php_launches_enabled: bool,
+) -> Vec<ManagedService> {
     let mut services = Vec::new();
 
     if is_herd_running() {
@@ -87,9 +96,13 @@ pub fn default_services(config: &HearthConfig, config_dir: &std::path::Path) -> 
                 ),
             ],
         ));
-        match hearth_fpm_service(config, config_dir) {
-            Ok(svc) => services.push(svc),
-            Err(reason) => warn!(reason = %reason, "php-fpm not registered"),
+        if php_launches_enabled {
+            match hearth_fpm_service(&config.default_php, config_dir) {
+                Ok(svc) => services.push(svc),
+                Err(reason) => warn!(reason = %reason, "php-fpm not registered"),
+            }
+        } else {
+            warn!("php launches disabled (hard php-config failure) — php-fpm not registered");
         }
     }
 
@@ -166,28 +179,33 @@ pub fn default_services(config: &HearthConfig, config_dir: &std::path::Path) -> 
 
     // Supervised AddedPackage entries (Horizon, Reverb). Boot-time prune already ran
     // before this is called (see daemon main.rs), so every entry here has a vendor dir.
-    let roots = crate::php::targets::ProviderRoots::detect();
-    for pkg in &config.added_packages {
-        let kind = match pkg.package.as_str() {
-            "horizon" => ServiceKind::Horizon,
-            "reverb" => ServiceKind::Reverb,
-            _ => continue, // telescope/pulse are install-only
-        };
-        services.push(worker_service(kind, pkg, config_dir, &roots));
+    if php_launches_enabled {
+        let roots = crate::php::targets::ProviderRoots::detect();
+        for pkg in &config.added_packages {
+            let kind = match pkg.package.as_str() {
+                "horizon" => ServiceKind::Horizon,
+                "reverb" => ServiceKind::Reverb,
+                _ => continue, // telescope/pulse are install-only
+            };
+            services.push(worker_service(kind, pkg, config_dir, &roots));
+        }
+    } else if !config.added_packages.is_empty() {
+        warn!("php launches disabled (hard php-config failure) — workers not registered");
     }
 
     services
 }
 
-/// Build Hearth's own supervised php-fpm service, or a truthful skip reason.
-/// Registration requires BOTH a resolvable binary and a generated fpm config;
-/// a missing config is launch-blocked (generation is todo #2343) and must
-/// never surface as a supervisor start failure.
+/// Build Hearth's own supervised php-fpm service for one PHP version, or a
+/// truthful skip reason. Registration requires BOTH a resolvable binary and a
+/// generated fpm config; a missing config is launch-blocked (generation is
+/// todo #2343) and must never surface as a supervisor start failure. Takes
+/// the version directly so version-switch paths build the NEW version's
+/// service — binary, args, AND scan-dir env — from scratch.
 pub fn hearth_fpm_service(
-    config: &HearthConfig,
+    version: &str,
     config_dir: &std::path::Path,
 ) -> Result<ManagedService, String> {
-    let version = &config.default_php;
     let Some(binary) =
         crate::php::resolver::resolve_phpfpm_binary(version, &config_dir.to_path_buf())
     else {
@@ -279,7 +297,7 @@ mod tests {
         std::fs::write(&bin_path, "fake").unwrap();
 
         let config = HearthConfig::default();
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true);
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(kinds.contains(&ServiceKind::Mailpit));
@@ -289,7 +307,7 @@ mod tests {
     fn default_services_excludes_mailpit_when_binary_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = HearthConfig::default();
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true);
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(!kinds.contains(&ServiceKind::Mailpit));
@@ -317,7 +335,7 @@ mod tests {
             postgres_port: free_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true);
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(
             kinds.contains(&ServiceKind::Postgresql),
@@ -348,7 +366,7 @@ mod tests {
             mysql_port: free_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true);
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(kinds.contains(&ServiceKind::Mysql), "got: {kinds:?}");
     }
@@ -365,7 +383,7 @@ mod tests {
             mysql_port: busy_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true);
         drop(listener);
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
@@ -385,7 +403,7 @@ mod tests {
             redis_port: free_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true);
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(kinds.contains(&ServiceKind::Redis), "got: {kinds:?}");
     }
@@ -401,7 +419,7 @@ mod tests {
             redis_port: busy_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true);
         drop(listener);
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
@@ -421,7 +439,7 @@ mod tests {
             postgres_port: busy_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true);
         drop(listener);
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
@@ -497,7 +515,7 @@ mod tests {
             installed_at: chrono::Utc::now(),
         });
 
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true);
         let horizon = services
             .iter()
             .find(|s| s.kind == ServiceKind::Horizon)
@@ -520,9 +538,38 @@ mod tests {
             installed_at: chrono::Utc::now(),
         });
 
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true);
         assert!(services.iter().all(|s| s.kind != ServiceKind::Horizon));
         assert!(services.iter().all(|s| s.kind != ServiceKind::Reverb));
+    }
+
+    #[test]
+    fn php_disabled_skips_fpm_and_workers_keeps_others() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Mailpit present so a non-PHP service would register.
+        let bin_path = tmp.path().join("services/mailpit/mailpit");
+        std::fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
+        std::fs::write(&bin_path, "fake").unwrap();
+        // Launchable FPM + a worker entry that WOULD register.
+        write_fake_fpm(tmp.path(), "8.4");
+        std::fs::create_dir_all(tmp.path().join("fpm")).unwrap();
+        std::fs::write(tmp.path().join("fpm/php-fpm.conf"), "; fpm").unwrap();
+        let mut config = HearthConfig::default();
+        config.added_packages.push(AddedPackage {
+            package: "horizon".to_string(),
+            site_path: tmp.path().to_path_buf(),
+            site_name: "s".to_string(),
+            command: "/php".to_string(),
+            args: vec!["artisan".to_string(), "horizon".to_string()],
+            php_version: Some("8.4".to_string()),
+            installed_at: chrono::Utc::now(),
+        });
+
+        let services = default_services(&config, tmp.path(), false);
+        let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
+        assert!(!kinds.contains(&ServiceKind::PhpFpm), "got: {kinds:?}");
+        assert!(!kinds.contains(&ServiceKind::Horizon), "got: {kinds:?}");
+        assert!(kinds.contains(&ServiceKind::Mailpit), "got: {kinds:?}");
     }
 
     fn write_fake_fpm(config_dir: &std::path::Path, version: &str) -> std::path::PathBuf {
@@ -541,8 +588,7 @@ mod tests {
         std::fs::create_dir_all(config_dir.join("fpm")).unwrap();
         std::fs::write(config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
 
-        let config = HearthConfig::default(); // default_php = 8.4
-        let svc = hearth_fpm_service(&config, config_dir).expect("fpm should register");
+        let svc = hearth_fpm_service("8.4", config_dir).expect("fpm should register");
         assert_eq!(
             svc.env(),
             &[(
@@ -560,8 +606,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_fake_fpm(tmp.path(), "8.4");
         // No fpm/php-fpm.conf generated (that is todo #2343's job).
-        let config = HearthConfig::default();
-        let err = match hearth_fpm_service(&config, tmp.path()) {
+        let err = match hearth_fpm_service("8.4", tmp.path()) {
             Err(e) => e,
             Ok(_) => panic!("expected launch-blocked skip"),
         };
@@ -574,11 +619,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("fpm")).unwrap();
         std::fs::write(tmp.path().join("fpm/php-fpm.conf"), "; fpm").unwrap();
-        let config = HearthConfig {
-            default_php: "7.4".to_string(),
-            ..HearthConfig::default()
-        };
-        let err = match hearth_fpm_service(&config, tmp.path()) {
+        let err = match hearth_fpm_service("7.4", tmp.path()) {
             Err(e) => e,
             Ok(_) => panic!("expected unresolvable skip"),
         };
