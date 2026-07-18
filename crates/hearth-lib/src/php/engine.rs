@@ -23,8 +23,9 @@ use crate::php::reconcile::{
     sha256_hex,
 };
 use crate::php::targets::{
-    ChannelClass, PhpProvider, PhpSapi, PhpTarget, ProbeInfo, ProviderRoots, classify_channel,
-    discover_provider_targets, probe_scan_dirs,
+    ChannelClass, ExternalFpmEvidence, PhpProvider, PhpSapi, PhpTarget, PhpTargetIdentity,
+    ProbeInfo, ProviderRoots, classify_channel, discover_provider_targets, probe_scan_dirs,
+    verify_user_channel,
 };
 use crate::service::ServiceKind;
 use crate::service::supervisor::ServiceSupervisor;
@@ -35,6 +36,73 @@ use crate::socket::{
 
 /// Injected Herd-ownership probe (production: `service::manager::is_herd_running`).
 pub type HerdProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Injected external-FPM launch-context probe (production:
+/// [`detect_external_fpm`]). Called only for ambient-provider FPM targets;
+/// MUST derive evidence from the running process itself, never from the
+/// Hearth daemon's inherited environment (review 5594 B2-1).
+pub type ExternalFpmProbe = Arc<dyn Fn(&PhpTargetIdentity) -> ExternalFpmEvidence + Send + Sync>;
+
+/// Production external-FPM probe: read-only inspection of the actual running
+/// php-fpm master for this version. Evidence sources, in order:
+/// 1. the master's own environment (when the OS exposes it) — a
+///    `HERD_PHP_XY_INI_SCAN_DIR` entry proves the user channel;
+/// 2. otherwise the master is running but unprovable → `Unverified`;
+/// 3. no matching master → `NotRunning`.
+pub fn detect_external_fpm(id: &PhpTargetIdentity) -> ExternalFpmEvidence {
+    let xy = id.version.replace('.', "");
+    let listing = std::process::Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output();
+    let Ok(listing) = listing else {
+        return ExternalFpmEvidence::Unverified {
+            reason: "process listing unavailable".to_string(),
+        };
+    };
+    let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+    let master_pid = listing.lines().find_map(|line| {
+        let line = line.trim_start();
+        let (pid, command) = line.split_once(' ')?;
+        let command = command.trim_start();
+        if !command.starts_with("php-fpm: master process") {
+            return None;
+        }
+        // Match this version's master via its fpm config path (Herd layout
+        // embeds `X.Y-fpm.conf`).
+        if command.contains(&format!("{}-fpm.conf", id.version))
+            || command.contains(&format!("php{xy}"))
+        {
+            pid.parse::<u32>().ok()
+        } else {
+            None
+        }
+    });
+    let Some(pid) = master_pid else {
+        return ExternalFpmEvidence::NotRunning;
+    };
+
+    let env_out = std::process::Command::new("ps")
+        .args(["eww", "-o", "command=", "-p", &pid.to_string()])
+        .output();
+    let env_text = env_out
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let wanted = format!("HERD_PHP_{xy}_INI_SCAN_DIR=");
+    if let Some(token) = env_text.split_whitespace().find(|t| t.starts_with(&wanted)) {
+        let dir = PathBuf::from(token.trim_start_matches(&wanted));
+        if !dir.as_os_str().is_empty() {
+            return ExternalFpmEvidence::Verified { dir };
+        }
+    }
+    // macOS exposes other-session process environments to `ps eww` only for
+    // terminal-launched processes; a bare command line means unprovable.
+    ExternalFpmEvidence::Unverified {
+        reason: format!(
+            "running php-fpm master (pid {pid}) environment is not externally \
+             readable and its config carries no scan-dir proof"
+        ),
+    }
+}
 
 /// Channel-file materialization state for one expected file, used to join
 /// classification with outcome (tier ⊓ outcome — status never overclaims).
@@ -51,6 +119,7 @@ pub struct PhpConfigEngine {
     config_dir: PathBuf,
     provider_roots: ProviderRoots,
     herd_running: HerdProbe,
+    external_fpm: ExternalFpmProbe,
     probe_timeout: Duration,
     /// Serializes config/reconcile mutations across daemon + MCP handlers.
     op_lock: Mutex<()>,
@@ -65,6 +134,7 @@ impl PhpConfigEngine {
         config_dir: PathBuf,
         provider_roots: ProviderRoots,
         herd_running: HerdProbe,
+        external_fpm: ExternalFpmProbe,
         probe_timeout: Duration,
     ) -> Self {
         Self {
@@ -73,6 +143,7 @@ impl PhpConfigEngine {
             config_dir,
             provider_roots,
             herd_running,
+            external_fpm,
             probe_timeout,
             op_lock: Mutex::new(()),
             probe_cache: std::sync::Mutex::new(HashMap::new()),
@@ -85,6 +156,10 @@ impl PhpConfigEngine {
 
     pub fn config_dir(&self) -> &Path {
         &self.config_dir
+    }
+
+    pub fn provider_roots(&self) -> &ProviderRoots {
+        &self.provider_roots
     }
 
     pub fn manifest_path(&self) -> PathBuf {
@@ -369,10 +444,27 @@ impl PhpConfigEngine {
                 context_failure(&probe, "sanitized probe:"),
                 &self.provider_roots,
             );
-            let write_channel = match (&normal_channel, &sanitized_channel) {
-                (ChannelClass::Verified { dir }, _) => Some(dir.clone()),
-                (_, ChannelClass::Verified { dir }) => Some(dir.clone()),
-                _ => None,
+            // External (non-Hearth-launched) FPM: the daemon's own probe env
+            // is NOT evidence for the running process (B2-1). Its channel —
+            // including write authority — comes exclusively from the
+            // independently observed launch context.
+            let external = if id.provider != PhpProvider::Hearth && id.sapi == PhpSapi::Fpm {
+                Some((self.external_fpm)(&id))
+            } else {
+                None
+            };
+            let write_channel = match &external {
+                Some(ExternalFpmEvidence::Verified { dir }) => {
+                    verify_user_channel(dir, &self.provider_roots.allowed_prefixes())
+                        .ok()
+                        .map(|verified| verified.path)
+                }
+                Some(_) => None,
+                None => match (&normal_channel, &sanitized_channel) {
+                    (ChannelClass::Verified { dir }, _) => Some(dir.clone()),
+                    (_, ChannelClass::Verified { dir }) => Some(dir.clone()),
+                    _ => None,
+                },
             };
             targets.push(PhpTarget {
                 id,
@@ -380,6 +472,7 @@ impl PhpConfigEngine {
                 normal_channel,
                 sanitized_channel,
                 write_channel,
+                external,
             });
         }
         (targets, creation_failures)
@@ -459,6 +552,78 @@ impl PhpConfigEngine {
             let effective = php_ini.effective_for(&target.id.version);
             let managed_expected = !effective.is_empty();
             let configured = key.and_then(|k| effective.get(k).cloned());
+
+            // External FPM targets get exactly ONE row, built from the
+            // independently observed launch context — never from the daemon
+            // env probes, and never with env credit (B2-1).
+            if let Some(evidence) = &target.external {
+                let (channel, coverage, applied) = match evidence {
+                    ExternalFpmEvidence::Verified { dir } => {
+                        match verify_user_channel(dir, &self.provider_roots.allowed_prefixes()) {
+                            Ok(verified) => {
+                                let file_state =
+                                    file_states.get(&verified.path.join(CHANNEL_FILE_NAME));
+                                let applied = matches!(file_state, Some(FileState::Applied));
+                                let coverage = coverage_label(
+                                    "external",
+                                    &ChannelClass::Verified {
+                                        dir: verified.path.clone(),
+                                    },
+                                    false,
+                                    file_state,
+                                    managed_expected,
+                                );
+                                (
+                                    Some(verified.path.to_string_lossy().to_string()),
+                                    coverage,
+                                    applied,
+                                )
+                            }
+                            Err(rejection) => (
+                                Some(dir.to_string_lossy().to_string()),
+                                format!(
+                                    "unmanaged: best-effort (external channel verification \
+                                     failed: {rejection})"
+                                ),
+                                false,
+                            ),
+                        }
+                    }
+                    ExternalFpmEvidence::NotRunning => (
+                        None,
+                        "unverified: external php-fpm not running (start it or use a \
+                         Hearth-launched FPM to verify)"
+                            .to_string(),
+                        false,
+                    ),
+                    ExternalFpmEvidence::Unverified { reason } => (
+                        None,
+                        format!(
+                            "UNMANAGED: privileged-dir (external launch context unproven: \
+                             {reason})"
+                        ),
+                        false,
+                    ),
+                };
+                let materialized = managed_expected && applied;
+                let (observed, observed_state) = match (&configured, materialized) {
+                    (Some(value), true) => (Some(value.clone()), "materialized".to_string()),
+                    _ => (None, "n/a".to_string()),
+                };
+                rows.push(PhpTargetRow {
+                    provider: provider_str(target.id.provider).to_string(),
+                    version: target.id.version.clone(),
+                    sapi: sapi_str(target.id.sapi).to_string(),
+                    context: "external".to_string(),
+                    channel,
+                    coverage,
+                    configured: configured.clone(),
+                    observed,
+                    observed_state,
+                });
+                continue;
+            }
+
             for (context, class) in [
                 ("normal", &target.normal_channel),
                 ("sanitized", &target.sanitized_channel),
@@ -596,52 +761,76 @@ pub async fn switch_php_version(
     engine: &PhpConfigEngine,
     version: &str,
 ) -> Result<String, String> {
-    validate_version(version)?;
-    let config_dir = engine.config_dir().to_path_buf();
-    if crate::php::resolver::resolve_php_binary(version, &config_dir).is_none()
-        && crate::php::resolver::resolve_phpfpm_binary(version, &config_dir).is_none()
-    {
-        return Err(format!(
-            "PHP {version} is not installed (no CLI or FPM binary found)"
-        ));
-    }
+    engine.switch(supervisor, version).await
+}
 
-    {
-        let mut cfg = engine.config.lock().await;
-        cfg.default_php = version.to_string();
-        cfg.save_to(engine.config_path())
-            .map_err(|e| format!("failed to save config: {e}"))?;
-    }
-    // Reconcile channel files for the new active version BEFORE any
-    // supervisor acquisition (lock order), hard-gated: a Refused/Failed
-    // channel aborts the FPM restart.
-    require_reconciled(engine.apply(crate::socket::PhpConfigAction::Sync).await)
-        .map_err(|e| format!("switched default_php to {version} (persisted), but: {e}"))?;
-
-    let mut sup = supervisor.lock().await;
-    let _ = sup.stop_service(ServiceKind::PhpFpm);
-    match crate::service::manager::hearth_fpm_service(version, &config_dir) {
-        Ok(svc) => {
-            sup.register(svc);
-            sup.start_service(ServiceKind::PhpFpm)
-                .map_err(|e| format!("switched to PHP {version}, but php-fpm start failed: {e}"))?;
-            Ok(format!("Switched to PHP {version}; php-fpm restarted"))
+impl PhpConfigEngine {
+    /// First-class serialized version switch (review 5594 B2-3): ONE
+    /// `op_lock` acquisition covers validation, `default_php` persistence,
+    /// reconciliation (via the private, already-locked sync path — never a
+    /// recursive lock), the hard-failure gate, AND the FPM service
+    /// replacement. Concurrent Set/Unset/Sync/Switch therefore cannot
+    /// interleave between the persisted default and its reconcile, and an
+    /// older switch can never overwrite the service after a newer committed
+    /// one — supervisor mutation happens inside the same critical section,
+    /// after config/probe work, preserving the project lock order
+    /// (`config → … → supervisor`; both are async mutexes, so awaiting them
+    /// under the async op lock is sound).
+    pub async fn switch(
+        &self,
+        supervisor: &Arc<Mutex<ServiceSupervisor>>,
+        version: &str,
+    ) -> Result<String, String> {
+        let _op = self.op_lock.lock().await;
+        validate_version(version)?;
+        let config_dir = self.config_dir.clone();
+        if crate::php::resolver::resolve_php_binary(version, &config_dir).is_none()
+            && crate::php::resolver::resolve_phpfpm_binary(version, &config_dir).is_none()
+        {
+            return Err(format!(
+                "PHP {version} is not installed (no CLI or FPM binary found)"
+            ));
         }
-        Err(reason) => {
-            let removed = sup.remove_service(ServiceKind::PhpFpm);
-            let herd_note = if engine.herd_running() {
-                " (Herd manages PHP-FPM)"
-            } else {
-                ""
-            };
-            let stale_note = if removed {
-                "; previous php-fpm registration removed"
-            } else {
-                ""
-            };
-            Ok(format!(
-                "Switched to PHP {version}; php-fpm not registered: {reason}{herd_note}{stale_note}"
-            ))
+
+        {
+            let mut cfg = self.config.lock().await;
+            cfg.default_php = version.to_string();
+            cfg.save_to(&self.config_path)
+                .map_err(|e| format!("failed to save config: {e}"))?;
+        }
+        // Reconcile for the new active version, hard-gated: a Refused/Failed
+        // channel aborts the FPM restart (config release above keeps lock
+        // order; op lock stays held for the whole transaction).
+        require_reconciled(self.sync_locked().await)
+            .map_err(|e| format!("switched default_php to {version} (persisted), but: {e}"))?;
+
+        let mut sup = supervisor.lock().await;
+        let _ = sup.stop_service(ServiceKind::PhpFpm);
+        match crate::service::manager::hearth_fpm_service(version, &config_dir) {
+            Ok(svc) => {
+                sup.register(svc);
+                sup.start_service(ServiceKind::PhpFpm).map_err(|e| {
+                    format!("switched to PHP {version}, but php-fpm start failed: {e}")
+                })?;
+                Ok(format!("Switched to PHP {version}; php-fpm restarted"))
+            }
+            Err(reason) => {
+                let removed = sup.remove_service(ServiceKind::PhpFpm);
+                let herd_note = if self.herd_running() {
+                    " (Herd manages PHP-FPM)"
+                } else {
+                    ""
+                };
+                let stale_note = if removed {
+                    "; previous php-fpm registration removed"
+                } else {
+                    ""
+                };
+                Ok(format!(
+                    "Switched to PHP {version}; php-fpm not registered: \
+                     {reason}{herd_note}{stale_note}"
+                ))
+            }
         }
     }
 }
@@ -766,6 +955,15 @@ mod tests {
     }
 
     fn fixture(herd: bool) -> Fixture {
+        fixture_with_external(
+            herd,
+            Arc::new(|_: &PhpTargetIdentity| ExternalFpmEvidence::Unverified {
+                reason: "test default".to_string(),
+            }),
+        )
+    }
+
+    fn fixture_with_external(herd: bool, external: ExternalFpmProbe) -> Fixture {
         // Canonicalized base — /var → /private/var on macOS would otherwise
         // break allowlist prefix checks.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -773,11 +971,13 @@ mod tests {
         let config_dir = base.join("hearth config"); // path with a space
         std::fs::create_dir_all(&config_dir).unwrap();
         let config_path = base.join("config.toml");
-        let roots = ProviderRoots {
-            hearth: config_dir.clone(),
-            herd: base.join("herd"),
-            homebrew: base.join("homebrew"),
-        };
+        let roots = ProviderRoots::isolated(
+            &base,
+            config_dir.clone(),
+            base.join("herd"),
+            base.join("homebrew"),
+        )
+        .unwrap();
         let config = Arc::new(Mutex::new(HearthConfig::default()));
         let engine = Arc::new(PhpConfigEngine::new(
             Arc::clone(&config),
@@ -785,6 +985,7 @@ mod tests {
             config_dir.clone(),
             roots,
             Arc::new(move || herd),
+            external,
             Duration::from_millis(50),
         ));
         Fixture {
@@ -1314,6 +1515,207 @@ mod tests {
             "8.3",
             "no persist on refusal"
         );
+    }
+
+    /// Fake Herd-style provider: CLI+FPM binaries whose DAEMON-ENV probes
+    /// report the user-scoped channel (the B2-1 hazard scenario: inherited
+    /// launcher vars make the daemon see a verified channel).
+    fn install_fake_herd_pair(fx: &Fixture, version: &str) -> PathBuf {
+        let herd = fx.engine.provider_roots.herd.clone();
+        let xy = version.replace('.', "");
+        let user_channel = herd.join("config/php").join(&xy);
+        std::fs::create_dir_all(&user_channel).unwrap();
+        let script = format!(
+            "#!/bin/sh\necho \"Scan for additional .ini files in: {}\"\n",
+            user_channel.display()
+        );
+        write_executable(&herd.join("bin").join(format!("php{xy}")), &script);
+        write_executable(&herd.join("bin").join(format!("php{xy}-fpm")), &script);
+        user_channel
+    }
+
+    #[tokio::test]
+    async fn external_fpm_row_never_borrows_daemon_env() {
+        // Daemon-env probes see a verified Herd user channel (launcher vars
+        // inherited), but the external probe cannot prove the running
+        // master's context → the FPM row MUST stay unmanaged/unproven while
+        // the CLI rows may be managed.
+        let fx = fixture_with_external(
+            false,
+            Arc::new(|_: &PhpTargetIdentity| ExternalFpmEvidence::Unverified {
+                reason: "environment not readable".to_string(),
+            }),
+        );
+        install_fake_herd_pair(&fx, "8.4");
+        fx.engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+
+        let outcome = fx.engine.apply(PhpConfigAction::Status).await.unwrap();
+        let fpm_rows: Vec<_> = outcome
+            .rows
+            .iter()
+            .filter(|r| r.provider == "herd" && r.sapi == "fpm")
+            .collect();
+        assert_eq!(fpm_rows.len(), 1, "exactly one external row: {fpm_rows:?}");
+        assert_eq!(fpm_rows[0].context, "external");
+        assert!(
+            fpm_rows[0]
+                .coverage
+                .starts_with("UNMANAGED: privileged-dir"),
+            "unproven external context must fail closed, got: {}",
+            fpm_rows[0].coverage
+        );
+        assert!(fpm_rows[0].coverage.contains("environment not readable"));
+        // CLI context evidence stays separate: normal row is managed.
+        let cli_normal = outcome
+            .rows
+            .iter()
+            .find(|r| r.provider == "herd" && r.sapi == "cli" && r.context == "normal")
+            .expect("herd cli normal row");
+        assert!(
+            cli_normal.coverage.starts_with("managed"),
+            "got: {}",
+            cli_normal.coverage
+        );
+    }
+
+    #[tokio::test]
+    async fn external_fpm_verified_evidence_yields_managed_row() {
+        let fx_probe_dir = std::sync::Arc::new(std::sync::Mutex::new(PathBuf::new()));
+        let probe_dir = Arc::clone(&fx_probe_dir);
+        let fx = fixture_with_external(
+            false,
+            Arc::new(move |_: &PhpTargetIdentity| ExternalFpmEvidence::Verified {
+                dir: probe_dir.lock().unwrap().clone(),
+            }),
+        );
+        let user_channel = install_fake_herd_pair(&fx, "8.4");
+        *fx_probe_dir.lock().unwrap() = user_channel.clone();
+
+        fx.engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        let outcome = fx.engine.apply(PhpConfigAction::Status).await.unwrap();
+        let fpm_row = outcome
+            .rows
+            .iter()
+            .find(|r| r.provider == "herd" && r.sapi == "fpm")
+            .expect("external fpm row");
+        assert_eq!(fpm_row.context, "external");
+        assert!(
+            fpm_row.coverage.starts_with("managed (channel)"),
+            "independently proven channel may be managed, got: {}",
+            fpm_row.coverage
+        );
+        assert!(
+            user_channel.join("zz-hearth.ini").is_file(),
+            "channel file materialized in the proven dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_fpm_not_running_row_is_unverified() {
+        let fx = fixture_with_external(
+            false,
+            Arc::new(|_: &PhpTargetIdentity| ExternalFpmEvidence::NotRunning),
+        );
+        install_fake_herd_pair(&fx, "8.4");
+        let outcome = fx.engine.apply(PhpConfigAction::Status).await.unwrap();
+        let fpm_row = outcome
+            .rows
+            .iter()
+            .find(|r| r.provider == "herd" && r.sapi == "fpm")
+            .expect("external fpm row");
+        assert!(
+            fpm_row
+                .coverage
+                .starts_with("unverified: external php-fpm not running"),
+            "got: {}",
+            fpm_row.coverage
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_serializes_with_set_under_one_op_lock() {
+        let fx = fixture(false);
+        write_fake_fpm_pair(&fx, "8.3");
+        write_fake_fpm_pair(&fx, "8.4");
+        std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
+        std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
+        fx.config.lock().await.default_php = "8.3".to_string();
+        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+
+        // Deterministic barrier: hold the engine op lock; both operations
+        // must block behind it (no sleeps deciding the outcome).
+        let barrier = fx.engine.op_lock.lock().await;
+        let e1 = Arc::clone(&fx.engine);
+        let sup1 = Arc::clone(&supervisor);
+        let switch_task = tokio::spawn(async move { e1.switch(&sup1, "8.4").await });
+        let e2 = Arc::clone(&fx.engine);
+        let set_task =
+            tokio::spawn(async move { e2.apply(set_global("memory_limit", "1G")).await });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !switch_task.is_finished(),
+            "switch must wait on the op lock"
+        );
+        assert!(!set_task.is_finished(), "set must wait on the op lock");
+
+        drop(barrier);
+        switch_task.await.unwrap().unwrap();
+        set_task.await.unwrap().unwrap();
+
+        // Invariant: registered FPM service matches the committed default.
+        let cfg_default = fx.config.lock().await.default_php.clone();
+        assert_eq!(cfg_default, "8.4");
+        let mut sup = supervisor.lock().await;
+        let svc = sup.service(ServiceKind::PhpFpm).expect("fpm registered");
+        assert!(svc.env()[0].1.contains("8.4"), "env: {:?}", svc.env());
+        let _ = sup.stop_service(ServiceKind::PhpFpm);
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_switches_leave_service_consistent_with_committed_default() {
+        let fx = fixture(false);
+        write_fake_fpm_pair(&fx, "8.3");
+        write_fake_fpm_pair(&fx, "8.4");
+        std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
+        std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
+        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+
+        let barrier = fx.engine.op_lock.lock().await;
+        let e1 = Arc::clone(&fx.engine);
+        let sup1 = Arc::clone(&supervisor);
+        let t1 = tokio::spawn(async move { e1.switch(&sup1, "8.3").await });
+        let e2 = Arc::clone(&fx.engine);
+        let sup2 = Arc::clone(&supervisor);
+        let t2 = tokio::spawn(async move { e2.switch(&sup2, "8.4").await });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!t1.is_finished() && !t2.is_finished());
+        drop(barrier);
+        t1.await.unwrap().unwrap();
+        t2.await.unwrap().unwrap();
+
+        // Whichever switch committed LAST owns both the default and the
+        // service — an older switch can never overwrite a newer one.
+        let cfg_default = fx.config.lock().await.default_php.clone();
+        let mut sup = supervisor.lock().await;
+        let svc = sup.service(ServiceKind::PhpFpm).expect("fpm registered");
+        assert!(
+            svc.command()
+                .contains(&format!("php/{cfg_default}/php-fpm")),
+            "service binary {} must match committed default {cfg_default}",
+            svc.command()
+        );
+        assert!(
+            svc.env()[0].1.contains(&cfg_default),
+            "service env {:?} must match committed default {cfg_default}",
+            svc.env()
+        );
+        let _ = sup.stop_service(ServiceKind::PhpFpm);
     }
 
     #[tokio::test]

@@ -64,7 +64,8 @@ async fn main() -> anyhow::Result<()> {
     // Ensure directories exist before any engine registration. DB engines
     // expect `run/` and `data/` to be present on first start; pre-creating
     // them once per daemon boot keeps the wrapper scripts simple.
-    let config_dir = hearth_lib::config_dir();
+    let config_dir = hearth_lib::validated_config_dir()
+        .map_err(|e| anyhow::anyhow!("runtime-path configuration invalid: {e}"))?;
     let config_path = config_dir.join("config.toml");
     std::fs::create_dir_all(hearth_lib::run_dir())?;
     std::fs::create_dir_all(hearth_lib::log_dir())?;
@@ -95,8 +96,10 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&config),
         config_path.clone(),
         config_dir.clone(),
-        ProviderRoots::detect(),
+        ProviderRoots::detect()
+            .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?,
         Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        Arc::new(hearth_lib::php::engine::detect_external_fpm),
         std::time::Duration::from_secs(5),
     ));
     // Boot hard gate (F4): a failed OR hard-refused reconcile disables every
@@ -785,7 +788,7 @@ async fn process_request(
                         kind,
                         &pkg,
                         &config_dir,
-                        &ProviderRoots::detect(),
+                        Some(state.php_engine.provider_roots()),
                     );
                     sup.register(svc);
                     if let Err(e) = sup.start_service(kind) {

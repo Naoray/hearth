@@ -533,12 +533,19 @@ mod tests {
             Arc::clone(&config),
             base.join("config.toml"),
             base.join("hearth"),
-            crate::php::targets::ProviderRoots {
-                hearth: base.join("hearth"),
-                herd: base.join("herd"),
-                homebrew: base.join("homebrew"),
-            },
+            crate::php::targets::ProviderRoots::isolated(
+                &base,
+                base.join("hearth"),
+                base.join("herd"),
+                base.join("homebrew"),
+            )
+            .unwrap(),
             Arc::new(|| false),
+            Arc::new(|_: &crate::php::targets::PhpTargetIdentity| {
+                crate::php::targets::ExternalFpmEvidence::Unverified {
+                    reason: "test".to_string(),
+                }
+            }),
             std::time::Duration::from_millis(50),
         ));
 
@@ -598,12 +605,19 @@ mod tests {
             Arc::clone(&config),
             tmp_php.path().join("config.toml"),
             tmp_php.path().join("hearth"),
-            crate::php::targets::ProviderRoots {
-                hearth: tmp_php.path().join("hearth"),
-                herd: tmp_php.path().join("herd"),
-                homebrew: tmp_php.path().join("homebrew"),
-            },
+            crate::php::targets::ProviderRoots::isolated(
+                tmp_php.path(),
+                tmp_php.path().join("hearth"),
+                tmp_php.path().join("herd"),
+                tmp_php.path().join("homebrew"),
+            )
+            .unwrap(),
             Arc::new(|| false),
+            Arc::new(|_: &crate::php::targets::PhpTargetIdentity| {
+                crate::php::targets::ExternalFpmEvidence::Unverified {
+                    reason: "test".to_string(),
+                }
+            }),
             std::time::Duration::from_millis(50),
         ));
         let server = HearthMcpServer::new(

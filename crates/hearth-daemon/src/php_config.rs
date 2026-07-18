@@ -53,6 +53,20 @@ pub async fn php_config_legacy(
     };
     match php_config(state, action).await {
         DaemonResponse::PhpConfigReport(outcome) => {
+            // B2-2: a hard reconciliation failure must surface as a legacy
+            // ERROR (paths + reasons), never as an Ok with a soft FPM note.
+            // Canonical persistence is mentioned truthfully as partial state,
+            // not success.
+            let hard = outcome.hard_failures();
+            if !hard.is_empty() {
+                return DaemonResponse::Error {
+                    message: format!(
+                        "Set {key}={value}: canonical config persisted, but channel \
+                         reconciliation hard-failed and php-fpm was NOT restarted: {}",
+                        hard.join("; ")
+                    ),
+                };
+            }
             let fpm_note = match &outcome.fpm {
                 FpmRestartOutcome::Restarted => "php-fpm restarted".to_string(),
                 FpmRestartOutcome::NotRegistered { herd_hint: true } => {
@@ -105,17 +119,24 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         let config_path = base.join("config.toml");
         let config = Arc::new(Mutex::new(HearthConfig::default()));
-        let roots = ProviderRoots {
-            hearth: config_dir.clone(),
-            herd: base.join("herd"),
-            homebrew: base.join("homebrew"),
-        };
+        let roots = ProviderRoots::isolated(
+            &base,
+            config_dir.clone(),
+            base.join("herd"),
+            base.join("homebrew"),
+        )
+        .unwrap();
         let engine = Arc::new(PhpConfigEngine::new(
             Arc::clone(&config),
             config_path.clone(),
             config_dir.clone(),
             roots,
             Arc::new(|| false),
+            Arc::new(|_: &hearth_lib::php::targets::PhpTargetIdentity| {
+                hearth_lib::php::targets::ExternalFpmEvidence::Unverified {
+                    reason: "test".to_string(),
+                }
+            }),
             Duration::from_millis(50),
         ));
         let state = Arc::new(DaemonState {
@@ -279,5 +300,96 @@ mod tests {
         .await;
         assert!(matches!(response, DaemonResponse::Error { .. }));
         assert!(!config_path.exists(), "rejected input must not persist");
+    }
+
+    fn plant_homebrew_collision(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tmp.path().canonicalize().unwrap();
+        let conf_d = base.join("homebrew/etc/php/8.4/conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        let binary = base.join("homebrew/opt/php@8.4/bin/php");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\necho \"Scan for additional .ini files in: {}\"\n",
+                conf_d.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::process::Command::new(&binary).arg("--warmup").output();
+        let collision = conf_d.join("zz-hearth.ini");
+        std::fs::write(&collision, "; not ours\n").unwrap();
+        collision
+    }
+
+    #[tokio::test]
+    async fn legacy_hard_collision_returns_error_no_restart_foreign_untouched() {
+        let (tmp, _config_path, state) = state_fixture();
+        let collision = plant_homebrew_collision(&tmp);
+
+        let response = php_config_legacy(
+            &state,
+            "active".to_string(),
+            "memory_limit".to_string(),
+            "1G".to_string(),
+        )
+        .await;
+        match response {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("zz-hearth.ini"), "got: {message}");
+                assert!(message.contains("NOT restarted"), "got: {message}");
+                assert!(
+                    message.contains("persisted"),
+                    "partial persistence stated truthfully: {message}"
+                );
+                assert!(
+                    !message
+                        .to_lowercase()
+                        .starts_with("set memory_limit=1g (persisted). php-fpm"),
+                    "must not be success wording"
+                );
+            }
+            other => panic!("expected legacy Error, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&collision).unwrap(),
+            "; not ours\n",
+            "foreign file untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_io_failure_returns_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, _config_path, state) = state_fixture();
+        let base = tmp.path().canonicalize().unwrap();
+        // Hearth-provider fake whose conf.d creation will fail (read-only
+        // version dir) → typed Failed → legacy Error.
+        let version_dir = base.join("hearth/php/8.4");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let binary = version_dir.join("php");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&version_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let response = php_config_legacy(
+            &state,
+            "active".to_string(),
+            "memory_limit".to_string(),
+            "1G".to_string(),
+        )
+        .await;
+        std::fs::set_permissions(&version_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match response {
+            DaemonResponse::Error { message } => {
+                assert!(
+                    message.contains("creation refused") || message.contains("failed"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected legacy Error, got {other:?}"),
+        }
     }
 }

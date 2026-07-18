@@ -180,14 +180,19 @@ pub fn default_services(
     // Supervised AddedPackage entries (Horizon, Reverb). Boot-time prune already ran
     // before this is called (see daemon main.rs), so every entry here has a vendor dir.
     if php_launches_enabled {
-        let roots = crate::php::targets::ProviderRoots::detect();
+        // detect() can fail closed on invalid override env; legacy version
+        // inference is then unavailable but explicit-version workers still
+        // get their env.
+        let roots = crate::php::targets::ProviderRoots::detect()
+            .map_err(|e| warn!(error = %e, "provider-root detection failed"))
+            .ok();
         for pkg in &config.added_packages {
             let kind = match pkg.package.as_str() {
                 "horizon" => ServiceKind::Horizon,
                 "reverb" => ServiceKind::Reverb,
                 _ => continue, // telescope/pulse are install-only
             };
-            services.push(worker_service(kind, pkg, config_dir, &roots));
+            services.push(worker_service(kind, pkg, config_dir, roots.as_ref()));
         }
     } else if !config.added_packages.is_empty() {
         warn!("php launches disabled (hard php-config failure) — workers not registered");
@@ -238,7 +243,7 @@ pub fn worker_service(
     kind: ServiceKind,
     pkg: &AddedPackage,
     config_dir: &std::path::Path,
-    roots: &crate::php::targets::ProviderRoots,
+    roots: Option<&crate::php::targets::ProviderRoots>,
 ) -> ManagedService {
     let svc = ManagedService::with_cwd_and_site(
         kind,
@@ -250,7 +255,7 @@ pub fn worker_service(
     let version = pkg
         .php_version
         .clone()
-        .or_else(|| infer_worker_version(&pkg.command, roots));
+        .or_else(|| roots.and_then(|roots| infer_worker_version(&pkg.command, roots)));
     match version {
         Some(version) => svc.with_env(vec![crate::php::scan_dir_env(config_dir, &version)]),
         None => {
@@ -627,11 +632,13 @@ mod tests {
     }
 
     fn test_roots(base: &std::path::Path) -> crate::php::targets::ProviderRoots {
-        crate::php::targets::ProviderRoots {
-            hearth: base.join("hearth"),
-            herd: base.join("herd"),
-            homebrew: base.join("homebrew"),
-        }
+        crate::php::targets::ProviderRoots::isolated(
+            base,
+            base.join("hearth"),
+            base.join("herd"),
+            base.join("homebrew"),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -652,7 +659,7 @@ mod tests {
             ServiceKind::Horizon,
             &pkg,
             tmp.path(),
-            &test_roots(tmp.path()),
+            Some(&test_roots(tmp.path())),
         );
         assert_eq!(
             svc.env(),
@@ -685,7 +692,7 @@ mod tests {
             installed_at: chrono::Utc::now(),
         };
         // Canonical match → version inferred → env granted.
-        let svc = worker_service(ServiceKind::Horizon, &pkg, &base, &roots);
+        let svc = worker_service(ServiceKind::Horizon, &pkg, &base, Some(&roots));
         assert_eq!(
             svc.env(),
             &[(
@@ -696,7 +703,7 @@ mod tests {
 
         // No canonical match → unguaranteed: NO env, never a guess.
         pkg.command = base.join("somewhere-else/php").display().to_string();
-        let svc = worker_service(ServiceKind::Horizon, &pkg, &base, &roots);
+        let svc = worker_service(ServiceKind::Horizon, &pkg, &base, Some(&roots));
         assert!(
             svc.env().is_empty(),
             "unmatched legacy command must not get env credit"

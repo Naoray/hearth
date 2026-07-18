@@ -73,6 +73,22 @@ pub enum ChannelClass {
     BestEffort { reason: String },
 }
 
+/// Independently observed launch context of an EXTERNAL (non-Hearth-launched)
+/// FPM process (review 5594 B2-1). The Hearth daemon's own inherited shell
+/// environment is NEVER evidence for an external process: only the running
+/// master's actual observable environment/configuration may prove a channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalFpmEvidence {
+    /// The running master's own environment/configuration proves this
+    /// user-scoped scan channel (still subject to channel verification).
+    Verified { dir: PathBuf },
+    /// No matching external FPM master is running.
+    NotRunning,
+    /// A master is running but its environment/configuration is unreadable
+    /// or carries no channel proof — fail closed.
+    Unverified { reason: String },
+}
+
 /// A discovered PHP target with probe results and per-context classification.
 #[derive(Debug, Clone)]
 pub struct PhpTarget {
@@ -82,6 +98,9 @@ pub struct PhpTarget {
     pub sanitized_channel: ChannelClass,
     /// `Some` iff a Verified channel may receive `zz-hearth.ini`.
     pub write_channel: Option<PathBuf>,
+    /// Present only for ambient-provider FPM targets: the independently
+    /// observed external launch context (never daemon-env-derived).
+    pub external: Option<ExternalFpmEvidence>,
 }
 
 /// Injected provider base directories. Production uses the real roots
@@ -97,38 +116,157 @@ pub struct ProviderRoots {
     pub herd: PathBuf,
     /// Homebrew prefix (contains `opt/php@{v}/…` and `etc/php/{v}/conf.d`).
     pub homebrew: PathBuf,
+    /// Immutable allowed WRITE roots (review 5594 B2-4). Discovery roots
+    /// NEVER imply write authority: production is fixed to the Hearth config
+    /// dir, the user's home scope, and `/opt/homebrew`; an explicitly
+    /// constructed isolated runtime is confined to its runtime root. Not
+    /// derivable from lone environment overrides.
+    allowed_write_roots: Vec<PathBuf>,
 }
 
 impl ProviderRoots {
-    /// Production roots. Part of the runtime-path seam: `hearth` follows
-    /// `HEARTH_CONFIG_DIR` (via [`crate::config_dir`]); `HEARTH_HERD_ROOT`
-    /// and `HEARTH_HOMEBREW_ROOT` override the ambient provider roots so an
-    /// isolated smoke/test daemon can never discover — let alone write —
-    /// real Herd/Homebrew channels. Production defaults are unchanged when
-    /// the variables are unset.
-    pub fn detect() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        let env_root = |name: &str, default: PathBuf| -> PathBuf {
-            match std::env::var_os(name) {
-                Some(v) if !v.is_empty() => PathBuf::from(v),
-                _ => default,
+    /// Runtime detection with fail-closed override semantics (B2-4):
+    ///
+    /// - No overrides → production: real Hearth/Herd/Homebrew discovery
+    ///   roots and the IMMUTABLE production write allowlist (Hearth config
+    ///   dir, user home scope, `/opt/homebrew`).
+    /// - `HEARTH_ISOLATED_ROOT` set → typed isolated mode via
+    ///   [`ProviderRoots::isolated`]: `HEARTH_CONFIG_DIR` and any provider
+    ///   overrides must live beneath that root; write authority is confined
+    ///   to it.
+    /// - A lone `HEARTH_HERD_ROOT`/`HEARTH_HOMEBREW_ROOT` without
+    ///   `HEARTH_ISOLATED_ROOT` is an error — a discovery override can never
+    ///   silently alter production behavior or enlarge write authority.
+    pub fn detect() -> Result<Self, String> {
+        let herd_override = std::env::var_os("HEARTH_HERD_ROOT").filter(|v| !v.is_empty());
+        let brew_override = std::env::var_os("HEARTH_HOMEBREW_ROOT").filter(|v| !v.is_empty());
+
+        match std::env::var_os("HEARTH_ISOLATED_ROOT") {
+            Some(root) => {
+                if root.is_empty() {
+                    return Err("HEARTH_ISOLATED_ROOT is set but empty".to_string());
+                }
+                let root = PathBuf::from(root);
+                if !root.is_absolute() {
+                    return Err(format!(
+                        "HEARTH_ISOLATED_ROOT must be absolute, got {}",
+                        root.display()
+                    ));
+                }
+                let hearth = crate::config_dir();
+                let herd = herd_override
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| root.join("herd"));
+                let homebrew = brew_override
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| root.join("homebrew"));
+                Self::isolated(&root, hearth, herd, homebrew)
             }
-        };
-        Self {
-            hearth: crate::config_dir(),
-            herd: env_root(
-                "HEARTH_HERD_ROOT",
-                home.join("Library/Application Support/Herd"),
-            ),
-            homebrew: env_root("HEARTH_HOMEBREW_ROOT", PathBuf::from("/opt/homebrew")),
+            None => {
+                if herd_override.is_some() || brew_override.is_some() {
+                    return Err(
+                        "HEARTH_HERD_ROOT/HEARTH_HOMEBREW_ROOT are test/smoke discovery \
+                         overrides and require HEARTH_ISOLATED_ROOT — refusing to alter \
+                         production provider discovery or write authority"
+                            .to_string(),
+                    );
+                }
+                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+                Ok(Self::production(home))
+            }
         }
     }
 
-    /// Canonicalized channel-verification allowlist derived from the roots
-    /// (all under `$HOME` or `/opt/homebrew` in production).
+    fn production(home: PathBuf) -> Self {
+        let hearth = crate::config_dir();
+        Self {
+            herd: home.join("Library/Application Support/Herd"),
+            homebrew: PathBuf::from("/opt/homebrew"),
+            allowed_write_roots: vec![hearth.clone(), home, PathBuf::from("/opt/homebrew")],
+            hearth,
+        }
+    }
+
+    /// Explicit typed isolated-runtime constructor (tests/smoke). Every root
+    /// must be non-empty, absolute, outside the privileged denylist, and
+    /// contained beneath `runtime_root`; write authority is exactly
+    /// `runtime_root` and nothing else. Invalid inputs fail with actionable
+    /// errors — never a silent fallback.
+    pub fn isolated(
+        runtime_root: &Path,
+        hearth: PathBuf,
+        herd: PathBuf,
+        homebrew: PathBuf,
+    ) -> Result<Self, String> {
+        if runtime_root.as_os_str().is_empty() || !runtime_root.is_absolute() {
+            return Err(format!(
+                "isolated runtime root must be a non-empty absolute path, got {}",
+                runtime_root.display()
+            ));
+        }
+        let canonical_root = runtime_root.canonicalize().map_err(|e| {
+            format!(
+                "isolated runtime root {} must exist and canonicalize: {e}",
+                runtime_root.display()
+            )
+        })?;
+        if canonical_root.starts_with(PRIVILEGED_PREFIX) {
+            return Err(format!(
+                "isolated runtime root {} is under {PRIVILEGED_PREFIX}",
+                canonical_root.display()
+            ));
+        }
+        for (name, dir) in [
+            ("hearth", &hearth),
+            ("herd", &herd),
+            ("homebrew", &homebrew),
+        ] {
+            if dir.as_os_str().is_empty() || !dir.is_absolute() {
+                return Err(format!(
+                    "isolated {name} root must be a non-empty absolute path, got {}",
+                    dir.display()
+                ));
+            }
+            // Containment check on the canonical form of the deepest
+            // existing ancestor (roots may not exist yet).
+            let mut probe = dir.clone();
+            while !probe.exists() {
+                probe = match probe.parent() {
+                    Some(p) => p.to_path_buf(),
+                    None => break,
+                };
+            }
+            let canonical = probe.canonicalize().unwrap_or(probe);
+            if !canonical.starts_with(&canonical_root) {
+                return Err(format!(
+                    "isolated {name} root {} is not contained beneath the isolated \
+                     runtime root {}",
+                    dir.display(),
+                    canonical_root.display()
+                ));
+            }
+            if canonical.starts_with(PRIVILEGED_PREFIX) {
+                return Err(format!(
+                    "isolated {name} root {} is under {PRIVILEGED_PREFIX}",
+                    dir.display()
+                ));
+            }
+        }
+        Ok(Self {
+            hearth,
+            herd,
+            homebrew,
+            allowed_write_roots: vec![canonical_root],
+        })
+    }
+
+    /// Canonicalized allowed WRITE prefixes. Immutable per construction:
+    /// production = Hearth config dir + `$HOME` + `/opt/homebrew`; isolated
+    /// = the isolated runtime root only. Discovery-root overrides never
+    /// appear here.
     pub fn allowed_prefixes(&self) -> Vec<PathBuf> {
-        [&self.hearth, &self.herd, &self.homebrew]
-            .into_iter()
+        self.allowed_write_roots
+            .iter()
             .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
             .collect()
     }
@@ -734,11 +872,13 @@ fi
     }
 
     fn test_roots(base: &Path) -> ProviderRoots {
-        ProviderRoots {
-            hearth: base.join("hearth"),
-            herd: base.join("Herd"),
-            homebrew: base.join("homebrew"),
-        }
+        ProviderRoots::isolated(
+            base,
+            base.join("hearth"),
+            base.join("Herd"),
+            base.join("homebrew"),
+        )
+        .unwrap()
     }
 
     // ---- probing ----
@@ -1195,6 +1335,126 @@ echo "Scan for additional .ini files in: {normal}"
             !outside.join("8.4").exists(),
             "zero mutation through the symlink"
         );
+    }
+
+    #[test]
+    fn lone_provider_override_without_isolated_root_is_rejected() {
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.remove("HEARTH_CONFIG_DIR");
+        guard.set("HEARTH_HERD_ROOT", "/tmp/evil-discovery-root");
+        let err = ProviderRoots::detect().unwrap_err();
+        assert!(err.contains("HEARTH_ISOLATED_ROOT"), "got: {err}");
+        drop(guard);
+    }
+
+    #[test]
+    fn production_write_authority_is_immutable_and_never_tmp() {
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.remove("HEARTH_CONFIG_DIR");
+        let roots = ProviderRoots::detect().unwrap();
+        let allowed = roots.allowed_prefixes();
+        drop(guard);
+
+        assert_eq!(
+            allowed.len(),
+            3,
+            "config dir + home + /opt/homebrew: {allowed:?}"
+        );
+        assert!(
+            allowed
+                .iter()
+                .all(|p| !p.starts_with("/tmp") && !p.starts_with("/private/tmp")),
+            "no temp path may ever be production write authority: {allowed:?}"
+        );
+        assert!(
+            allowed.iter().any(|p| p == Path::new("/opt/homebrew")),
+            "got: {allowed:?}"
+        );
+    }
+
+    #[test]
+    fn isolated_mode_confines_and_validates_roots() {
+        let (_tmp, base) = canon_tmp();
+        std::fs::create_dir_all(base.join("hearth")).unwrap();
+
+        // Roots outside the runtime root are rejected.
+        let err = ProviderRoots::isolated(
+            &base,
+            base.join("hearth"),
+            PathBuf::from("/tmp"),
+            base.join("homebrew"),
+        )
+        .unwrap_err();
+        assert!(err.contains("not contained"), "got: {err}");
+
+        // Relative/empty roots are rejected.
+        let err = ProviderRoots::isolated(
+            &base,
+            base.join("hearth"),
+            PathBuf::from("relative/herd"),
+            base.join("homebrew"),
+        )
+        .unwrap_err();
+        assert!(err.contains("absolute"), "got: {err}");
+
+        // Valid isolated construction confines write authority to the root,
+        // and /usr/local stays denied there too.
+        let roots = ProviderRoots::isolated(
+            &base,
+            base.join("hearth"),
+            base.join("herd"),
+            base.join("homebrew"),
+        )
+        .unwrap();
+        assert_eq!(roots.allowed_prefixes(), vec![base.clone()]);
+        assert!(
+            verify_user_channel(
+                Path::new("/usr/local/etc/php/conf.d"),
+                &roots.allowed_prefixes()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn isolated_env_mode_requires_config_dir_under_root() {
+        let (_tmp, base) = canon_tmp();
+        std::fs::create_dir_all(base.join("hearth")).unwrap();
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.set("HEARTH_ISOLATED_ROOT", &base);
+        guard.set("HEARTH_CONFIG_DIR", base.join("hearth"));
+
+        let roots = ProviderRoots::detect().unwrap();
+        assert_eq!(roots.allowed_prefixes(), vec![base.clone()]);
+        assert_eq!(roots.herd, base.join("herd"));
+
+        // Real (outside-root) config dir in isolated mode fails closed.
+        guard.remove("HEARTH_CONFIG_DIR");
+        let err = ProviderRoots::detect().unwrap_err();
+        assert!(err.contains("not contained"), "got: {err}");
+        drop(guard);
     }
 
     #[test]

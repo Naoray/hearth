@@ -750,7 +750,8 @@ async fn run_php_exec(
 ) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
 
-    let config_dir = hearth_lib::config_dir();
+    let config_dir = hearth_lib::validated_config_dir()
+        .map_err(|e| anyhow::anyhow!("runtime-path configuration invalid: {e}"))?;
     let config_path = config_dir.join("config.toml");
     let config = hearth_lib::config::HearthConfig::load()?;
     let version = version.unwrap_or_else(|| config.default_php.clone());
@@ -761,8 +762,10 @@ async fn run_php_exec(
         std::sync::Arc::new(tokio::sync::Mutex::new(config)),
         config_path,
         config_dir.clone(),
-        hearth_lib::php::targets::ProviderRoots::detect(),
+        hearth_lib::php::targets::ProviderRoots::detect()
+            .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?,
         std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        std::sync::Arc::new(hearth_lib::php::engine::detect_external_fpm),
         std::time::Duration::from_secs(5),
     );
     // Hard gate (F4): never exec PHP against unreconciled channel state.
@@ -804,7 +807,8 @@ async fn run_install() -> anyhow::Result<()> {
 
     // 2. Create config directory
     println!("\n[2/3] Creating config directory...");
-    let config_dir = hearth_lib::config_dir();
+    let config_dir = hearth_lib::validated_config_dir()
+        .map_err(|e| anyhow::anyhow!("runtime-path configuration invalid: {e}"))?;
     std::fs::create_dir_all(&config_dir)?;
     // Load-and-preserve: re-running `hearth install` must keep existing
     // php_ini, added_packages, and port settings. `load()` returns defaults
@@ -833,8 +837,10 @@ async fn run_install() -> anyhow::Result<()> {
         )),
         config_dir.join("config.toml"),
         config_dir.clone(),
-        hearth_lib::php::targets::ProviderRoots::detect(),
+        hearth_lib::php::targets::ProviderRoots::detect()
+            .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?,
         std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        std::sync::Arc::new(hearth_lib::php::engine::detect_external_fpm),
         std::time::Duration::from_secs(5),
     );
     // Hard gate (F4): a Refused/Failed channel outcome aborts install with a
