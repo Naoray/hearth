@@ -32,7 +32,11 @@ impl AddPackage {
 }
 
 #[derive(Parser)]
-#[command(name = "hearth", version, about = "Unified Laravel development command center")]
+#[command(
+    name = "hearth",
+    version,
+    about = "Unified Laravel development command center"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -212,13 +216,9 @@ enum DbCommands {
         engine: Option<String>,
     },
     /// Stop a DB engine, or all DB engines.
-    Stop {
-        engine: Option<String>,
-    },
+    Stop { engine: Option<String> },
     /// Restart a DB engine (stop + start).
-    Restart {
-        engine: Option<String>,
-    },
+    Restart { engine: Option<String> },
     /// Report status of all DB engines.
     Status {
         /// Emit machine-readable JSON instead of a table.
@@ -430,8 +430,7 @@ fn build_php_config_action(
     match (key, value) {
         (Some(key), Some(value)) => Ok(PhpConfigAction::Set { scope, key, value }),
         _ => Err(
-            "provide <key> <value> to set, or one of --show/--status/--sync/--unmanage"
-                .to_string(),
+            "provide <key> <value> to set, or one of --show/--status/--sync/--unmanage".to_string(),
         ),
     }
 }
@@ -629,7 +628,11 @@ fn print_response(response: DaemonResponse) {
         DaemonResponse::DbStatus { engines } => {
             print_db_status_table(&engines);
         }
-        DaemonResponse::Conflict { engine, port, owner_hint } => {
+        DaemonResponse::Conflict {
+            engine,
+            port,
+            owner_hint,
+        } => {
             let hint = owner_hint
                 .as_deref()
                 .map(|h| format!(" (owner: {h})"))
@@ -761,7 +764,10 @@ async fn run_php_exec(
         .args(&args)
         .env(key, value)
         .exec();
-    Err(anyhow::anyhow!("failed to exec {}: {err}", binary.display()))
+    Err(anyhow::anyhow!(
+        "failed to exec {}: {err}",
+        binary.display()
+    ))
 }
 
 async fn run_install() -> anyhow::Result<()> {
@@ -793,7 +799,9 @@ async fn run_install() -> anyhow::Result<()> {
     if let Some(ref phar) = config.composer_phar {
         println!("  Resolved composer.phar → {}", phar.display());
     } else {
-        println!("  Warning: composer.phar not found on host. `hearth add` will probe at request time.");
+        println!(
+            "  Warning: composer.phar not found on host. `hearth add` will probe at request time."
+        );
     }
     config.save()?;
     println!("  Config saved to {}", config_dir.display());
@@ -821,7 +829,9 @@ async fn run_install() -> anyhow::Result<()> {
     let herd_running = hearth_lib::service::manager::is_herd_running();
     let resolver_content = if herd_running {
         // Herd manages its own dnsmasq on default port 53 — don't override it
-        println!("  Herd detected — writing /etc/resolver/test without custom port (using Herd's dnsmasq on port 53)");
+        println!(
+            "  Herd detected — writing /etc/resolver/test without custom port (using Herd's dnsmasq on port 53)"
+        );
         "nameserver 127.0.0.1\n".to_string()
     } else {
         println!("  Writing /etc/resolver/test with port {}", config.dns_port);
@@ -836,10 +846,11 @@ async fn run_install() -> anyhow::Result<()> {
     }
 
     let status = std::process::Command::new("sudo")
-        .args(["bash", "-c", &format!(
-            "echo '{}' > /etc/resolver/test",
-            resolver_content.trim()
-        )])
+        .args([
+            "bash",
+            "-c",
+            &format!("echo '{}' > /etc/resolver/test", resolver_content.trim()),
+        ])
         .status()?;
     if !status.success() {
         anyhow::bail!("Failed to write /etc/resolver/test");
@@ -912,9 +923,9 @@ async fn daemon_start() -> anyhow::Result<()> {
                 .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
         });
     }
-    let child = command
-        .spawn()
-        .context("Failed to start hearth-daemon. Is it installed next to the `hearth` binary or on PATH?")?;
+    let child = command.spawn().context(
+        "Failed to start hearth-daemon. Is it installed next to the `hearth` binary or on PATH?",
+    )?;
 
     let pid = child.id();
     println!("Daemon starting (PID {})...", pid);
@@ -929,7 +940,10 @@ async fn daemon_start() -> anyhow::Result<()> {
         }
     }
 
-    println!("Daemon started but socket not yet available. Check logs at {}", log_dir.display());
+    println!(
+        "Daemon started but socket not yet available. Check logs at {}",
+        log_dir.display()
+    );
     Ok(())
 }
 
@@ -964,7 +978,10 @@ async fn daemon_stop() -> anyhow::Result<()> {
         }
     }
 
-    println!("Daemon did not stop within 5 seconds. You may need to kill PID {} manually.", pid);
+    println!(
+        "Daemon did not stop within 5 seconds. You may need to kill PID {} manually.",
+        pid
+    );
     Ok(())
 }
 
@@ -1032,9 +1049,7 @@ async fn run_add(
     use std::io::IsTerminal;
 
     if !yes && !std::io::stdin().is_terminal() {
-        anyhow::bail!(
-            "refusing to prompt on non-TTY; pass --yes to accept defaults"
-        );
+        anyhow::bail!("refusing to prompt on non-TTY; pass --yes to accept defaults");
     }
 
     let site_path = site
@@ -1164,10 +1179,11 @@ fn reverb_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
         let port = if port_is_free(8080) {
             8080
         } else {
-            first_free_port(8080, 8099, 20)
-                .ok_or_else(|| anyhow::anyhow!(
+            first_free_port(8080, 8099, 20).ok_or_else(|| {
+                anyhow::anyhow!(
                     "ports 8080..=8099 are all busy; pass --site and rerun without --yes"
-                ))?
+                )
+            })?
         };
         answers.reverb_port = Some(port);
         return Ok(answers);
@@ -1326,25 +1342,126 @@ mod tests {
     #[test]
     fn flag_matrix_rejects_invalid_combinations() {
         // More than one action flag.
-        assert!(build(Some("k"), None, false, None, true, true, false, false, false).is_err());
+        assert!(
+            build(
+                Some("k"),
+                None,
+                false,
+                None,
+                true,
+                true,
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
         assert!(build(None, None, false, None, false, false, true, true, false).is_err());
         // --global with --php.
-        assert!(build(Some("k"), Some("v"), true, Some("8.3"), false, false, false, false, false)
-            .is_err());
+        assert!(
+            build(
+                Some("k"),
+                Some("v"),
+                true,
+                Some("8.3"),
+                false,
+                false,
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
         // Status/Sync/Unmanage take no key/value/scope.
-        assert!(build(Some("k"), None, false, None, false, false, true, false, false).is_err());
-        assert!(build(None, Some("v"), false, None, false, false, false, true, false).is_err());
+        assert!(
+            build(
+                Some("k"),
+                None,
+                false,
+                None,
+                false,
+                false,
+                true,
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            build(
+                None,
+                Some("v"),
+                false,
+                None,
+                false,
+                false,
+                false,
+                true,
+                false
+            )
+            .is_err()
+        );
         assert!(build(None, None, true, None, false, false, false, false, true).is_err());
-        assert!(build(None, None, false, Some("8.3"), false, false, true, false, false).is_err());
+        assert!(
+            build(
+                None,
+                None,
+                false,
+                Some("8.3"),
+                false,
+                false,
+                true,
+                false,
+                false
+            )
+            .is_err()
+        );
         // --show forbids a value.
-        assert!(build(Some("k"), Some("v"), false, None, true, false, false, false, false)
-            .is_err());
+        assert!(
+            build(
+                Some("k"),
+                Some("v"),
+                false,
+                None,
+                true,
+                false,
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
         // --unset requires a key, forbids a value.
         assert!(build(None, None, false, None, false, true, false, false, false).is_err());
-        assert!(build(Some("k"), Some("v"), false, None, false, true, false, false, false)
-            .is_err());
+        assert!(
+            build(
+                Some("k"),
+                Some("v"),
+                false,
+                None,
+                false,
+                true,
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
         // Implicit Set needs both key and value.
-        assert!(build(Some("k"), None, false, None, false, false, false, false, false).is_err());
+        assert!(
+            build(
+                Some("k"),
+                None,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
         assert!(build(None, None, false, None, false, false, false, false, false).is_err());
     }
 
@@ -1352,7 +1469,17 @@ mod tests {
     fn flag_matrix_builds_expected_actions() {
         // Bare invocation keeps Active-version behavior.
         assert_eq!(
-            build(Some("memory_limit"), Some("1G"), false, None, false, false, false, false, false),
+            build(
+                Some("memory_limit"),
+                Some("1G"),
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
             Ok(PhpConfigAction::Set {
                 scope: PhpScope::Active,
                 key: "memory_limit".to_string(),
@@ -1360,7 +1487,17 @@ mod tests {
             })
         );
         assert_eq!(
-            build(Some("k"), Some("v"), true, None, false, false, false, false, false),
+            build(
+                Some("k"),
+                Some("v"),
+                true,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
             Ok(PhpConfigAction::Set {
                 scope: PhpScope::Global,
                 key: "k".to_string(),
@@ -1368,15 +1505,37 @@ mod tests {
             })
         );
         assert_eq!(
-            build(Some("k"), Some("v"), false, Some("8.3"), false, false, false, false, false),
+            build(
+                Some("k"),
+                Some("v"),
+                false,
+                Some("8.3"),
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
             Ok(PhpConfigAction::Set {
-                scope: PhpScope::Version { version: "8.3".to_string() },
+                scope: PhpScope::Version {
+                    version: "8.3".to_string()
+                },
                 key: "k".to_string(),
                 value: "v".to_string(),
             })
         );
         assert_eq!(
-            build(Some("k"), None, true, None, false, true, false, false, false),
+            build(
+                Some("k"),
+                None,
+                true,
+                None,
+                false,
+                true,
+                false,
+                false,
+                false
+            ),
             Ok(PhpConfigAction::Unset {
                 scope: PhpScope::Global,
                 key: "k".to_string(),
@@ -1387,8 +1546,20 @@ mod tests {
             Ok(PhpConfigAction::Show { key: None })
         );
         assert_eq!(
-            build(Some("k"), None, false, None, true, false, false, false, false),
-            Ok(PhpConfigAction::Show { key: Some("k".to_string()) })
+            build(
+                Some("k"),
+                None,
+                false,
+                None,
+                true,
+                false,
+                false,
+                false,
+                false
+            ),
+            Ok(PhpConfigAction::Show {
+                key: Some("k".to_string())
+            })
         );
         assert_eq!(
             build(None, None, false, None, false, false, true, false, false),
@@ -1490,7 +1661,9 @@ mod tests {
             rows: vec![],
             files: vec![FileOutcome {
                 path: "/x/zz-hearth.ini".to_string(),
-                result: FileWriteResult::Refused { reason: "untracked".to_string() },
+                result: FileWriteResult::Refused {
+                    reason: "untracked".to_string(),
+                },
             }],
             fpm: FpmRestartOutcome::NotAttempted,
         };
@@ -1502,7 +1675,9 @@ mod tests {
             rows: vec![],
             files: vec![FileOutcome {
                 path: "/x/zz-hearth.ini".to_string(),
-                result: FileWriteResult::Failed { error: "io".to_string() },
+                result: FileWriteResult::Failed {
+                    error: "io".to_string(),
+                },
             }],
             fpm: FpmRestartOutcome::NotAttempted,
         };
@@ -1513,7 +1688,9 @@ mod tests {
             persisted: Some(true),
             rows: vec![],
             files: vec![],
-            fpm: FpmRestartOutcome::Failed { message: "boom".to_string() },
+            fpm: FpmRestartOutcome::Failed {
+                message: "boom".to_string(),
+            },
         };
         assert_eq!(render_php_config_report(&fpm_failed).2, ExitClass::Failure);
 
@@ -1521,7 +1698,9 @@ mod tests {
         for fpm in [
             FpmRestartOutcome::NotRegistered { herd_hint: true },
             FpmRestartOutcome::NotRegistered { herd_hint: false },
-            FpmRestartOutcome::LaunchBlocked { reason: "missing fpm config — see todo #2343".to_string() },
+            FpmRestartOutcome::LaunchBlocked {
+                reason: "missing fpm config — see todo #2343".to_string(),
+            },
             FpmRestartOutcome::Restarted,
             FpmRestartOutcome::NotAttempted,
         ] {

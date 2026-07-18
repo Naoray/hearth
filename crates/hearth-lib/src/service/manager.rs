@@ -656,6 +656,9 @@ mod tests {
         // No canonical match → unguaranteed: NO env, never a guess.
         pkg.command = base.join("somewhere-else/php").display().to_string();
         let svc = worker_service(ServiceKind::Horizon, &pkg, &base, &roots);
-        assert!(svc.env().is_empty(), "unmatched legacy command must not get env credit");
+        assert!(
+            svc.env().is_empty(),
+            "unmatched legacy command must not get env credit"
+        );
     }
 }

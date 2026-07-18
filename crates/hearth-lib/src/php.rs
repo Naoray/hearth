@@ -161,7 +161,10 @@ mod tests {
         let (key, value) = scan_dir_env(std::path::Path::new("/tmp/hearth config"), "8.4");
         assert_eq!(key, "PHP_INI_SCAN_DIR");
         assert_eq!(value, ":/tmp/hearth config/php/8.4/conf.d");
-        assert!(value.starts_with(':'), "leading colon appends after default scan dir");
+        assert!(
+            value.starts_with(':'),
+            "leading colon appends after default scan dir"
+        );
     }
 
     #[test]

@@ -14,9 +14,9 @@ use crate::config::HearthConfig;
 use crate::php::PhpManager;
 use crate::php::engine::{PhpConfigEngine, restart_fpm_conditionally};
 use crate::service::supervisor::ServiceSupervisor;
-use crate::socket::{FpmRestartOutcome, PhpConfigAction, PhpScope};
 use crate::service::{ServiceKind, ServiceState};
 use crate::site::SiteManager;
+use crate::socket::{FpmRestartOutcome, PhpConfigAction, PhpScope};
 use crate::valet::ValetCli;
 
 // ---------------------------------------------------------------------------

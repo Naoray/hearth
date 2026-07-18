@@ -93,7 +93,11 @@ pub enum DaemonResponse {
 #[serde(tag = "action")]
 pub enum PhpConfigAction {
     /// Persist a directive into the canonical store, then reconcile channels.
-    Set { scope: PhpScope, key: String, value: String },
+    Set {
+        scope: PhpScope,
+        key: String,
+        value: String,
+    },
     /// Remove a directive from the canonical store, then reconcile channels.
     Unset { scope: PhpScope, key: String },
     /// Report configured (and, where materialized, observed) values. Read-only.
@@ -340,7 +344,9 @@ mod tests {
     fn all_scopes() -> Vec<PhpScope> {
         vec![
             PhpScope::Global,
-            PhpScope::Version { version: "8.4".to_string() },
+            PhpScope::Version {
+                version: "8.4".to_string(),
+            },
             PhpScope::Active,
         ]
     }
@@ -360,7 +366,9 @@ mod tests {
             });
         }
         cases.push(PhpConfigAction::Show { key: None });
-        cases.push(PhpConfigAction::Show { key: Some("memory_limit".to_string()) });
+        cases.push(PhpConfigAction::Show {
+            key: Some("memory_limit".to_string()),
+        });
         cases.push(PhpConfigAction::Status);
         cases.push(PhpConfigAction::Sync);
         cases.push(PhpConfigAction::Unmanage);
@@ -396,7 +404,9 @@ mod tests {
             FpmRestartOutcome::LaunchBlocked {
                 reason: "missing fpm config — see todo #2343".to_string(),
             },
-            FpmRestartOutcome::Failed { message: "start failed".to_string() },
+            FpmRestartOutcome::Failed {
+                message: "start failed".to_string(),
+            },
             FpmRestartOutcome::NotAttempted,
         ]
     }
@@ -416,8 +426,12 @@ mod tests {
             FileWriteResult::Written,
             FileWriteResult::Unchanged,
             FileWriteResult::Deleted,
-            FileWriteResult::Refused { reason: "untracked file".to_string() },
-            FileWriteResult::Failed { error: "permission denied".to_string() },
+            FileWriteResult::Refused {
+                reason: "untracked file".to_string(),
+            },
+            FileWriteResult::Failed {
+                error: "permission denied".to_string(),
+            },
         ];
         for result in cases {
             let json = serde_json::to_string(&result).unwrap();

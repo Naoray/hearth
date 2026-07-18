@@ -483,8 +483,10 @@ installed_at = "2026-01-01T00:00:00Z"
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
 
-        let mut existing = HearthConfig::default();
-        existing.mysql_port = 3307;
+        let mut existing = HearthConfig {
+            mysql_port: 3307,
+            ..HearthConfig::default()
+        };
         existing
             .php_ini
             .global

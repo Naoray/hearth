@@ -238,7 +238,10 @@ mod tests {
         let php = tmp.path().join("php");
         std::fs::write(
             &php,
-            format!("#!/bin/sh\nprintf %s \"$PHP_INI_SCAN_DIR\" > '{}'\n", out.display()),
+            format!(
+                "#!/bin/sh\nprintf %s \"$PHP_INI_SCAN_DIR\" > '{}'\n",
+                out.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&php, std::fs::Permissions::from_mode(0o755)).unwrap();
