@@ -99,7 +99,6 @@ async fn main() -> anyhow::Result<()> {
         ProviderRoots::detect()
             .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?,
         Arc::new(|| hearth_lib::service::manager::is_herd_running()),
-        Arc::new(hearth_lib::php::engine::detect_external_fpm),
         std::time::Duration::from_secs(5),
     ));
     // Boot hard gate (F4): a failed OR hard-refused reconcile disables every

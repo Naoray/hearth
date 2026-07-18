@@ -765,7 +765,6 @@ async fn run_php_exec(
         hearth_lib::php::targets::ProviderRoots::detect()
             .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?,
         std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
-        std::sync::Arc::new(hearth_lib::php::engine::detect_external_fpm),
         std::time::Duration::from_secs(5),
     );
     // Hard gate (F4): never exec PHP against unreconciled channel state.
@@ -840,7 +839,6 @@ async fn run_install() -> anyhow::Result<()> {
         hearth_lib::php::targets::ProviderRoots::detect()
             .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?,
         std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
-        std::sync::Arc::new(hearth_lib::php::engine::detect_external_fpm),
         std::time::Duration::from_secs(5),
     );
     // Hard gate (F4): a Refused/Failed channel outcome aborts install with a

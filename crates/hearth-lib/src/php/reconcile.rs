@@ -903,7 +903,6 @@ mod tests {
                 reason: "test".to_string(),
             },
             write_channel: Some(dir.to_path_buf()),
-            external: None,
         }
     }
 
@@ -919,7 +918,6 @@ mod tests {
             normal_channel: class.clone(),
             sanitized_channel: class,
             write_channel: None,
-            external: None,
         }
     }
 
