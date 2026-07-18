@@ -27,6 +27,7 @@ pub fn run(
     args: &[&str],
     dry_run: bool,
     log_path: Option<&Path>,
+    scan_env: Option<&(String, String)>,
 ) -> Result<ArtisanResult> {
     if dry_run {
         let planned = planned_command(php_binary, args);
@@ -52,6 +53,9 @@ pub fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some((key, value)) = scan_env {
+        cmd.env(key, value);
+    }
 
     let output = cmd.output().context("failed to spawn artisan")?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -96,6 +100,7 @@ mod tests {
             &["telescope:install"],
             true,
             None,
+            None,
         )
         .unwrap();
         assert!(r.success);
@@ -107,7 +112,35 @@ mod tests {
     fn live_run_errors_when_php_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let php_path = tmp.path().join("php-fake");
-        let err = run(tmp.path(), &php_path, &["migrate"], false, None).unwrap_err();
+        let err = run(tmp.path(), &php_path, &["migrate"], false, None, None).unwrap_err();
         assert!(err.to_string().contains("PHP binary not found"));
+    }
+
+    #[test]
+    fn artisan_receives_scan_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("out");
+        let php = tmp.path().join("php");
+        std::fs::write(
+            &php,
+            format!(
+                "#!/bin/sh\nprintf %s \"$PHP_INI_SCAN_DIR\" > '{}'\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&php, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let pair = (
+            "PHP_INI_SCAN_DIR".to_string(),
+            ":/tmp/hearth/php/8.4/conf.d".to_string(),
+        );
+        let r = run(tmp.path(), &php, &["migrate"], false, None, Some(&pair)).unwrap();
+        assert!(r.success, "fake php should exit 0: {r:?}");
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            ":/tmp/hearth/php/8.4/conf.d"
+        );
     }
 }

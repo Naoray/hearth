@@ -54,6 +54,7 @@ pub fn apply(ctx: &RecipeContext, answers: &AddAnswers) -> Result<RecipeOutcome>
                 package: "laravel/reverb",
                 dev: false,
                 log_path: ctx.log_path.as_deref(),
+                scan_env: ctx.scan_env.clone(),
             },
             ctx.dry_run,
         )?;
@@ -119,6 +120,7 @@ pub fn apply(ctx: &RecipeContext, answers: &AddAnswers) -> Result<RecipeOutcome>
             ],
             cwd: ctx.site_path.clone(),
             site_name: ctx.site_name.clone(),
+            php_version: ctx.php_version.clone(),
         });
     }
 
@@ -147,6 +149,7 @@ fn run_artisan_step(
         args,
         ctx.dry_run,
         ctx.log_path.as_deref(),
+        ctx.scan_env.as_ref(),
     )?;
     if !result.success {
         anyhow::bail!(

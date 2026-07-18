@@ -23,6 +23,9 @@ pub struct ComposerInvocation<'a> {
     pub dev: bool,
     /// If set, write combined stdout/stderr to this file so the CLI can `tail -f` it.
     pub log_path: Option<&'a Path>,
+    /// Belt-E `PHP_INI_SCAN_DIR` pair so composer's PHP loads Hearth's
+    /// channel INI (todo #2321 stage B). `None` = no injection.
+    pub scan_env: Option<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -86,6 +89,9 @@ pub fn run_require(inv: ComposerInvocation<'_>, dry_run: bool) -> Result<Compose
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some((key, value)) = &inv.scan_env {
+        cmd.env(key, value);
+    }
 
     let output = cmd.output().context("failed to spawn composer")?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -176,6 +182,7 @@ mod tests {
             package: "laravel/horizon",
             dev: false,
             log_path: None,
+            scan_env: None,
         }
     }
 
@@ -218,6 +225,40 @@ mod tests {
         let r = run_require(i, true).unwrap();
         assert!(r.success);
         assert!(r.stdout.starts_with("[dry-run]"));
+    }
+
+    #[test]
+    fn composer_receives_scan_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let site = tmp.path().join("site");
+        std::fs::create_dir_all(&site).unwrap();
+        let out = tmp.path().join("out");
+        // Fake PHP that records the scan-dir env instead of running composer.
+        let php = tmp.path().join("php");
+        std::fs::write(
+            &php,
+            format!(
+                "#!/bin/sh\nprintf %s \"$PHP_INI_SCAN_DIR\" > '{}'\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&php, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let phar = tmp.path().join("composer.phar");
+        std::fs::write(&phar, "phar").unwrap();
+
+        let mut i = inv(&site, &php, &phar);
+        i.scan_env = Some((
+            "PHP_INI_SCAN_DIR".to_string(),
+            ":/tmp/hearth/php/8.4/conf.d".to_string(),
+        ));
+        let r = run_require(i, false).unwrap();
+        assert!(r.success, "fake php should exit 0: {r:?}");
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            ":/tmp/hearth/php/8.4/conf.d"
+        );
     }
 
     #[test]

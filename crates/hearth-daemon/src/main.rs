@@ -11,8 +11,10 @@ use hearth_lib::config::{AddedPackage, HearthConfig};
 use hearth_lib::db::health::port_in_use;
 use hearth_lib::mcp::HearthMcpServer;
 use hearth_lib::php::PhpManager;
+use hearth_lib::php::engine::PhpConfigEngine;
+use hearth_lib::php::targets::ProviderRoots;
 use hearth_lib::service::manager::{default_services, prune_added_packages};
-use hearth_lib::service::supervisor::{ManagedService, ServiceSupervisor};
+use hearth_lib::service::supervisor::ServiceSupervisor;
 use hearth_lib::service::{ServiceKind, ServiceState};
 use hearth_lib::site::SiteManager;
 use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
@@ -20,6 +22,8 @@ use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
 use rmcp::transport::StreamableHttpServerConfig;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::StreamableHttpService;
+
+mod php_config;
 
 /// Shared state accessible by all daemon request handlers.
 ///
@@ -38,6 +42,12 @@ struct DaemonState {
     site_manager: Arc<Mutex<SiteManager>>,
     php_manager: Arc<Mutex<PhpManager>>,
     add_lock: Arc<Mutex<()>>,
+    /// Shared php-config engine (daemon socket handler + MCP tools route
+    /// through the same instance; its op lock serializes both).
+    php_engine: Arc<PhpConfigEngine>,
+    /// Injected config persistence path — handlers must never call the
+    /// global-path `HearthConfig::save()`.
+    config_path: PathBuf,
 }
 
 #[tokio::main]
@@ -48,13 +58,21 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Hearth daemon starting...");
 
-    // Load config
-    let mut config = HearthConfig::load().context("Failed to load config")?;
+    // One validated runtime-mode/root snapshot for the whole boot (B5-2/
+    // B5-4): the mode decision, config root, and write authority all come
+    // from a single ProviderRoots construction. A root-construction failure
+    // aborts boot here — before any config load or service registration.
+    let provider_roots = ProviderRoots::detect()
+        .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?;
+    let config_dir = provider_roots.hearth.clone();
+    let config_path = config_dir.join("config.toml");
+
+    // Load config from the validated path.
+    let mut config = HearthConfig::load_from(&config_path).context("Failed to load config")?;
 
     // Ensure directories exist before any engine registration. DB engines
     // expect `run/` and `data/` to be present on first start; pre-creating
     // them once per daemon boot keeps the wrapper scripts simple.
-    let config_dir = hearth_lib::config_dir();
     std::fs::create_dir_all(hearth_lib::run_dir())?;
     std::fs::create_dir_all(hearth_lib::log_dir())?;
     std::fs::create_dir_all(hearth_lib::data_dir())?;
@@ -65,16 +83,48 @@ async fn main() -> anyhow::Result<()> {
     if !dropped.is_empty() {
         info!(count = dropped.len(), "pruned stale AddedPackage entries from config");
         config.added_packages = kept;
-        if let Err(e) = config.save() {
+        if let Err(e) = config.save_to(&config_path) {
             warn!(error = %e, "failed to persist pruned config");
         }
     }
 
-    // Build supervisor with default services. Per-package supervised registration
-    // lands in Task 4 (Horizon) and Task 5 (Reverb).
+    // Capture read-only fields before wrapping config in Arc<Mutex<>>
+    let tld = config.tld.clone();
+    let dump_port = config.dump_port;
+    let mcp_port = config.mcp_port;
+
+    let config = Arc::new(Mutex::new(config));
+
+    // Shared php-config engine + boot hook: pending-journal recovery, guarded
+    // legacy INI migration, and channel reconcile run BEFORE default_services
+    // so the supervisor only ever sees reconciled state.
+    let php_engine = Arc::new(PhpConfigEngine::new(
+        Arc::clone(&config),
+        config_path.clone(),
+        config_dir.clone(),
+        provider_roots.clone(),
+        Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        std::time::Duration::from_secs(5),
+    ));
+    // Boot hard gate (F4): a failed OR hard-refused reconcile disables every
+    // PHP launch (FPM + workers) while the daemon keeps serving truthful
+    // status and non-PHP services.
+    let php_launches_enabled =
+        match hearth_lib::php::engine::require_reconciled(php_engine.boot_sync().await) {
+            Ok(_) => true,
+            Err(e) => {
+                error!(error = %e, "php-config boot reconcile failed — PHP launches disabled");
+                false
+            }
+        };
+
+    // Build supervisor with default services.
     let mut supervisor = ServiceSupervisor::new();
-    for svc in default_services(&config, &config_dir) {
-        supervisor.register(svc);
+    {
+        let cfg = config.lock().await;
+        for svc in default_services(&cfg, &config_dir, php_launches_enabled, &provider_roots) {
+            supervisor.register(svc);
+        }
     }
 
     // Valet home directories for site enumeration (Valet + Herd)
@@ -84,18 +134,15 @@ async fn main() -> anyhow::Result<()> {
     if herd_valet.exists() {
         valet_homes.push(herd_valet);
     }
-    let tld = config.tld.clone();
-
-    // Capture ports before wrapping config in Arc<Mutex<>>
-    let dump_port = config.dump_port;
-    let mcp_port = config.mcp_port;
 
     let state = Arc::new(DaemonState {
         supervisor: Arc::new(Mutex::new(supervisor)),
-        config: Arc::new(Mutex::new(config)),
+        config,
         site_manager: Arc::new(Mutex::new(SiteManager::with_homes(valet_homes, tld))),
         php_manager: Arc::new(Mutex::new(PhpManager::new(hearth_lib::config_dir()))),
         add_lock: Arc::new(Mutex::new(())),
+        php_engine,
+        config_path,
     });
 
     // Remove stale socket
@@ -138,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
     let mcp_site_manager = Arc::clone(&state.site_manager);
     let mcp_php_manager = Arc::clone(&state.php_manager);
     let mcp_config = Arc::clone(&state.config);
+    let mcp_engine = Arc::clone(&state.php_engine);
     tokio::spawn(async move {
         let mcp_server_config = StreamableHttpServerConfig::default();
 
@@ -145,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
         let sm = mcp_site_manager;
         let pm = mcp_php_manager;
         let cfg = mcp_config;
+        let engine = mcp_engine;
 
         let service: StreamableHttpService<HearthMcpServer, LocalSessionManager> =
             StreamableHttpService::new(
@@ -154,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
                         Arc::clone(&sm),
                         Arc::clone(&pm),
                         Arc::clone(&cfg),
+                        Arc::clone(&engine),
                     ))
                 },
                 Arc::new(LocalSessionManager::default()),
@@ -484,7 +534,7 @@ async fn process_request(
                     let park_path = PathBuf::from(&path);
                     if !cfg.parked_paths.contains(&park_path) {
                         cfg.parked_paths.push(park_path);
-                        if let Err(e) = cfg.save() {
+                        if let Err(e) = cfg.save_to(&state.config_path) {
                             return DaemonResponse::Error {
                                 message: format!("parked but failed to save config: {e}"),
                             };
@@ -553,42 +603,12 @@ async fn process_request(
         }
 
         DaemonRequest::PhpConfig { version, key, value } => {
-            // Lock ordering: config -> php_manager -> supervisor
-            let resolved_version = {
-                let cfg = state.config.lock().await;
-                if version == "active" {
-                    cfg.default_php.clone()
-                } else {
-                    version
-                }
-            };
-            // Drop config lock before acquiring php_manager
-
-            {
-                let pm = state.php_manager.lock().await;
-                if let Err(e) = pm.set_ini_value(&resolved_version, &key, &value) {
-                    return DaemonResponse::Error { message: e.to_string() };
-                }
-            }
-            // Drop php_manager lock before acquiring supervisor
-
-            let mut sup = state.supervisor.lock().await;
-            // Restart PHP-FPM to pick up INI changes
-            if let Err(e) = sup.stop_service(hearth_lib::service::ServiceKind::PhpFpm) {
-                return DaemonResponse::Error {
-                    message: format!("INI updated but php-fpm stop failed: {e}"),
-                };
-            }
-            if let Err(e) = sup.start_service(hearth_lib::service::ServiceKind::PhpFpm) {
-                return DaemonResponse::Error {
-                    message: format!("INI updated but php-fpm restart failed: {e}"),
-                };
-            }
-
-            DaemonResponse::Ok {
-                message: Some(format!("Set {key}={value} for PHP {resolved_version} and restarted php-fpm")),
-            }
+            // Legacy protocol window: mapped to a V2 Set, answered with a
+            // legacy Ok/Error response (old CLIs keep working).
+            php_config::php_config_legacy(state, version, key, value).await
         }
+
+        DaemonRequest::PhpConfigV2 { action } => php_config::php_config(state, action).await,
 
         DaemonRequest::DbStart { engine } => {
             db_start(state, engine).await
@@ -640,7 +660,13 @@ async fn process_request(
                 default_php: default_php_clone,
                 ..HearthConfig::default()
             };
-            let config_dir = hearth_lib::config_dir();
+            // B5-2: derive from the boot-validated snapshot (config_path),
+            // never a second raw config_dir() read.
+            let config_dir = state
+                .config_path
+                .parent()
+                .expect("config.toml path always has a parent directory")
+                .to_path_buf();
             let ctx_resolution = {
                 let sm = state.site_manager.lock().await;
                 let explicit: Option<&std::path::Path> = if site_path.is_empty() {
@@ -668,6 +694,22 @@ async fn process_request(
             // Build the per-request log file path so the CLI can `tail -f` it.
             let log_path = hearth_lib::log_dir().join(format!("add-{package}.log"));
 
+            // Pre-launch reconcile, HARD-GATED (F4): composer/artisan must
+            // never run against unreconciled channel state. Probe cache makes
+            // a repeat call cheap.
+            if !dry_run
+                && let Err(e) = hearth_lib::php::engine::require_reconciled(
+                    state
+                        .php_engine
+                        .apply(hearth_lib::socket::PhpConfigAction::Sync)
+                        .await,
+                )
+            {
+                return DaemonResponse::Error {
+                    message: format!("hearth add {package}: {e}"),
+                };
+            }
+
             let recipe_ctx = hearth_lib::add::recipe::RecipeContext {
                 site_path: site_ctx.site.path.clone(),
                 site_name: site_ctx.site.name.clone(),
@@ -676,6 +718,11 @@ async fn process_request(
                 no_supervise,
                 dry_run,
                 log_path: Some(log_path),
+                php_version: Some(site_ctx.php_version.clone()),
+                scan_env: Some(hearth_lib::php::scan_dir_env(
+                    &config_dir,
+                    &site_ctx.php_version,
+                )),
                 now: chrono::Utc::now(),
             };
 
@@ -706,6 +753,15 @@ async fn process_request(
                 // Multi-site check + persist under config lock. v0.3.0 ships single-instance
                 // Horizon and Reverb; multi-site is v0.3.1.
                 let now = chrono::Utc::now();
+                let pkg = AddedPackage {
+                    package: spec.package.clone(),
+                    site_path: spec.cwd.clone(),
+                    site_name: spec.site_name.clone(),
+                    command: spec.command.clone(),
+                    args: spec.args.clone(),
+                    php_version: spec.php_version.clone(),
+                    installed_at: now,
+                };
                 {
                     let mut cfg = state.config.lock().await;
                     let existing_other_site = cfg.added_packages.iter().find(|p| {
@@ -723,15 +779,8 @@ async fn process_request(
                     // Remove an existing same-site entry (idempotent re-run) before pushing.
                     cfg.added_packages
                         .retain(|p| !(p.package == spec.package && p.site_name == spec.site_name));
-                    cfg.added_packages.push(AddedPackage {
-                        package: spec.package.clone(),
-                        site_path: spec.cwd.clone(),
-                        site_name: spec.site_name.clone(),
-                        command: spec.command.clone(),
-                        args: spec.args.clone(),
-                        installed_at: now,
-                    });
-                    if let Err(e) = cfg.save() {
+                    cfg.added_packages.push(pkg.clone());
+                    if let Err(e) = cfg.save_to(&state.config_path) {
                         return DaemonResponse::Error {
                             message: format!(
                                 "recipe ran but failed to persist AddedPackage: {e}"
@@ -743,12 +792,13 @@ async fn process_request(
 
                 if !no_supervise {
                     let mut sup = state.supervisor.lock().await;
-                    let svc = ManagedService::with_cwd_and_site(
+                    // Same constructor as boot rehydration — worker gets the
+                    // Belt-E scan-dir env for its resolved PHP version.
+                    let svc = hearth_lib::service::manager::worker_service(
                         kind,
-                        spec.command.clone(),
-                        spec.args.clone(),
-                        spec.cwd.clone(),
-                        spec.site_name.clone(),
+                        &pkg,
+                        &config_dir,
+                        state.php_engine.provider_roots(),
                     );
                     sup.register(svc);
                     if let Err(e) = sup.start_service(kind) {
@@ -768,57 +818,19 @@ async fn process_request(
         }
 
         DaemonRequest::PhpSwitch { version } => {
-            let config_dir = hearth_lib::config_dir();
-
-            // Resolve the new PHP-FPM binary (no lock needed)
-            let fpm_binary = match hearth_lib::php::resolver::resolve_phpfpm_binary(&version, &config_dir) {
-                Some(path) => path,
-                None => {
-                    return DaemonResponse::Error {
-                        message: format!("PHP {version} php-fpm binary not found"),
-                    };
-                }
-            };
-
-            // Lock ordering: config first, then supervisor
+            // Shared switch path (engine-injected paths, hard-gated reconcile,
+            // FPM service rebuilt with the new version's env — F3/F4).
+            match hearth_lib::php::engine::switch_php_version(
+                &state.supervisor,
+                &state.php_engine,
+                &version,
+            )
+            .await
             {
-                let mut cfg = state.config.lock().await;
-                cfg.default_php = version.clone();
-                if let Err(e) = cfg.save() {
-                    return DaemonResponse::Error {
-                        message: format!("failed to save config: {e}"),
-                    };
-                }
-            }
-            // Drop config lock before acquiring supervisor
-
-            let mut sup = state.supervisor.lock().await;
-
-            // Stop current PHP-FPM
-            let _ = sup.stop_service(hearth_lib::service::ServiceKind::PhpFpm);
-
-            // Reconfigure with new binary
-            sup.reconfigure_service(
-                hearth_lib::service::ServiceKind::PhpFpm,
-                fpm_binary.to_string_lossy().to_string(),
-                vec![
-                    "--nodaemonize".to_string(),
-                    format!(
-                        "--fpm-config={}",
-                        config_dir.join("fpm/php-fpm.conf").display()
-                    ),
-                ],
-            );
-
-            // Start new PHP-FPM
-            if let Err(e) = sup.start_service(hearth_lib::service::ServiceKind::PhpFpm) {
-                return DaemonResponse::Error {
-                    message: format!("failed to start php-fpm {version}: {e}"),
-                };
-            }
-
-            DaemonResponse::Ok {
-                message: Some(format!("Switched to PHP {version}")),
+                Ok(message) => DaemonResponse::Ok {
+                    message: Some(message),
+                },
+                Err(message) => DaemonResponse::Error { message },
             }
         }
     }

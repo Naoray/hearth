@@ -56,7 +56,23 @@ pub fn vendor_path_for(package: &str) -> String {
 /// When Herd is detected, nginx/php-fpm/dnsmasq are skipped — Herd
 /// manages those. Hearth only registers its own services (Mailpit, etc.).
 /// The dump server and MCP server are Tokio tasks, not supervised processes.
-pub fn default_services(config: &HearthConfig, config_dir: &std::path::Path) -> Vec<ManagedService> {
+///
+/// `php_launches_enabled = false` (daemon boot after a HARD php-config
+/// reconciliation failure) skips every PHP process registration — FPM and
+/// Horizon/Reverb workers — so no PHP launches with unreconciled channel
+/// state; non-PHP services and status access stay available.
+///
+/// B5-4: `roots` is the caller's already-validated `ProviderRoots` snapshot
+/// (the same value the PHP engine holds). This function performs NO root
+/// detection of its own — a root-construction failure must propagate at the
+/// entrypoint before any PHP/FPM/worker registration, never degrade into a
+/// warning plus a partial service list.
+pub fn default_services(
+    config: &HearthConfig,
+    config_dir: &std::path::Path,
+    php_launches_enabled: bool,
+    roots: &crate::php::targets::ProviderRoots,
+) -> Vec<ManagedService> {
     let mut services = Vec::new();
 
     if is_herd_running() {
@@ -87,17 +103,14 @@ pub fn default_services(config: &HearthConfig, config_dir: &std::path::Path) -> 
                 ),
             ],
         ));
-        services.push(ManagedService::new(
-            ServiceKind::PhpFpm,
-            "php-fpm".to_string(),
-            vec![
-                "--nodaemonize".to_string(),
-                format!(
-                    "--fpm-config={}",
-                    config_dir.join("fpm/php-fpm.conf").display()
-                ),
-            ],
-        ));
+        if php_launches_enabled {
+            match hearth_fpm_service(&config.default_php, config_dir) {
+                Ok(svc) => services.push(svc),
+                Err(reason) => warn!(reason = %reason, "php-fpm not registered"),
+            }
+        } else {
+            warn!("php launches disabled (hard php-config failure) — php-fpm not registered");
+        }
     }
 
     // Mailpit — only if binary is found
@@ -173,22 +186,102 @@ pub fn default_services(config: &HearthConfig, config_dir: &std::path::Path) -> 
 
     // Supervised AddedPackage entries (Horizon, Reverb). Boot-time prune already ran
     // before this is called (see daemon main.rs), so every entry here has a vendor dir.
-    for pkg in &config.added_packages {
-        let kind = match pkg.package.as_str() {
-            "horizon" => ServiceKind::Horizon,
-            "reverb" => ServiceKind::Reverb,
-            _ => continue, // telescope/pulse are install-only
-        };
-        services.push(ManagedService::with_cwd_and_site(
-            kind,
-            pkg.command.clone(),
-            pkg.args.clone(),
-            pkg.site_path.clone(),
-            pkg.site_name.clone(),
-        ));
+    if php_launches_enabled {
+        for pkg in &config.added_packages {
+            let kind = match pkg.package.as_str() {
+                "horizon" => ServiceKind::Horizon,
+                "reverb" => ServiceKind::Reverb,
+                _ => continue, // telescope/pulse are install-only
+            };
+            services.push(worker_service(kind, pkg, config_dir, roots));
+        }
+    } else if !config.added_packages.is_empty() {
+        warn!("php launches disabled (hard php-config failure) — workers not registered");
     }
 
     services
+}
+
+/// Build Hearth's own supervised php-fpm service for one PHP version, or a
+/// truthful skip reason. Registration requires BOTH a resolvable binary and a
+/// generated fpm config; a missing config is launch-blocked (generation is
+/// todo #2343) and must never surface as a supervisor start failure. Takes
+/// the version directly so version-switch paths build the NEW version's
+/// service — binary, args, AND scan-dir env — from scratch.
+pub fn hearth_fpm_service(
+    version: &str,
+    config_dir: &std::path::Path,
+) -> Result<ManagedService, String> {
+    let Some(binary) =
+        crate::php::resolver::resolve_phpfpm_binary(version, &config_dir.to_path_buf())
+    else {
+        return Err(format!(
+            "php-fpm binary for {version} not found — skipping registration"
+        ));
+    };
+    let fpm_conf = config_dir.join("fpm/php-fpm.conf");
+    if !fpm_conf.is_file() {
+        return Err("launch-blocked: missing fpm config — see todo #2343".to_string());
+    }
+    Ok(ManagedService::new(
+        ServiceKind::PhpFpm,
+        binary.to_string_lossy().to_string(),
+        vec![
+            "--nodaemonize".to_string(),
+            format!("--fpm-config={}", fpm_conf.display()),
+        ],
+    )
+    .with_env(vec![crate::php::scan_dir_env(config_dir, version)]))
+}
+
+/// Supervised worker with Belt-E scan-dir env when its PHP version is known.
+/// Used by BOTH worker registration sites (boot rehydration here, and the
+/// daemon's add-time registration). Legacy entries without a version get one
+/// inferred ONLY when the stored command equals a discovered target's
+/// canonical binary; otherwise the worker spawns env-unguaranteed (loud warn,
+/// never a wrong env credit).
+pub fn worker_service(
+    kind: ServiceKind,
+    pkg: &AddedPackage,
+    config_dir: &std::path::Path,
+    roots: &crate::php::targets::ProviderRoots,
+) -> ManagedService {
+    let svc = ManagedService::with_cwd_and_site(
+        kind,
+        pkg.command.clone(),
+        pkg.args.clone(),
+        pkg.site_path.clone(),
+        pkg.site_name.clone(),
+    );
+    let version = pkg
+        .php_version
+        .clone()
+        .or_else(|| infer_worker_version(&pkg.command, roots));
+    match version {
+        Some(version) => svc.with_env(vec![crate::php::scan_dir_env(config_dir, &version)]),
+        None => {
+            warn!(
+                package = %pkg.package,
+                command = %pkg.command,
+                "worker PHP version unknown and command matches no discovered \
+                 PHP binary — spawning without scan-dir env (unguaranteed)",
+            );
+            svc
+        }
+    }
+}
+
+/// Infer a legacy worker's PHP version from its stored command path — only an
+/// exact canonical-binary match counts (plan 5560 §2.4 provenance rule).
+fn infer_worker_version(
+    command: &str,
+    roots: &crate::php::targets::ProviderRoots,
+) -> Option<String> {
+    let canonical = std::path::Path::new(command).canonicalize().ok()?;
+    crate::php::targets::discover_provider_targets(roots)
+        .into_iter()
+        .find(|id| id.binary == canonical)
+        .map(|id| id.version)
 }
 
 #[cfg(test)]
@@ -210,7 +303,7 @@ mod tests {
         std::fs::write(&bin_path, "fake").unwrap();
 
         let config = HearthConfig::default();
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(kinds.contains(&ServiceKind::Mailpit));
@@ -220,7 +313,7 @@ mod tests {
     fn default_services_excludes_mailpit_when_binary_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = HearthConfig::default();
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(!kinds.contains(&ServiceKind::Mailpit));
@@ -248,7 +341,7 @@ mod tests {
             postgres_port: free_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(
             kinds.contains(&ServiceKind::Postgresql),
@@ -279,7 +372,7 @@ mod tests {
             mysql_port: free_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(kinds.contains(&ServiceKind::Mysql), "got: {kinds:?}");
     }
@@ -296,7 +389,7 @@ mod tests {
             mysql_port: busy_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         drop(listener);
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
@@ -316,7 +409,7 @@ mod tests {
             redis_port: free_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(kinds.contains(&ServiceKind::Redis), "got: {kinds:?}");
     }
@@ -332,7 +425,7 @@ mod tests {
             redis_port: busy_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         drop(listener);
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
@@ -352,7 +445,7 @@ mod tests {
             postgres_port: busy_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         drop(listener);
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
@@ -387,6 +480,7 @@ mod tests {
                 site_name: "kept".to_string(),
                 command: "/php".to_string(),
                 args: vec!["artisan".to_string(), "horizon".to_string()],
+                php_version: None,
                 installed_at: now,
             },
             AddedPackage {
@@ -395,6 +489,7 @@ mod tests {
                 site_name: "gone".to_string(),
                 command: "/php".to_string(),
                 args: vec!["artisan".to_string(), "horizon".to_string()],
+                php_version: None,
                 installed_at: now,
             },
         ];
@@ -422,10 +517,11 @@ mod tests {
             site_name: "shopfront".to_string(),
             command: "/php".to_string(),
             args: vec!["artisan".to_string(), "horizon".to_string()],
+            php_version: None,
             installed_at: chrono::Utc::now(),
         });
 
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         let horizon = services
             .iter()
             .find(|s| s.kind == ServiceKind::Horizon)
@@ -444,11 +540,224 @@ mod tests {
             site_name: "blog".to_string(),
             command: String::new(),
             args: vec![],
+            php_version: None,
             installed_at: chrono::Utc::now(),
         });
 
-        let services = default_services(&config, tmp.path());
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         assert!(services.iter().all(|s| s.kind != ServiceKind::Horizon));
         assert!(services.iter().all(|s| s.kind != ServiceKind::Reverb));
+    }
+
+    #[test]
+    fn php_disabled_skips_fpm_and_workers_keeps_others() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Mailpit present so a non-PHP service would register.
+        let bin_path = tmp.path().join("services/mailpit/mailpit");
+        std::fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
+        std::fs::write(&bin_path, "fake").unwrap();
+        // Launchable FPM + a worker entry that WOULD register.
+        write_fake_fpm(tmp.path(), "8.4");
+        std::fs::create_dir_all(tmp.path().join("fpm")).unwrap();
+        std::fs::write(tmp.path().join("fpm/php-fpm.conf"), "; fpm").unwrap();
+        let mut config = HearthConfig::default();
+        config.added_packages.push(AddedPackage {
+            package: "horizon".to_string(),
+            site_path: tmp.path().to_path_buf(),
+            site_name: "s".to_string(),
+            command: "/php".to_string(),
+            args: vec!["artisan".to_string(), "horizon".to_string()],
+            php_version: Some("8.4".to_string()),
+            installed_at: chrono::Utc::now(),
+        });
+
+        let services = default_services(&config, tmp.path(), false, &test_roots(tmp.path()));
+        let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
+        assert!(!kinds.contains(&ServiceKind::PhpFpm), "got: {kinds:?}");
+        assert!(!kinds.contains(&ServiceKind::Horizon), "got: {kinds:?}");
+        assert!(kinds.contains(&ServiceKind::Mailpit), "got: {kinds:?}");
+    }
+
+    fn write_fake_fpm(config_dir: &std::path::Path, version: &str) -> std::path::PathBuf {
+        let dir = config_dir.join("php").join(version);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("php-fpm");
+        std::fs::write(&bin, "fake").unwrap();
+        bin
+    }
+
+    #[test]
+    fn fpm_uses_resolved_binary_and_scan_env() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_dir = tmp.path();
+        let bin = write_fake_fpm(config_dir, "8.4");
+        std::fs::create_dir_all(config_dir.join("fpm")).unwrap();
+        std::fs::write(config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
+
+        let svc = hearth_fpm_service("8.4", config_dir).expect("fpm should register");
+        assert_eq!(
+            svc.env(),
+            &[(
+                "PHP_INI_SCAN_DIR".to_string(),
+                format!(":{}", config_dir.join("php/8.4/conf.d").display()),
+            )]
+        );
+        // Resolved absolute binary, never bare PATH "php-fpm".
+        assert_eq!(svc.command(), bin.display().to_string());
+        assert_eq!(svc.display_name(), "php-fpm");
+    }
+
+    #[test]
+    fn fpm_skipped_and_launch_blocked_when_conf_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fake_fpm(tmp.path(), "8.4");
+        // No fpm/php-fpm.conf generated (that is todo #2343's job).
+        let err = match hearth_fpm_service("8.4", tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected launch-blocked skip"),
+        };
+        assert!(err.contains("launch-blocked"), "got: {err}");
+        assert!(err.contains("#2343"), "got: {err}");
+    }
+
+    #[test]
+    fn fpm_skipped_when_unresolvable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("fpm")).unwrap();
+        std::fs::write(tmp.path().join("fpm/php-fpm.conf"), "; fpm").unwrap();
+        let err = match hearth_fpm_service("7.4", tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected unresolvable skip"),
+        };
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    fn test_roots(base: &std::path::Path) -> crate::php::targets::ProviderRoots {
+        crate::php::targets::ProviderRoots::isolated(
+            base,
+            base.join("hearth"),
+            base.join("herd"),
+            base.join("homebrew"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn worker_env_injected_at_boot_and_add_registration() {
+        // worker_service is the single constructor used by BOTH registration
+        // sites (manager boot loop + daemon add-arm).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pkg = AddedPackage {
+            package: "horizon".to_string(),
+            site_path: tmp.path().to_path_buf(),
+            site_name: "shopfront".to_string(),
+            command: "/php".to_string(),
+            args: vec!["artisan".to_string(), "horizon".to_string()],
+            php_version: Some("8.3".to_string()),
+            installed_at: chrono::Utc::now(),
+        };
+        let roots = test_roots(tmp.path());
+        let svc = worker_service(ServiceKind::Horizon, &pkg, tmp.path(), &roots);
+        assert_eq!(
+            svc.env(),
+            &[(
+                "PHP_INI_SCAN_DIR".to_string(),
+                format!(":{}", tmp.path().join("php/8.3/conf.d").display()),
+            )]
+        );
+        assert_eq!(svc.site_name(), Some("shopfront"));
+    }
+
+    #[test]
+    fn legacy_added_package_inferred_only_on_canonical_match_else_unguaranteed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let roots = test_roots(&base);
+        // A discoverable Herd 8.4 CLI binary.
+        let herd_bin = roots.herd.join("bin");
+        std::fs::create_dir_all(&herd_bin).unwrap();
+        let php84 = herd_bin.join("php84");
+        std::fs::write(&php84, "fake").unwrap();
+
+        let mut pkg = AddedPackage {
+            package: "horizon".to_string(),
+            site_path: base.clone(),
+            site_name: "legacy".to_string(),
+            command: php84.display().to_string(),
+            args: vec!["artisan".to_string(), "horizon".to_string()],
+            php_version: None,
+            installed_at: chrono::Utc::now(),
+        };
+        // Canonical match → version inferred → env granted.
+        let svc = worker_service(ServiceKind::Horizon, &pkg, &base, &roots);
+        assert_eq!(
+            svc.env(),
+            &[(
+                "PHP_INI_SCAN_DIR".to_string(),
+                format!(":{}", base.join("php/8.4/conf.d").display()),
+            )]
+        );
+
+        // No canonical match → unguaranteed: NO env, never a guess.
+        pkg.command = base.join("somewhere-else/php").display().to_string();
+        let svc = worker_service(ServiceKind::Horizon, &pkg, &base, &roots);
+        assert!(
+            svc.env().is_empty(),
+            "unmatched legacy command must not get env credit"
+        );
+    }
+
+    #[test]
+    fn root_failure_can_never_register_php_workers() {
+        // B5-4 (red reproduced live at 224621f: a lone HEARTH_HERD_ROOT made
+        // the internal detect() fail, and default_services still registered
+        // the Horizon worker behind a warning). Post-fix: default_services
+        // performs NO root detection of its own — the entrypoint's
+        // `ProviderRoots::detect()?` propagates the typed error BEFORE any
+        // registration, and service construction consumes only the passed
+        // validated snapshot, immune to poisoned root env.
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_CONFIG_DIR");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        // A lone discovery override makes ProviderRoots::detect() fail closed.
+        guard.set("HEARTH_HERD_ROOT", "/tmp/lone-override");
+        assert!(
+            crate::php::targets::ProviderRoots::detect().is_err(),
+            "the entrypoint gate is a typed error — never a warning"
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = HearthConfig::default();
+        config.added_packages.push(AddedPackage {
+            package: "horizon".to_string(),
+            site_path: tmp.path().to_path_buf(),
+            site_name: "shopfront".to_string(),
+            command: "/php".to_string(),
+            args: vec!["artisan".to_string(), "horizon".to_string()],
+            php_version: Some("8.3".to_string()),
+            installed_at: chrono::Utc::now(),
+        });
+        // With an explicit validated snapshot the worker registers with its
+        // Belt-E env — proof no second (env-driven) detection remains.
+        let roots = test_roots(tmp.path());
+        let services = default_services(&config, tmp.path(), true, &roots);
+        let worker = services
+            .iter()
+            .find(|s| s.kind == crate::service::ServiceKind::Horizon)
+            .expect("explicit snapshot registers the worker regardless of ambient env");
+        assert_eq!(
+            worker.env(),
+            &[(
+                "PHP_INI_SCAN_DIR".to_string(),
+                format!(":{}", tmp.path().join("php/8.3/conf.d").display()),
+            )]
+        );
+        drop(guard);
     }
 }

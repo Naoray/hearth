@@ -6,8 +6,17 @@
 //! Homebrew php@8.5 are co-installed realities, not duplicates).
 //!
 //! Probing runs the real binary (`--ini` for CLI, `-i` for FPM — php-fpm has
-//! no `--ini`) in two env contexts plus an env-honor canary, because
-//! Herd-patched binaries ignore `PHP_INI_SCAN_DIR` whenever `HOME` is set.
+//! no `--ini`) in two env contexts plus an env-honor canary. The canary is
+//! load-bearing because scan behavior is launcher-environment-dependent:
+//! machine ground truth (2026-07-18, exact binary hashes in PR #26) shows
+//! Herd-patched binaries ignore `PHP_INI_SCAN_DIR` whenever their own
+//! `HERD_PHP_XY_INI_SCAN_DIR` variable is present (Herd's shell integration
+//! exports it), and honor it — including leading-colon append, marker parsed
+//! last and winning — when that variable is absent, in which case their
+//! compiled default scan dir is the privileged `/usr/local/etc/php/conf.d`.
+//! `HOME` is NOT the trigger. Classification therefore never assumes
+//! provider folklore; it reports whatever the probes observe in the actual
+//! launch context.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -43,8 +52,10 @@ pub struct ProbeInfo {
     pub normal_scan_dir: Option<PathBuf>,
     /// `env_clear` + `PATH=/usr/bin:/bin`.
     pub sanitized_scan_dir: Option<PathBuf>,
-    /// Env-honor canary result: does the binary honor `PHP_INI_SCAN_DIR`
-    /// under a normal (HOME-bearing) environment? Herd-patched binaries do not.
+    /// Env-honor canary result: does the binary FUNCTIONALLY honor
+    /// `PHP_INI_SCAN_DIR` under the normal (daemon) environment — marker ini
+    /// actually parsed? Herd-patched binaries do not when their
+    /// `HERD_PHP_XY_INI_SCAN_DIR` launcher variable is present.
     pub env_honored: bool,
     /// Probe failures (timeout, spawn error) — classification degrades these
     /// to BestEffort instead of guessing.
@@ -62,6 +73,17 @@ pub enum ChannelClass {
     BestEffort { reason: String },
 }
 
+// Round-4 locked design (review 5594 rev4, brief 5625): ambient/external FPM
+// observation can NEVER produce verified evidence, a managed row, or a write
+// target in Stage B — the daemon's own inherited shell environment was never
+// evidence for an external process, and no observable launch context is
+// authenticatable from outside. The former `ExternalFpmEvidence`/
+// `VerifiedExternalFpm` types, the process detector, and the evaluator were
+// DELETED so that argv masquerade, mutable titles, ambiguous executable
+// records, duplicate candidates, PID reuse, and stale evidence cannot grant
+// authority by construction — there is no ambient authority source to attack.
+// Authoritative Hearth-generated FPM ownership is todo #2343.
+
 /// A discovered PHP target with probe results and per-context classification.
 #[derive(Debug, Clone)]
 pub struct PhpTarget {
@@ -69,7 +91,9 @@ pub struct PhpTarget {
     pub probe: ProbeInfo,
     pub normal_channel: ChannelClass,
     pub sanitized_channel: ChannelClass,
-    /// `Some` iff a Verified channel may receive `zz-hearth.ini`.
+    /// `Some` iff a Verified channel may receive `zz-hearth.ini`. Always
+    /// `None` for ambient-provider FPM targets (round-4 locked design:
+    /// external FPM never authorizes writes in Stage B).
     pub write_channel: Option<PathBuf>,
 }
 
@@ -86,32 +110,338 @@ pub struct ProviderRoots {
     pub herd: PathBuf,
     /// Homebrew prefix (contains `opt/php@{v}/…` and `etc/php/{v}/conf.d`).
     pub homebrew: PathBuf,
+    /// Immutable allowed WRITE roots (review 5594 B2-4). Discovery roots
+    /// NEVER imply write authority: production is fixed to the Hearth config
+    /// dir, the user's home scope, and `/opt/homebrew`; an explicitly
+    /// constructed isolated runtime is confined to its runtime root. Not
+    /// derivable from lone environment overrides.
+    allowed_write_roots: Vec<PathBuf>,
 }
 
 impl ProviderRoots {
-    /// Production roots.
-    pub fn detect() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        Self {
-            hearth: crate::config_dir(),
-            herd: home.join("Library/Application Support/Herd"),
-            homebrew: PathBuf::from("/opt/homebrew"),
+    /// Runtime detection with fail-closed override semantics (B2-4):
+    ///
+    /// - No overrides → production: real Hearth/Herd/Homebrew discovery
+    ///   roots and the IMMUTABLE production write allowlist (Hearth config
+    ///   dir, user home scope, `/opt/homebrew`).
+    /// - `HEARTH_ISOLATED_ROOT` set → typed isolated mode via
+    ///   [`ProviderRoots::isolated`]: `HEARTH_CONFIG_DIR` and any provider
+    ///   overrides must live beneath that root; write authority is confined
+    ///   to it.
+    /// - A lone `HEARTH_HERD_ROOT`/`HEARTH_HOMEBREW_ROOT` without
+    ///   `HEARTH_ISOLATED_ROOT` is an error — a discovery override can never
+    ///   silently alter production behavior or enlarge write authority.
+    pub fn detect() -> Result<Self, String> {
+        Self::detect_with_home(dirs::home_dir())
+    }
+
+    /// Injectable home resolution (review 5594 B3-2): HOME-unavailable
+    /// behavior is deterministic and fail-closed — there is NO fallback root.
+    pub fn detect_with_home(home: Option<PathBuf>) -> Result<Self, String> {
+        // Distinguish "absent" from "present but invalid": every PRESENT
+        // override is validated; empty/relative values are errors, never
+        // silently unset/defaulted.
+        let read_override = |name: &str| -> Result<Option<PathBuf>, String> {
+            match std::env::var_os(name) {
+                None => Ok(None),
+                Some(v) if v.is_empty() => Err(format!(
+                    "{name} is set but empty — unset it or point it at an absolute path"
+                )),
+                Some(v) => {
+                    let path = PathBuf::from(v);
+                    if !path.is_absolute() {
+                        return Err(format!(
+                            "{name} must be an absolute path, got {}",
+                            path.display()
+                        ));
+                    }
+                    Ok(Some(path))
+                }
+            }
+        };
+        let herd_override = read_override("HEARTH_HERD_ROOT")?;
+        let brew_override = read_override("HEARTH_HOMEBREW_ROOT")?;
+
+        match std::env::var_os("HEARTH_ISOLATED_ROOT") {
+            Some(root) => {
+                if root.is_empty() {
+                    return Err("HEARTH_ISOLATED_ROOT is set but empty".to_string());
+                }
+                let root = PathBuf::from(root);
+                if !root.is_absolute() {
+                    return Err(format!(
+                        "HEARTH_ISOLATED_ROOT must be absolute, got {}",
+                        root.display()
+                    ));
+                }
+                let hearth = crate::config_dir();
+                let herd = herd_override.unwrap_or_else(|| root.join("herd"));
+                let homebrew = brew_override.unwrap_or_else(|| root.join("homebrew"));
+                Self::isolated(&root, hearth, herd, homebrew)
+            }
+            None => {
+                if herd_override.is_some() || brew_override.is_some() {
+                    return Err(
+                        "HEARTH_HERD_ROOT/HEARTH_HOMEBREW_ROOT are test/smoke discovery \
+                         overrides and require HEARTH_ISOLATED_ROOT — refusing to alter \
+                         production provider discovery or write authority"
+                            .to_string(),
+                    );
+                }
+                let home = home.ok_or_else(|| {
+                    "cannot resolve the user home directory — refusing to construct a \
+                     production write allowlist (fail closed)"
+                        .to_string()
+                })?;
+                Self::production_checked(home)
+            }
         }
     }
 
-    /// Canonicalized channel-verification allowlist derived from the roots
-    /// (all under `$HOME` or `/opt/homebrew` in production).
+    fn production_checked(home: PathBuf) -> Result<Self, String> {
+        // B4-2: canonicalize-and-validate FIRST. A HOME that is missing, a
+        // file, `/`, or a symlink alias of `/`/denylisted roots fails closed
+        // with no allowlist constructed.
+        let home = canonical_allowed_root("home", &home).map_err(|e| {
+            format!("{e} — refusing to construct a production write allowlist (fail closed)")
+        })?;
+        // B5-2 locked root model: production Hearth config authority is the
+        // FIXED HOME-derived default — never an environment-selected path.
+        let default_hearth = home.join("Library/Application Support/hearth");
+        let hearth = validated_root_under("hearth config", &home, &default_hearth, true, true)?;
+        // A present HEARTH_CONFIG_DIR without typed isolated mode may never
+        // select another production authority root: it must validate to
+        // exactly the fixed default.
+        if let Some(v) = std::env::var_os("HEARTH_CONFIG_DIR") {
+            if v.is_empty() {
+                return Err("HEARTH_CONFIG_DIR is set but empty — unset it, or use \
+                     HEARTH_ISOLATED_ROOT for isolated runtimes"
+                    .to_string());
+            }
+            let override_path = PathBuf::from(v);
+            let normalized =
+                validated_root_under("HEARTH_CONFIG_DIR", &home, &override_path, true, true)
+                    .map_err(|e| {
+                        format!(
+                            "{e} — production accepts HEARTH_CONFIG_DIR only when it is exactly \
+                     the default config dir; use HEARTH_ISOLATED_ROOT for isolated runtimes"
+                        )
+                    })?;
+            if normalized != hearth {
+                return Err(format!(
+                    "HEARTH_CONFIG_DIR {} does not match the fixed production config dir \
+                     {} — an environment override can never select another production \
+                     write authority; use HEARTH_ISOLATED_ROOT for isolated runtimes",
+                    override_path.display(),
+                    hearth.display()
+                ));
+            }
+        }
+        let mut allowed_write_roots = vec![hearth.clone(), home.clone()];
+        // Homebrew authority only when the canonical /opt/homebrew scope
+        // actually exists; its absence removes authority, never widens it.
+        if let Ok(brew) = canonical_allowed_root("homebrew", Path::new("/opt/homebrew")) {
+            allowed_write_roots.push(brew);
+        }
+        Ok(Self {
+            // Provider discovery roots derive from the validated canonical
+            // HOME boundary.
+            herd: home.join("Library/Application Support/Herd"),
+            homebrew: PathBuf::from("/opt/homebrew"),
+            allowed_write_roots,
+            hearth,
+        })
+    }
+
+    /// Explicit typed isolated-runtime constructor (tests/smoke). The runtime
+    /// root must canonicalize to an existing directory that is neither `/`
+    /// nor denylisted; every provider/config root is validated through
+    /// [`validated_root_under`] against that exact canonical boundary and
+    /// stored ONLY in its validated normalized form (B5-3: no raw input
+    /// retention, no traversal components, no `canonicalize().unwrap_or`).
+    /// Write authority is exactly `runtime_root` and nothing else.
+    pub fn isolated(
+        runtime_root: &Path,
+        hearth: PathBuf,
+        herd: PathBuf,
+        homebrew: PathBuf,
+    ) -> Result<Self, String> {
+        let canonical_root = canonical_allowed_root("isolated runtime", runtime_root)?;
+        let hearth = validated_root_under("isolated hearth", &canonical_root, &hearth, true, true)?;
+        let herd = validated_root_under("isolated herd", &canonical_root, &herd, true, true)?;
+        let homebrew =
+            validated_root_under("isolated homebrew", &canonical_root, &homebrew, true, true)?;
+        Ok(Self {
+            hearth,
+            herd,
+            homebrew,
+            allowed_write_roots: vec![canonical_root],
+        })
+    }
+
+    /// Canonicalized allowed WRITE prefixes. Immutable per construction:
+    /// production = Hearth config dir + `$HOME` + `/opt/homebrew`; isolated
+    /// = the isolated runtime root only. Discovery-root overrides never
+    /// appear here.
     pub fn allowed_prefixes(&self) -> Vec<PathBuf> {
-        [&self.hearth, &self.herd, &self.homebrew]
-            .into_iter()
-            .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
-            .collect()
+        // Stored roots are already canonical-validated at construction
+        // (B4-2); no later canonicalization may expand authority here.
+        self.allowed_write_roots.clone()
     }
 }
 
 /// Shared root-owned, version-blind fallback scan dir — hard-denylisted:
 /// never written, never verified, always `PrivilegedDir`.
 const PRIVILEGED_PREFIX: &str = "/usr/local/etc/php";
+
+/// Canonical allowed-root invariant (review 5594 B4-2) — the ONE constructor
+/// every allowed write prefix goes through: the path must be non-empty,
+/// absolute, canonicalize to an EXISTING directory, and that canonical form
+/// must be neither `/` nor under the privileged denylist. Symlink aliases
+/// are resolved BEFORE the checks, so an alias of `/` or a denylisted root
+/// can never slip through. Errors propagate — no permissive fallback.
+fn canonical_allowed_root(name: &str, path: &Path) -> Result<PathBuf, String> {
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return Err(format!(
+            "{name} root must be a non-empty absolute path, got {}",
+            path.display()
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|e| {
+        format!(
+            "{name} root {} must exist and canonicalize: {e}",
+            path.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "{name} root {} is not a directory",
+            canonical.display()
+        ));
+    }
+    if canonical == Path::new("/") {
+        return Err(format!(
+            "{name} root {} resolves to `/` — `/` can never be write authority",
+            path.display()
+        ));
+    }
+    if canonical.starts_with(PRIVILEGED_PREFIX) {
+        return Err(format!(
+            "{name} root {} resolves under {PRIVILEGED_PREFIX} — denylisted",
+            path.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Round-5 (review 5594 B5-1/B5-3): THE boundary-aware constructor for every
+/// authority root that may not exist yet. The approved `boundary` is
+/// canonical-validated first; the candidate must be absolute and composed of
+/// nothing but normal components after the leading root — `..`, `.`, embedded
+/// roots, and platform prefixes can never form write authority. An existing
+/// candidate must canonicalize inside the boundary; a missing candidate is
+/// rebuilt from its canonicalized deepest EXISTING ancestor plus the
+/// validated normal-component suffix, and the rebuilt path is re-proven
+/// inside the boundary. Canonicalization failures are hard errors — never
+/// `unwrap_or(raw)` — and only the validated normalized form is returned.
+fn validated_root_under(
+    name: &str,
+    boundary: &Path,
+    candidate: &Path,
+    allow_missing: bool,
+    strict_child: bool,
+) -> Result<PathBuf, String> {
+    let boundary = canonical_allowed_root(&format!("{name} boundary"), boundary)?;
+    if candidate.as_os_str().is_empty() || !candidate.is_absolute() {
+        return Err(format!(
+            "{name} root must be a non-empty absolute path, got {}",
+            candidate.display()
+        ));
+    }
+    // Component inspection happens BEFORE any ancestor walk or filesystem
+    // access: the platform root is allowed only as the leading component.
+    for (i, comp) in candidate.components().enumerate() {
+        match comp {
+            std::path::Component::RootDir if i == 0 => {}
+            std::path::Component::Normal(_) => {}
+            other => {
+                return Err(format!(
+                    "{name} root {} contains a non-normal path component ({other:?}) — \
+                     traversal, prefix, and embedded-root components can never form \
+                     write authority",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    let validated = if candidate.exists() {
+        canonical_allowed_root(name, candidate)?
+    } else {
+        if !allow_missing {
+            return Err(format!(
+                "{name} root {} does not exist",
+                candidate.display()
+            ));
+        }
+        let mut probe = candidate.to_path_buf();
+        while !probe.exists() {
+            probe = probe
+                .parent()
+                .ok_or_else(|| {
+                    format!(
+                        "{name} root {} has no existing ancestor",
+                        candidate.display()
+                    )
+                })?
+                .to_path_buf();
+        }
+        let canonical_ancestor = canonical_allowed_root(name, &probe)?;
+        let remainder = candidate
+            .strip_prefix(&probe)
+            .map_err(|_| format!("{name} root {} escapes its ancestor", candidate.display()))?;
+        // Proven above: every candidate component after the leading root is
+        // Normal, so the missing suffix is too — re-checked defensively.
+        if remainder
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "{name} root {} has a non-normal missing-suffix component",
+                candidate.display()
+            ));
+        }
+        canonical_ancestor.join(remainder)
+    };
+    if !validated.starts_with(&boundary) {
+        return Err(format!(
+            "{name} root {} resolves to {} — not contained beneath the approved \
+             boundary {}",
+            candidate.display(),
+            validated.display(),
+            boundary.display()
+        ));
+    }
+    if strict_child && validated == boundary {
+        return Err(format!(
+            "{name} root {} must be strictly below the boundary {}",
+            candidate.display(),
+            boundary.display()
+        ));
+    }
+    if validated == Path::new("/") {
+        return Err(format!(
+            "{name} root {} resolves to `/` — `/` can never be write authority",
+            candidate.display()
+        ));
+    }
+    if validated.starts_with(PRIVILEGED_PREFIX) {
+        return Err(format!(
+            "{name} root {} resolves under {PRIVILEGED_PREFIX} — denylisted",
+            candidate.display()
+        ));
+    }
+    Ok(validated)
+}
 
 /// A directory that passed [`verify_user_channel`]. Callers re-check dev/inode
 /// identity around temp-file creation + rename (fallback for dirfd binding).
@@ -236,10 +566,11 @@ pub async fn probe_scan_dirs(binary: &Path, sapi: PhpSapi, timeout: Duration) ->
         Err(e) => info.failures.push(format!("sanitized probe: {e}")),
     }
 
-    // Env-honor canary (normal env): Herd-patched binaries ignore
-    // PHP_INI_SCAN_DIR whenever HOME is set; env credit requires FUNCTIONAL
-    // proof — the marker ini must appear in `Additional .ini files parsed`,
-    // never just an echoed scan-dir path.
+    // Env-honor canary (normal env): scan behavior is launcher-env-dependent
+    // (Herd-patched binaries ignore PHP_INI_SCAN_DIR when their
+    // HERD_PHP_XY_INI_SCAN_DIR variable is present); env credit requires
+    // FUNCTIONAL proof — the marker ini must appear in `Additional .ini
+    // files parsed`, never just an echoed scan-dir path.
     match probe_env_honor(binary, arg, timeout).await {
         Ok(true) => info.env_honored = true,
         Ok(false) => {
@@ -451,6 +782,147 @@ pub fn verify_user_channel(
     })
 }
 
+/// Create a missing Hearth-owned channel directory through the same trust
+/// rules as [`verify_user_channel`] — never called for ambient (Herd or
+/// Homebrew) channels, which must preexist.
+///
+/// Before any filesystem mutation: the target must be lexically under the
+/// Hearth root; the deepest EXISTING ancestor is walked component-by-component
+/// (each rejected if a symlink), canonicalized, re-checked against the Hearth
+/// root and the privileged denylist, and required to be a user-owned,
+/// non-group/other-writable directory. Only then are the missing components
+/// created (0755), and the final directory must still pass
+/// [`verify_user_channel`]. Every failure is returned as a typed rejection —
+/// callers surface it as a hard outcome, never a silent skip.
+pub fn ensure_hearth_channel_dir(
+    hearth_root: &Path,
+    dir: &Path,
+) -> Result<VerifiedDir, ChannelRejection> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !dir.starts_with(hearth_root) {
+        return Err(reject(format!(
+            "{} is outside the Hearth root {} — only Hearth-owned channels may be created",
+            dir.display(),
+            hearth_root.display()
+        )));
+    }
+    if dir.starts_with(PRIVILEGED_PREFIX) {
+        return Err(reject(format!(
+            "{} is under {PRIVILEGED_PREFIX} — never written by Hearth",
+            dir.display()
+        )));
+    }
+    // B5-1: the requested dir must be the Hearth root plus NORMAL components
+    // only — `..`/`.`/embedded roots are rejected BEFORE any ancestor walk
+    // or `create_dir_all`, which would otherwise resolve traversal
+    // components during creation and mutate outside the root.
+    match dir.strip_prefix(hearth_root) {
+        Ok(suffix) => {
+            if suffix
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(reject(format!(
+                    "{} contains a non-normal path component below the Hearth root — \
+                     traversal can never name a channel dir",
+                    dir.display()
+                )));
+            }
+        }
+        Err(_) => {
+            return Err(reject(format!(
+                "{} is outside the Hearth root {}",
+                dir.display(),
+                hearth_root.display()
+            )));
+        }
+    }
+
+    // Deepest existing ancestor, with every component from the Hearth root
+    // down checked against symlinks BEFORE any mutation.
+    let mut ancestor = dir.to_path_buf();
+    while !ancestor.exists() {
+        match ancestor.parent() {
+            Some(parent) => ancestor = parent.to_path_buf(),
+            None => {
+                return Err(reject(format!(
+                    "{} has no existing ancestor",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    let mut walk = hearth_root.to_path_buf();
+    let relative = ancestor.strip_prefix(hearth_root).map_err(|_| {
+        reject(format!(
+            "existing ancestor {} escapes the Hearth root {}",
+            ancestor.display(),
+            hearth_root.display()
+        ))
+    })?;
+    for component in relative.components() {
+        walk.push(component);
+        let meta = std::fs::symlink_metadata(&walk)
+            .map_err(|e| reject(format!("{}: {e}", walk.display())))?;
+        if meta.file_type().is_symlink() {
+            return Err(reject(format!(
+                "{} is a symlink — refusing to create a channel dir beneath it",
+                walk.display()
+            )));
+        }
+    }
+
+    let canonical_ancestor = ancestor
+        .canonicalize()
+        .map_err(|e| reject(format!("cannot canonicalize {}: {e}", ancestor.display())))?;
+    let canonical_root = hearth_root.canonicalize().map_err(|e| {
+        reject(format!(
+            "cannot canonicalize {}: {e}",
+            hearth_root.display()
+        ))
+    })?;
+    if !canonical_ancestor.starts_with(&canonical_root) {
+        return Err(reject(format!(
+            "existing ancestor {} resolves outside the Hearth root {}",
+            canonical_ancestor.display(),
+            canonical_root.display()
+        )));
+    }
+    if canonical_ancestor.starts_with(PRIVILEGED_PREFIX) {
+        return Err(reject(format!(
+            "existing ancestor {} resolves into {PRIVILEGED_PREFIX}",
+            canonical_ancestor.display()
+        )));
+    }
+    let meta = std::fs::metadata(&canonical_ancestor)
+        .map_err(|e| reject(format!("{}: {e}", canonical_ancestor.display())))?;
+    if !meta.is_dir() {
+        return Err(reject(format!(
+            "{} is not a directory",
+            canonical_ancestor.display()
+        )));
+    }
+    if meta.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(reject(format!(
+            "{} is not owned by the current user — refusing to create beneath it",
+            canonical_ancestor.display()
+        )));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(reject(format!(
+            "{} is group/other-writable (mode {:o}) — refusing to create beneath it",
+            canonical_ancestor.display(),
+            meta.mode() & 0o7777
+        )));
+    }
+
+    std::fs::create_dir_all(dir)
+        .map_err(|e| reject(format!("creating {} failed: {e}", dir.display())))?;
+
+    verify_user_channel(dir, std::slice::from_ref(&canonical_root))
+}
+
 /// Expected user-channel layout for a (provider, version) pair.
 pub fn expected_channel_dir(
     provider: PhpProvider,
@@ -564,8 +1036,13 @@ fi
         )
     }
 
-    /// Herd-patched fake: with HOME set it IGNORES PHP_INI_SCAN_DIR entirely;
-    /// only a cleared env honors the variable.
+    /// Launcher-env-patched fake, modeled on real Herd binaries: when its
+    /// vendor scan-dir variable is present in the environment (simulated
+    /// here via `$HOME` as an always-present ambient variable in the normal
+    /// probe context) it IGNORES `PHP_INI_SCAN_DIR` entirely; only a cleared
+    /// env honors the variable. Real trigger on the reference machine is
+    /// `HERD_PHP_XY_INI_SCAN_DIR`, not HOME — the mechanism under test
+    /// (canary must catch an env-ignoring binary) is identical.
     fn herd_fake(normal_dir: &Path, sanitized_dir: &Path) -> String {
         format!(
             r#"#!/bin/sh
@@ -587,11 +1064,13 @@ fi
     }
 
     fn test_roots(base: &Path) -> ProviderRoots {
-        ProviderRoots {
-            hearth: base.join("hearth"),
-            herd: base.join("Herd"),
-            homebrew: base.join("homebrew"),
-        }
+        ProviderRoots::isolated(
+            base,
+            base.join("hearth"),
+            base.join("Herd"),
+            base.join("homebrew"),
+        )
+        .unwrap()
     }
 
     // ---- probing ----
@@ -1006,5 +1485,525 @@ echo "Scan for additional .ini files in: {normal}"
             !expected.exists(),
             "classification must never create an ambient (non-Hearth) channel dir"
         );
+    }
+
+    #[test]
+    fn ensure_hearth_channel_dir_creates_and_verifies() {
+        let (_tmp, base) = canon_tmp();
+        let hearth_root = base.join("hearth");
+        std::fs::create_dir_all(&hearth_root).unwrap();
+        let dir = hearth_root.join("php/8.4/conf.d");
+
+        let verified = ensure_hearth_channel_dir(&hearth_root, &dir).unwrap();
+        assert_eq!(verified.path, dir);
+        assert!(dir.is_dir());
+        // Idempotent on an existing dir.
+        assert!(ensure_hearth_channel_dir(&hearth_root, &dir).is_ok());
+    }
+
+    #[test]
+    fn ensure_hearth_channel_dir_rejects_outside_root() {
+        let (_tmp, base) = canon_tmp();
+        let hearth_root = base.join("hearth");
+        std::fs::create_dir_all(&hearth_root).unwrap();
+        let err =
+            ensure_hearth_channel_dir(&hearth_root, &base.join("elsewhere/conf.d")).unwrap_err();
+        assert!(err.reason.contains("outside the Hearth root"), "got: {err}");
+    }
+
+    #[test]
+    fn ensure_hearth_channel_dir_rejects_symlinked_ancestor() {
+        let (_tmp, base) = canon_tmp();
+        let hearth_root = base.join("hearth");
+        std::fs::create_dir_all(&hearth_root).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, hearth_root.join("php")).unwrap();
+
+        let err = ensure_hearth_channel_dir(&hearth_root, &hearth_root.join("php/8.4/conf.d"))
+            .unwrap_err();
+        assert!(err.reason.contains("symlink"), "got: {err}");
+        assert!(
+            !outside.join("8.4").exists(),
+            "zero mutation through the symlink"
+        );
+    }
+
+    #[test]
+    fn lone_provider_override_without_isolated_root_is_rejected() {
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.remove("HEARTH_CONFIG_DIR");
+        guard.set("HEARTH_HERD_ROOT", "/tmp/evil-discovery-root");
+        let err = ProviderRoots::detect().unwrap_err();
+        assert!(err.contains("HEARTH_ISOLATED_ROOT"), "got: {err}");
+        drop(guard);
+    }
+
+    #[test]
+    fn present_but_empty_provider_override_fails_closed() {
+        // B3-2: an explicitly present empty override is a configuration
+        // ERROR, never silently "unset".
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_CONFIG_DIR");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.set("HEARTH_HERD_ROOT", "");
+        let err = ProviderRoots::detect().unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+
+        // Same discipline for the homebrew override…
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.set("HEARTH_HOMEBREW_ROOT", "");
+        let err = ProviderRoots::detect().unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+
+        // …and in isolated mode: a present empty provider root never
+        // silently defaults beneath the runtime root.
+        let (_tmp, base) = canon_tmp();
+        std::fs::create_dir_all(base.join("hearth")).unwrap();
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.set("HEARTH_ISOLATED_ROOT", &base);
+        guard.set("HEARTH_CONFIG_DIR", base.join("hearth"));
+        guard.set("HEARTH_HERD_ROOT", "");
+        let err = ProviderRoots::detect().unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+        drop(guard);
+    }
+
+    #[test]
+    fn production_write_authority_is_immutable_and_never_tmp() {
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.remove("HEARTH_CONFIG_DIR");
+        let roots = ProviderRoots::detect().unwrap();
+        let allowed = roots.allowed_prefixes();
+        drop(guard);
+
+        assert_eq!(
+            allowed.len(),
+            3,
+            "config dir + home + /opt/homebrew: {allowed:?}"
+        );
+        assert!(
+            allowed
+                .iter()
+                .all(|p| !p.starts_with("/tmp") && !p.starts_with("/private/tmp")),
+            "no temp path may ever be production write authority: {allowed:?}"
+        );
+        assert!(
+            allowed.iter().any(|p| p == Path::new("/opt/homebrew")),
+            "got: {allowed:?}"
+        );
+    }
+
+    #[test]
+    fn home_unavailable_or_root_fails_closed_never_slash_allowlist() {
+        // B3-2: no fallback-to-`/` ever; HOME-unavailable is a typed error.
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.remove("HEARTH_CONFIG_DIR");
+
+        let err = ProviderRoots::detect_with_home(None).unwrap_err();
+        assert!(err.contains("home"), "got: {err}");
+        assert!(err.contains("fail closed"), "got: {err}");
+
+        let err = ProviderRoots::detect_with_home(Some(PathBuf::from("/"))).unwrap_err();
+        assert!(err.contains("can never be write authority"), "got: {err}");
+
+        // A valid home yields an allowlist that never contains `/`.
+        let (_tmp, base) = canon_tmp();
+        let roots = ProviderRoots::detect_with_home(Some(base.clone())).unwrap();
+        let allowed = roots.allowed_prefixes();
+        assert!(
+            allowed.iter().all(|p| p != Path::new("/")),
+            "`/` must never be write authority: {allowed:?}"
+        );
+        assert!(allowed.contains(&base));
+        drop(guard);
+    }
+
+    #[test]
+    fn home_symlink_alias_to_root_or_denylist_is_rejected() {
+        // B4-2: canonicalization happens FIRST — an absolute HOME that is a
+        // symlink alias of `/` (or a denylisted root) must be rejected and
+        // can never appear in allowed prefixes.
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.remove("HEARTH_CONFIG_DIR");
+        let (_tmp, base) = canon_tmp();
+        let root_alias = base.join("home-alias-root");
+        std::os::unix::fs::symlink("/", &root_alias).unwrap();
+        let err = ProviderRoots::detect_with_home(Some(root_alias)).unwrap_err();
+        assert!(err.contains("/"), "got: {err}");
+
+        let deny_alias = base.join("home-alias-denylist");
+        std::os::unix::fs::symlink("/usr/local/etc/php", &deny_alias).unwrap();
+        assert!(ProviderRoots::detect_with_home(Some(deny_alias)).is_err());
+
+        // Missing / non-directory HOME fails closed too.
+        assert!(ProviderRoots::detect_with_home(Some(base.join("no-such-home"))).is_err());
+        let file_home = base.join("file-home");
+        std::fs::write(&file_home, "x").unwrap();
+        assert!(ProviderRoots::detect_with_home(Some(file_home)).is_err());
+        drop(guard);
+    }
+
+    #[test]
+    fn isolated_runtime_root_slash_or_alias_is_rejected() {
+        // B4-2: even the test-only constructor keeps the invariant — a
+        // runtime root that IS or resolves to `/` (or a denylisted root) is
+        // rejected outright.
+        let err = ProviderRoots::isolated(
+            Path::new("/"),
+            PathBuf::from("/hearth"),
+            PathBuf::from("/herd"),
+            PathBuf::from("/homebrew"),
+        )
+        .unwrap_err();
+        assert!(err.contains("/"), "got: {err}");
+
+        let (_tmp, base) = canon_tmp();
+        let alias = base.join("runtime-alias-root");
+        std::os::unix::fs::symlink("/", &alias).unwrap();
+        assert!(
+            ProviderRoots::isolated(
+                &alias,
+                alias.join("hearth"),
+                alias.join("herd"),
+                alias.join("homebrew"),
+            )
+            .is_err(),
+            "runtime root aliasing `/` must be rejected"
+        );
+    }
+
+    #[test]
+    fn allowed_prefixes_can_never_contain_slash() {
+        // Post-invariant: stored prefixes are pre-validated canonical form;
+        // no constructor path may yield `/`.
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.remove("HEARTH_CONFIG_DIR");
+        let (_tmp, base) = canon_tmp();
+        std::fs::create_dir_all(base.join("hearth")).unwrap();
+        let production = ProviderRoots::detect_with_home(Some(base.clone())).unwrap();
+        let isolated = ProviderRoots::isolated(
+            &base,
+            base.join("hearth"),
+            base.join("herd"),
+            base.join("homebrew"),
+        )
+        .unwrap();
+        for roots in [production, isolated] {
+            assert!(
+                roots
+                    .allowed_prefixes()
+                    .iter()
+                    .all(|p| p != Path::new("/") && p.is_absolute()),
+                "invariant violated: {:?}",
+                roots.allowed_prefixes()
+            );
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn isolated_mode_confines_and_validates_roots() {
+        let (_tmp, base) = canon_tmp();
+        std::fs::create_dir_all(base.join("hearth")).unwrap();
+
+        // Roots outside the runtime root are rejected.
+        let err = ProviderRoots::isolated(
+            &base,
+            base.join("hearth"),
+            PathBuf::from("/tmp"),
+            base.join("homebrew"),
+        )
+        .unwrap_err();
+        assert!(err.contains("not contained"), "got: {err}");
+
+        // Relative/empty roots are rejected.
+        let err = ProviderRoots::isolated(
+            &base,
+            base.join("hearth"),
+            PathBuf::from("relative/herd"),
+            base.join("homebrew"),
+        )
+        .unwrap_err();
+        assert!(err.contains("absolute"), "got: {err}");
+
+        // Valid isolated construction confines write authority to the root,
+        // and /usr/local stays denied there too.
+        let roots = ProviderRoots::isolated(
+            &base,
+            base.join("hearth"),
+            base.join("herd"),
+            base.join("homebrew"),
+        )
+        .unwrap();
+        assert_eq!(roots.allowed_prefixes(), vec![base.clone()]);
+        assert!(
+            verify_user_channel(
+                Path::new("/usr/local/etc/php/conf.d"),
+                &roots.allowed_prefixes()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn isolated_env_mode_requires_config_dir_under_root() {
+        let (_tmp, base) = canon_tmp();
+        std::fs::create_dir_all(base.join("hearth")).unwrap();
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        guard.set("HEARTH_ISOLATED_ROOT", &base);
+        guard.set("HEARTH_CONFIG_DIR", base.join("hearth"));
+
+        let roots = ProviderRoots::detect().unwrap();
+        assert_eq!(roots.allowed_prefixes(), vec![base.clone()]);
+        assert_eq!(roots.herd, base.join("herd"));
+
+        // Real (outside-root) config dir in isolated mode fails closed.
+        guard.remove("HEARTH_CONFIG_DIR");
+        let err = ProviderRoots::detect().unwrap_err();
+        assert!(err.contains("not contained"), "got: {err}");
+        drop(guard);
+    }
+
+    #[test]
+    fn ensure_hearth_channel_dir_rejects_group_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, base) = canon_tmp();
+        let hearth_root = base.join("hearth");
+        let ancestor = hearth_root.join("php");
+        std::fs::create_dir_all(&ancestor).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err =
+            ensure_hearth_channel_dir(&hearth_root, &ancestor.join("8.4/conf.d")).unwrap_err();
+        assert!(err.reason.contains("group/other-writable"), "got: {err}");
+        assert!(!ancestor.join("8.4").exists());
+    }
+
+    #[test]
+    fn missing_suffix_traversal_never_forms_isolated_authority() {
+        // B5-1/B5-3: a candidate root carrying `..` (missing or partially
+        // existing) must be rejected by the constructor — never stored raw,
+        // never lexically escaping, zero partial creation.
+        let (_tmp, base) = canon_tmp();
+        let rt = base.join("rt");
+        std::fs::create_dir_all(rt.join("a")).unwrap();
+
+        for evil in [
+            rt.join("missing/../../outside"),
+            rt.join("missing/../../../outside"),
+            rt.join("a/../../outside"),
+            rt.join("missing/.."),
+        ] {
+            match ProviderRoots::isolated(&rt, evil.clone(), rt.join("herd"), rt.join("homebrew")) {
+                Err(e) => assert!(e.contains("component"), "typed rejection, got: {e}"),
+                Ok(r) => panic!(
+                    "traversal-bearing hearth root {} accepted, stored as {}",
+                    evil.display(),
+                    r.hearth.display()
+                ),
+            }
+            assert!(!base.join("outside").exists(), "zero partial creation");
+            assert!(!rt.join("missing").exists(), "zero partial creation");
+        }
+    }
+
+    #[test]
+    fn isolated_roots_store_validated_normalized_paths_only() {
+        // B5-3: stored provider/config roots are validated normalized forms —
+        // no raw input retention, no traversal components, strict children of
+        // the canonical isolated boundary.
+        let (_tmp, base) = canon_tmp();
+        let rt = base.join("rt");
+        std::fs::create_dir_all(&rt).unwrap();
+        let roots = ProviderRoots::isolated(
+            &rt,
+            rt.join("hearth cfg"),
+            rt.join("herd"),
+            rt.join("homebrew"),
+        )
+        .unwrap();
+        for stored in [&roots.hearth, &roots.herd, &roots.homebrew] {
+            assert!(stored.starts_with(&rt), "contained: {}", stored.display());
+            assert!(
+                stored.components().all(|c| !matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )),
+                "normalized: {}",
+                stored.display()
+            );
+        }
+        assert_eq!(roots.hearth, rt.join("hearth cfg"));
+
+        // The runtime root itself may never double as a provider root.
+        let err = ProviderRoots::isolated(&rt, rt.clone(), rt.join("herd"), rt.join("homebrew"))
+            .unwrap_err();
+        assert!(err.contains("strictly below"), "got: {err}");
+    }
+
+    #[test]
+    fn symlink_ancestor_escape_is_rejected_for_missing_isolated_roots() {
+        // B5-1: a missing root whose deepest existing ancestor is a symlink
+        // out of the boundary must be rejected at construction.
+        let (_tmp, base) = canon_tmp();
+        let rt = base.join("rt");
+        std::fs::create_dir_all(&rt).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, rt.join("link")).unwrap();
+        let err = ProviderRoots::isolated(
+            &rt,
+            rt.join("link/hearth"),
+            rt.join("herd"),
+            rt.join("homebrew"),
+        )
+        .unwrap_err();
+        assert!(err.contains("not contained"), "got: {err}");
+    }
+
+    #[test]
+    fn non_directory_or_missing_isolated_runtime_root_is_rejected() {
+        let (_tmp, base) = canon_tmp();
+        let file = base.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(
+            ProviderRoots::isolated(&file, file.join("h"), file.join("he"), file.join("hb"))
+                .is_err()
+        );
+        let missing = base.join("nope");
+        assert!(
+            ProviderRoots::isolated(
+                &missing,
+                missing.join("h"),
+                missing.join("he"),
+                missing.join("hb")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn production_config_override_cannot_enlarge_authority() {
+        // B5-2 locked root model: production Hearth config authority is the
+        // fixed HOME-derived default. A present HEARTH_CONFIG_DIR without
+        // typed isolated mode may never select another authority root.
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+
+        let (_tmp, base) = canon_tmp();
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let fixed_default = home.join("Library/Application Support/hearth");
+
+        // Absolute override outside HOME entirely.
+        let outside = base.join("evil");
+        std::fs::create_dir_all(&outside).unwrap();
+        guard.set("HEARTH_CONFIG_DIR", &outside);
+        match ProviderRoots::detect_with_home(Some(home.clone())) {
+            Err(e) => assert!(e.contains("HEARTH_CONFIG_DIR"), "typed error, got: {e}"),
+            Ok(r) => panic!(
+                "override outside HOME accepted into authority: {:?}",
+                r.allowed_prefixes()
+            ),
+        }
+
+        // Alternate root elsewhere under HOME.
+        let elsewhere = home.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        guard.set("HEARTH_CONFIG_DIR", &elsewhere);
+        assert!(
+            ProviderRoots::detect_with_home(Some(home.clone())).is_err(),
+            "alternate config root under HOME must be rejected"
+        );
+
+        // `..`-bearing override.
+        guard.set("HEARTH_CONFIG_DIR", home.join("Library/../evil2"));
+        assert!(ProviderRoots::detect_with_home(Some(home.clone())).is_err());
+
+        // Exact fixed default (missing is fine) — accepted and authoritative.
+        guard.set("HEARTH_CONFIG_DIR", &fixed_default);
+        let roots = ProviderRoots::detect_with_home(Some(home.clone())).unwrap();
+        assert_eq!(roots.hearth, fixed_default);
+        assert!(roots.allowed_prefixes().contains(&fixed_default));
+
+        // Absent override — same fixed default, same authority.
+        guard.remove("HEARTH_CONFIG_DIR");
+        let roots = ProviderRoots::detect_with_home(Some(home)).unwrap();
+        assert_eq!(roots.hearth, fixed_default);
+        drop(guard);
+    }
+
+    #[test]
+    fn ensure_hearth_channel_dir_rejects_non_normal_components_zero_creation() {
+        // B5-1: traversal components in the requested channel dir are
+        // rejected BEFORE any filesystem mutation.
+        let (_tmp, base) = canon_tmp();
+        let hearth_root = base.join("hearth");
+        std::fs::create_dir_all(&hearth_root).unwrap();
+        let evil = hearth_root.join("php/../../escape/conf.d");
+        let err = ensure_hearth_channel_dir(&hearth_root, &evil).unwrap_err();
+        assert!(err.reason.contains("component"), "got: {err}");
+        assert!(!base.join("escape").exists(), "zero out-of-root creation");
+        assert!(!hearth_root.join("php").exists(), "zero partial creation");
     }
 }

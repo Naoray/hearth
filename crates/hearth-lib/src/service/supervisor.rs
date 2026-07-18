@@ -60,6 +60,9 @@ pub struct ManagedService {
     /// shared system services (nginx, php-fpm, dnsmasq, mailpit, dump-server,
     /// the DB engines).
     site_name: Option<String>,
+    /// Extra environment variables for the spawned child (e.g. the Belt-E
+    /// `PHP_INI_SCAN_DIR` pair for PHP workers/FPM). Empty = inherit only.
+    env: Vec<(String, String)>,
 }
 
 impl ManagedService {
@@ -74,12 +77,20 @@ impl ManagedService {
             args,
             cwd: None,
             site_name: None,
+            env: Vec::new(),
         }
     }
 
     /// Builder: set the shutdown strategy for this service.
     pub fn with_shutdown_strategy(mut self, strategy: ShutdownStrategy) -> Self {
         self.shutdown_strategy = strategy;
+        self
+    }
+
+    /// Builder: extra environment variables for the spawned child. Process
+    /// group/supervision behavior is unchanged — env only affects the spawn.
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
         self
     }
 
@@ -103,6 +114,7 @@ impl ManagedService {
             args,
             cwd: Some(cwd),
             site_name: None,
+            env: Vec::new(),
         }
     }
 
@@ -124,6 +136,7 @@ impl ManagedService {
             args,
             cwd: Some(cwd),
             site_name: Some(site_name.into()),
+            env: Vec::new(),
         }
     }
 
@@ -135,6 +148,16 @@ impl ManagedService {
     /// Optional site name carried by per-site Laravel workers (Horizon, Reverb).
     pub fn site_name(&self) -> Option<&str> {
         self.site_name.as_deref()
+    }
+
+    /// Extra environment variables applied to the spawned child.
+    pub fn env(&self) -> &[(String, String)] {
+        &self.env
+    }
+
+    /// The command this service spawns.
+    pub fn command(&self) -> &str {
+        &self.command
     }
 
     /// User-facing label used in `hearth status` and tracing. Adds the site name
@@ -158,6 +181,9 @@ impl ManagedService {
             .stderr(Stdio::piped());
         if let Some(ref dir) = self.cwd {
             cmd.current_dir(dir);
+        }
+        for (key, value) in &self.env {
+            cmd.env(key, value);
         }
         let child = cmd.group_spawn()?;
 
@@ -355,14 +381,35 @@ impl ServiceSupervisor {
         svc.stop()
     }
 
-    /// Replace a service's command configuration (e.g., for PHP version switch).
-    /// The service must be stopped before reconfiguring.
-    pub fn reconfigure_service(&mut self, kind: ServiceKind, command: String, args: Vec<String>) {
+    /// Replace a service's command configuration (e.g., for PHP version
+    /// switch). The service must be stopped before reconfiguring. `env`
+    /// REPLACES the stored child environment — a version switch must never
+    /// retain the previous version's scan-dir env.
+    pub fn reconfigure_service(
+        &mut self,
+        kind: ServiceKind,
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    ) {
         if let Some(svc) = self.services.get_mut(&kind) {
             svc.command = command;
             svc.args = args;
+            svc.env = env;
             svc.circuit_breaker.reset();
         }
+    }
+
+    /// Deregister a service (e.g., a launch-blocked FPM after a version
+    /// switch). Returns true when a registration was removed. Callers stop
+    /// the service first.
+    pub fn remove_service(&mut self, kind: ServiceKind) -> bool {
+        self.services.remove(&kind).is_some()
+    }
+
+    /// Read access to one registered service (command/args/env inspection).
+    pub fn service(&self, kind: ServiceKind) -> Option<&ManagedService> {
+        self.services.get(&kind)
     }
 
     /// Run one health check pass. Returns services that crashed.
@@ -504,10 +551,49 @@ mod tests {
             ServiceKind::Nginx,
             "/usr/sbin/nginx-new".to_string(),
             vec!["-g".to_string(), "daemon off;".to_string()],
+            vec![("A".to_string(), "1".to_string())],
         );
         let svc = sup.services.get(&ServiceKind::Nginx).unwrap();
         assert_eq!(svc.command, "/usr/sbin/nginx-new");
         assert_eq!(svc.args, vec!["-g", "daemon off;"]);
+        assert_eq!(svc.env, vec![("A".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn reconfigure_replaces_env_never_retains_old() {
+        let mut sup = ServiceSupervisor::new();
+        sup.register(
+            ManagedService::new(ServiceKind::PhpFpm, "php-fpm".to_string(), vec![])
+                .with_env(vec![(
+                    "PHP_INI_SCAN_DIR".to_string(),
+                    ":/old/8.3/conf.d".to_string(),
+                )]),
+        );
+        sup.reconfigure_service(
+            ServiceKind::PhpFpm,
+            "/new/php-fpm".to_string(),
+            vec![],
+            vec![(
+                "PHP_INI_SCAN_DIR".to_string(),
+                ":/new/8.4/conf.d".to_string(),
+            )],
+        );
+        let svc = sup.services.get(&ServiceKind::PhpFpm).unwrap();
+        assert_eq!(
+            svc.env,
+            vec![(
+                "PHP_INI_SCAN_DIR".to_string(),
+                ":/new/8.4/conf.d".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn remove_service_deregisters() {
+        let mut sup = make_supervisor_with_service();
+        assert!(sup.remove_service(ServiceKind::Nginx));
+        assert!(!sup.remove_service(ServiceKind::Nginx));
+        assert!(sup.services.is_empty());
     }
 
     #[test]
@@ -517,6 +603,7 @@ mod tests {
         sup.reconfigure_service(
             ServiceKind::Redis,
             "redis-server".to_string(),
+            vec![],
             vec![],
         );
         assert!(sup.services.is_empty());
@@ -607,5 +694,32 @@ mod tests {
         let observed = std::path::PathBuf::from(contents.trim());
         let observed = std::fs::canonicalize(&observed).unwrap_or(observed);
         assert_eq!(observed, cwd);
+    }
+
+    #[test]
+    fn with_env_sets_child_environment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = std::fs::canonicalize(tmp.path()).unwrap();
+
+        let mut svc = ManagedService::with_cwd(
+            ServiceKind::Nginx,
+            "sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "printf %s \"$PHP_INI_SCAN_DIR\" > env-output".to_string(),
+            ],
+            cwd.clone(),
+        )
+        .with_env(vec![(
+            "PHP_INI_SCAN_DIR".to_string(),
+            ":/tmp/hearth/php/8.4/conf.d".to_string(),
+        )]);
+        svc.start().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = svc.stop();
+
+        let contents = std::fs::read_to_string(cwd.join("env-output"))
+            .expect("child should have written env-output");
+        assert_eq!(contents, ":/tmp/hearth/php/8.4/conf.d");
     }
 }

@@ -6,7 +6,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use hearth_lib::add::AddAnswers;
-use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
+use hearth_lib::socket::{
+    DaemonRequest, DaemonResponse, DbEngineStatus, FileWriteResult, FpmRestartOutcome,
+};
 
 /// Closed enum of packages accepted by `hearth add`. Validated at parse time so users
 /// get a clean clap error rather than a runtime "unknown package".
@@ -30,7 +32,11 @@ impl AddPackage {
 }
 
 #[derive(Parser)]
-#[command(name = "hearth", version, about = "Unified Laravel development command center")]
+#[command(
+    name = "hearth",
+    version,
+    about = "Unified Laravel development command center"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -158,12 +164,47 @@ enum PhpCommands {
     },
     /// List installed PHP versions
     List,
-    /// Set a php.ini config value (e.g., `hearth php config memory_limit 512M`)
+    /// Manage PHP INI configuration (e.g., `hearth php config memory_limit 512M`,
+    /// `hearth php config --global memory_limit 1G`, `hearth php config --status`)
     Config {
         /// INI key (e.g., memory_limit, upload_max_filesize)
-        key: String,
+        key: Option<String>,
         /// Value to set
-        value: String,
+        value: Option<String>,
+        /// Target the global store applied to every PHP version
+        #[arg(long)]
+        global: bool,
+        /// Target one version's override table (e.g., --php 8.3)
+        #[arg(long)]
+        php: Option<String>,
+        /// Show configured (and materialized) values instead of setting
+        #[arg(long)]
+        show: bool,
+        /// Remove a directive from the selected scope
+        #[arg(long)]
+        unset: bool,
+        /// Per-target coverage/status table
+        #[arg(long)]
+        status: bool,
+        /// Force journal recovery + reconcile of channel files
+        #[arg(long)]
+        sync: bool,
+        /// Remove every Hearth-written channel file
+        #[arg(long)]
+        unmanage: bool,
+    },
+    /// Run a PHP command with Hearth's scan-dir env at the final launch
+    /// boundary (e.g. `hearth php exec -- artisan test`). Covers launchers
+    /// that clear the environment — but NOT descendants that later clear env
+    /// themselves and exec an absolute PHP path; use a Homebrew/Hearth PHP
+    /// build for those.
+    Exec {
+        /// PHP version to run (defaults to the configured default_php)
+        #[arg(long = "php")]
+        php: Option<String>,
+        /// Arguments passed to the PHP binary verbatim
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
     },
 }
 
@@ -175,13 +216,9 @@ enum DbCommands {
         engine: Option<String>,
     },
     /// Stop a DB engine, or all DB engines.
-    Stop {
-        engine: Option<String>,
-    },
+    Stop { engine: Option<String> },
     /// Restart a DB engine (stop + start).
-    Restart {
-        engine: Option<String>,
-    },
+    Restart { engine: Option<String> },
     /// Report status of all DB engines.
     Status {
         /// Emit machine-readable JSON instead of a table.
@@ -227,14 +264,38 @@ async fn main() -> anyhow::Result<()> {
         Commands::Php { command } => match command {
             PhpCommands::Use { version } => DaemonRequest::PhpSwitch { version },
             PhpCommands::List => DaemonRequest::PhpList,
-            PhpCommands::Config { key, value } => DaemonRequest::PhpConfig {
-                version: "active".to_string(), // daemon resolves to current version
+            PhpCommands::Config {
                 key,
                 value,
-            },
+                global,
+                php,
+                show,
+                unset,
+                status,
+                sync,
+                unmanage,
+            } => {
+                // Client-side validation of the whole flag/action matrix
+                // BEFORE any daemon I/O.
+                match build_php_config_action(
+                    key, value, global, php, show, unset, status, sync, unmanage,
+                ) {
+                    Ok(action) => DaemonRequest::PhpConfigV2 { action },
+                    Err(msg) => {
+                        eprintln!("Error: {msg}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            PhpCommands::Exec { php, args } => {
+                return run_php_exec(php, args).await;
+            }
         },
         Commands::Db { command } => {
-            return run_db(command).await;
+            if run_db(command).await? == ExitClass::Failure {
+                std::process::exit(1);
+            }
+            return Ok(());
         }
         Commands::Daemon { command } => {
             return run_daemon(command).await;
@@ -273,20 +334,236 @@ async fn main() -> anyhow::Result<()> {
             no_supervise,
             dry_run,
         } => {
-            return run_add(package, site, yes, no_supervise, dry_run).await;
+            if run_add(package, site, yes, no_supervise, dry_run).await? == ExitClass::Failure {
+                std::process::exit(1);
+            }
+            return Ok(());
         }
     };
 
     let response = send_to_daemon(request).await?;
-    print_response(response);
+    // print_response is a pure renderer (returns ExitClass); main owns the
+    // only process-exit application in the binary.
+    if print_response(response) == ExitClass::Failure {
+        std::process::exit(1);
+    }
 
     Ok(())
 }
 
-async fn send_to_daemon(request: DaemonRequest) -> anyhow::Result<DaemonResponse> {
-    let socket_path = hearth_lib::socket::socket_path();
+/// Build the typed php-config action from the CLI flag matrix, or an
+/// actionable error. Exactly one action; `--global` ⊻ `--php`; scope flags
+/// only for Set/Unset/Show (plan 5560 §2.5).
+#[allow(clippy::too_many_arguments)]
+fn build_php_config_action(
+    key: Option<String>,
+    value: Option<String>,
+    global: bool,
+    php: Option<String>,
+    show: bool,
+    unset: bool,
+    status: bool,
+    sync: bool,
+    unmanage: bool,
+) -> Result<hearth_lib::socket::PhpConfigAction, String> {
+    use hearth_lib::socket::{PhpConfigAction, PhpScope};
 
-    let stream = UnixStream::connect(&socket_path)
+    let action_flags = [show, unset, status, sync, unmanage]
+        .iter()
+        .filter(|f| **f)
+        .count();
+    if action_flags > 1 {
+        return Err(
+            "pass at most one of --show, --unset, --status, --sync, --unmanage".to_string(),
+        );
+    }
+    if global && php.is_some() {
+        return Err("--global and --php are mutually exclusive".to_string());
+    }
+    let scope = if global {
+        PhpScope::Global
+    } else if let Some(version) = php.clone() {
+        PhpScope::Version { version }
+    } else {
+        PhpScope::Active
+    };
+
+    if status || sync || unmanage {
+        let name = if status {
+            "--status"
+        } else if sync {
+            "--sync"
+        } else {
+            "--unmanage"
+        };
+        if key.is_some() || value.is_some() {
+            return Err(format!("{name} takes no key or value"));
+        }
+        if global || php.is_some() {
+            return Err(format!("{name} takes no --global/--php scope"));
+        }
+        return Ok(if status {
+            PhpConfigAction::Status
+        } else if sync {
+            PhpConfigAction::Sync
+        } else {
+            PhpConfigAction::Unmanage
+        });
+    }
+
+    if show {
+        if value.is_some() {
+            return Err("--show takes an optional key but no value".to_string());
+        }
+        return Ok(PhpConfigAction::Show { key });
+    }
+
+    if unset {
+        if value.is_some() {
+            return Err("--unset removes a directive; it takes no value".to_string());
+        }
+        let key = key.ok_or_else(|| "--unset requires a key".to_string())?;
+        return Ok(PhpConfigAction::Unset { scope, key });
+    }
+
+    // Implicit Set: both key and value required.
+    match (key, value) {
+        (Some(key), Some(value)) => Ok(PhpConfigAction::Set { scope, key, value }),
+        _ => Err(
+            "provide <key> <value> to set, or one of --show/--status/--sync/--unmanage".to_string(),
+        ),
+    }
+}
+
+/// Exit classification for a php-config report. Nonzero iff persistence
+/// failed (arrives as a daemon Error), a channel file was Refused/Failed, or
+/// a REGISTERED php-fpm restart failed. NotRegistered / LaunchBlocked /
+/// unmanaged-only cells render loudly but exit 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitClass {
+    Success,
+    Failure,
+}
+
+/// Pure renderer: `(stdout, stderr, exit class)`. No process exit here.
+fn render_php_config_report(
+    outcome: &hearth_lib::socket::PhpConfigOutcome,
+) -> (String, String, ExitClass) {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let mut err = String::new();
+    let mut exit = ExitClass::Success;
+
+    if outcome.persisted == Some(true) {
+        out.push_str("Configuration persisted.\n");
+    }
+
+    for file in &outcome.files {
+        match &file.result {
+            FileWriteResult::Written => {
+                let _ = writeln!(out, "written   {}", file.path);
+            }
+            FileWriteResult::Unchanged => {
+                let _ = writeln!(out, "unchanged {}", file.path);
+            }
+            FileWriteResult::Deleted => {
+                let _ = writeln!(out, "deleted   {}", file.path);
+            }
+            FileWriteResult::Refused { reason } => {
+                exit = ExitClass::Failure;
+                let _ = writeln!(err, "refused   {} — {reason}", file.path);
+            }
+            FileWriteResult::Failed { error } => {
+                exit = ExitClass::Failure;
+                let _ = writeln!(err, "failed    {} — {error}", file.path);
+            }
+        }
+    }
+
+    if outcome.rows.is_empty() {
+        if outcome.persisted.is_none() && outcome.files.is_empty() {
+            out.push_str("No PHP targets discovered.\n");
+        }
+    } else {
+        let _ = writeln!(
+            out,
+            "{:<9} {:<7} {:<4} {:<10} {:<48} {}",
+            "PROVIDER", "VERSION", "SAPI", "CONTEXT", "CHANNEL", "COVERAGE"
+        );
+        for row in &outcome.rows {
+            let channel = row.channel.as_deref().unwrap_or("—");
+            let mut line = format!(
+                "{:<9} {:<7} {:<4} {:<10} {:<48} {}",
+                row.provider, row.version, row.sapi, row.context, channel, row.coverage
+            );
+            if let Some(configured) = &row.configured {
+                let _ = write!(line, "  configured={configured}");
+                match &row.observed {
+                    Some(observed) => {
+                        let _ = write!(line, " observed={observed} ({})", row.observed_state);
+                    }
+                    None => {
+                        let _ = write!(line, " observed=n/a");
+                    }
+                }
+            }
+            let _ = writeln!(out, "{line}");
+            if row.coverage.starts_with("UNMANAGED: privileged-dir") {
+                let _ = writeln!(
+                    out,
+                    "  ↳ remediation: root-owned, version-blind; never written by Hearth. \
+                     Use `hearth php exec -- <cmd>` for env-clearing launchers, or a \
+                     Hearth/Homebrew PHP build."
+                );
+            }
+            if row.coverage.contains("channel blocked") {
+                let _ = writeln!(
+                    out,
+                    "  ↳ remediation: remove or rename the file, then run \
+                     `hearth php config --sync`."
+                );
+            }
+        }
+        // Scope footer — states the guarantee boundary, never universal.
+        let _ = writeln!(
+            out,
+            "Coverage: Hearth guarantees Hearth-launched processes (env-honoring binaries) \
+             and verified user-owned, version-exclusive channels. UNMANAGED/LAUNCH-BLOCKED \
+             cells are outside that guarantee."
+        );
+    }
+
+    match &outcome.fpm {
+        FpmRestartOutcome::Restarted => out.push_str("php-fpm restarted\n"),
+        FpmRestartOutcome::NotRegistered { herd_hint: true } => {
+            out.push_str("php-fpm not restarted: not registered (Herd manages PHP-FPM)\n")
+        }
+        FpmRestartOutcome::NotRegistered { herd_hint: false } => {
+            out.push_str("php-fpm not restarted: not registered\n")
+        }
+        FpmRestartOutcome::LaunchBlocked { reason } => {
+            let _ = writeln!(out, "php-fpm not restarted: LAUNCH-BLOCKED ({reason})");
+        }
+        FpmRestartOutcome::Failed { message } => {
+            exit = ExitClass::Failure;
+            let _ = writeln!(err, "Error: php-fpm restart failed: {message}");
+        }
+        FpmRestartOutcome::NotAttempted => {}
+    }
+
+    (out, err, exit)
+}
+
+async fn send_to_daemon(request: DaemonRequest) -> anyhow::Result<DaemonResponse> {
+    send_to_daemon_at(&hearth_lib::socket::socket_path(), request).await
+}
+
+async fn send_to_daemon_at(
+    socket_path: &std::path::Path,
+    request: DaemonRequest,
+) -> anyhow::Result<DaemonResponse> {
+    let stream = UnixStream::connect(socket_path)
         .await
         .context("Daemon not running. Start with: hearth daemon start")?;
 
@@ -303,20 +580,33 @@ async fn send_to_daemon(request: DaemonRequest) -> anyhow::Result<DaemonResponse
     let mut line = String::new();
     reader.read_line(&mut line).await?;
 
-    let response: DaemonResponse = serde_json::from_str(line.trim())?;
+    // Protocol window: an old daemon closes without responding to an unknown
+    // request variant (EOF → empty line), or answers with a shape this CLI
+    // cannot parse. Either way the remediation is the same.
+    const MISMATCH: &str =
+        "hearth CLI and daemon versions differ — run 'hearth daemon restart' and retry.";
+    if line.trim().is_empty() {
+        anyhow::bail!("{MISMATCH}");
+    }
+    let response: DaemonResponse =
+        serde_json::from_str(line.trim()).map_err(|_| anyhow::anyhow!("{MISMATCH}"))?;
     Ok(response)
 }
 
-fn print_response(response: DaemonResponse) {
+/// Render one daemon response. Pure with respect to process control: returns
+/// the exit class and NEVER exits — only CLI `main` applies process exits.
+#[must_use]
+fn print_response(response: DaemonResponse) -> ExitClass {
     match response {
         DaemonResponse::Ok { message } => {
             if let Some(msg) = message {
                 println!("{}", msg);
             }
+            ExitClass::Success
         }
         DaemonResponse::Error { message } => {
             eprintln!("Error: {}", message);
-            std::process::exit(1);
+            ExitClass::Failure
         }
         DaemonResponse::Status { services } => {
             println!("{:<15} {:<15} {}", "SERVICE", "STATE", "PID");
@@ -329,6 +619,7 @@ fn print_response(response: DaemonResponse) {
                     svc.pid.map(|p| p.to_string()).unwrap_or_default()
                 );
             }
+            ExitClass::Success
         }
         DaemonResponse::Sites { sites } => {
             println!("{:<30} {:<6} {}", "SITE", "SSL", "PATH");
@@ -341,17 +632,24 @@ fn print_response(response: DaemonResponse) {
                     site.path
                 );
             }
+            ExitClass::Success
         }
         DaemonResponse::PhpVersions { versions } => {
             for v in versions {
                 let marker = if v.active { " *" } else { "" };
                 println!("PHP {}{} — {}", v.version, marker, v.path);
             }
+            ExitClass::Success
         }
         DaemonResponse::DbStatus { engines } => {
             print_db_status_table(&engines);
+            ExitClass::Success
         }
-        DaemonResponse::Conflict { engine, port, owner_hint } => {
+        DaemonResponse::Conflict {
+            engine,
+            port,
+            owner_hint,
+        } => {
             let hint = owner_hint
                 .as_deref()
                 .map(|h| format!(" (owner: {h})"))
@@ -360,9 +658,18 @@ fn print_response(response: DaemonResponse) {
                 "Error: port {port} for {engine} is already in use{hint}\n\
                  Hint: stop the colliding process (e.g. `brew services stop {engine}`) or change the port in ~/.config/hearth/config.toml."
             );
-            std::process::exit(1);
+            ExitClass::Failure
         }
-        DaemonResponse::Pong => println!("Daemon is running"),
+        DaemonResponse::PhpConfigReport(outcome) => {
+            let (out, err, exit) = render_php_config_report(&outcome);
+            print!("{out}");
+            eprint!("{err}");
+            exit
+        }
+        DaemonResponse::Pong => {
+            println!("Daemon is running");
+            ExitClass::Success
+        }
     }
 }
 
@@ -374,21 +681,21 @@ fn normalize_engine_arg(raw: Option<String>) -> Option<String> {
     }
 }
 
-async fn run_db(command: DbCommands) -> anyhow::Result<()> {
-    match command {
+async fn run_db(command: DbCommands) -> anyhow::Result<ExitClass> {
+    let exit = match command {
         DbCommands::Start { engine } => {
             let response = send_to_daemon(DaemonRequest::DbStart {
                 engine: normalize_engine_arg(engine),
             })
             .await?;
-            print_response(response);
+            print_response(response)
         }
         DbCommands::Stop { engine } => {
             let response = send_to_daemon(DaemonRequest::DbStop {
                 engine: normalize_engine_arg(engine),
             })
             .await?;
-            print_response(response);
+            print_response(response)
         }
         DbCommands::Restart { engine } => {
             let target = normalize_engine_arg(engine);
@@ -397,20 +704,24 @@ async fn run_db(command: DbCommands) -> anyhow::Result<()> {
             })
             .await?;
             let response = send_to_daemon(DaemonRequest::DbStart { engine: target }).await?;
-            print_response(response);
+            print_response(response)
         }
         DbCommands::Status { json } => {
             let response = send_to_daemon(DaemonRequest::DbStatus).await?;
             match response {
                 DaemonResponse::DbStatus { engines } if json => {
                     println!("{}", serde_json::to_string(&engines)?);
+                    ExitClass::Success
                 }
-                DaemonResponse::DbStatus { engines } => print_db_status_table(&engines),
+                DaemonResponse::DbStatus { engines } => {
+                    print_db_status_table(&engines);
+                    ExitClass::Success
+                }
                 other => print_response(other),
             }
         }
-    }
-    Ok(())
+    };
+    Ok(exit)
 }
 
 fn print_db_status_table(engines: &[DbEngineStatus]) {
@@ -432,6 +743,60 @@ fn print_db_status_table(engines: &[DbEngineStatus]) {
     }
 }
 
+/// `hearth php exec [--php X.Y] -- <args…>` — daemon-free shim. Reconciles
+/// channel files for the selected version, then replaces this process with
+/// the resolved PHP binary carrying the Belt-E scan-dir env (reconstructed at
+/// this final launch boundary). A descendant that clears env and execs an
+/// absolute PHP path bypasses the shim by design — use a Homebrew/Hearth PHP
+/// build for that case.
+async fn run_php_exec(
+    version: Option<String>,
+    args: Vec<std::ffi::OsString>,
+) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    // One validated runtime-mode/root snapshot per operation (B5-2/B5-4):
+    // config root and write authority come from the same construction.
+    let provider_roots = hearth_lib::php::targets::ProviderRoots::detect()
+        .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?;
+    let config_dir = provider_roots.hearth.clone();
+    let config_path = config_dir.join("config.toml");
+    let config = hearth_lib::config::HearthConfig::load_from(&config_path)?;
+    let version = version.unwrap_or_else(|| config.default_php.clone());
+
+    // Reconcile first — same engine as the daemon; the journaled manifest
+    // keeps a concurrent daemon reconcile safe.
+    let engine = hearth_lib::php::engine::PhpConfigEngine::new(
+        std::sync::Arc::new(tokio::sync::Mutex::new(config)),
+        config_path,
+        config_dir.clone(),
+        provider_roots,
+        std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        std::time::Duration::from_secs(5),
+    );
+    // Hard gate (F4): never exec PHP against unreconciled channel state.
+    hearth_lib::php::engine::require_reconciled(
+        engine
+            .apply(hearth_lib::socket::PhpConfigAction::Sync)
+            .await,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let binary = hearth_lib::php::resolver::resolve_php_binary(&version, &config_dir)
+        .with_context(|| format!("PHP {version} binary not found"))?;
+    let (key, value) = hearth_lib::php::scan_dir_env(&config_dir, &version);
+    // exec() only returns on failure — on success this process IS php, so no
+    // unsupervised child is ever created.
+    let err = std::process::Command::new(&binary)
+        .args(&args)
+        .env(key, value)
+        .exec();
+    Err(anyhow::anyhow!(
+        "failed to exec {}: {err}",
+        binary.display()
+    ))
+}
+
 async fn run_install() -> anyhow::Result<()> {
     println!("Hearth — first-time setup");
     println!("========================");
@@ -448,19 +813,50 @@ async fn run_install() -> anyhow::Result<()> {
 
     // 2. Create config directory
     println!("\n[2/3] Creating config directory...");
-    let config_dir = hearth_lib::config_dir();
+    // One validated runtime-mode/root snapshot for the whole install
+    // (B5-2/B5-4): config root and write authority come from the same
+    // construction; a root failure aborts before any directory creation.
+    let provider_roots = hearth_lib::php::targets::ProviderRoots::detect()
+        .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?;
+    let config_dir = provider_roots.hearth.clone();
+    let config_path = config_dir.join("config.toml");
     std::fs::create_dir_all(&config_dir)?;
-    let mut config = hearth_lib::config::HearthConfig::default();
+    // Load-and-preserve: re-running `hearth install` must keep existing
+    // php_ini, added_packages, and port settings. `load_from()` returns
+    // defaults only when no config exists, and errors (rather than
+    // clobbering) on a corrupt file.
+    let mut config = hearth_lib::config::HearthConfig::load_from(&config_path)?;
     // Resolve composer.phar up-front so `hearth add` can shell out via the site's PHP
     // (avoids the brew composer wrapper, which uses the system PHP — scratchpad 796 B3).
     config.composer_phar = hearth_lib::add::composer::resolve_composer_phar();
     if let Some(ref phar) = config.composer_phar {
         println!("  Resolved composer.phar → {}", phar.display());
     } else {
-        println!("  Warning: composer.phar not found on host. `hearth add` will probe at request time.");
+        println!(
+            "  Warning: composer.phar not found on host. `hearth add` will probe at request time."
+        );
     }
-    config.save()?;
+    config.save_to(&config_path)?;
     println!("  Config saved to {}", config_dir.display());
+
+    // One-shot daemon-free php-config reconcile (plan 5560 §2.3 install hook):
+    // recovers any pending journal and materializes channel files for the
+    // preserved php_ini settings.
+    let engine = hearth_lib::php::engine::PhpConfigEngine::new(
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            hearth_lib::config::HearthConfig::load_from(&config_path)?,
+        )),
+        config_path.clone(),
+        config_dir.clone(),
+        provider_roots,
+        std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        std::time::Duration::from_secs(5),
+    );
+    // Hard gate (F4): a Refused/Failed channel outcome aborts install with a
+    // nonzero exit (the preserved config stays persisted; rerun after fixing
+    // the reported path).
+    hearth_lib::php::engine::require_reconciled(engine.boot_sync().await)
+        .map_err(|e| anyhow::anyhow!("php-config reconcile failed: {e}"))?;
 
     // 3. Setup DNS resolver (requires sudo)
     println!("\n[3/3] Setting up DNS resolver (requires sudo)...");
@@ -468,7 +864,9 @@ async fn run_install() -> anyhow::Result<()> {
     let herd_running = hearth_lib::service::manager::is_herd_running();
     let resolver_content = if herd_running {
         // Herd manages its own dnsmasq on default port 53 — don't override it
-        println!("  Herd detected — writing /etc/resolver/test without custom port (using Herd's dnsmasq on port 53)");
+        println!(
+            "  Herd detected — writing /etc/resolver/test without custom port (using Herd's dnsmasq on port 53)"
+        );
         "nameserver 127.0.0.1\n".to_string()
     } else {
         println!("  Writing /etc/resolver/test with port {}", config.dns_port);
@@ -483,10 +881,11 @@ async fn run_install() -> anyhow::Result<()> {
     }
 
     let status = std::process::Command::new("sudo")
-        .args(["bash", "-c", &format!(
-            "echo '{}' > /etc/resolver/test",
-            resolver_content.trim()
-        )])
+        .args([
+            "bash",
+            "-c",
+            &format!("echo '{}' > /etc/resolver/test", resolver_content.trim()),
+        ])
         .status()?;
     if !status.success() {
         anyhow::bail!("Failed to write /etc/resolver/test");
@@ -499,35 +898,70 @@ async fn run_install() -> anyhow::Result<()> {
 
 async fn run_daemon(command: DaemonCommands) -> anyhow::Result<()> {
     match command {
-        DaemonCommands::Start => daemon_start().await,
-        DaemonCommands::Stop => daemon_stop().await,
+        // B6-1 (review 5594 rev6): mutating lifecycle commands obtain ONE
+        // validated root snapshot BEFORE any mkdir/log-create/remove/kill/
+        // spawn — a root-validation failure is a typed error with zero
+        // mutation. Status stays on the read-only seam: pid-file read +
+        // signal-0 probe + socket ping; no mutation, no launch.
+        DaemonCommands::Start => daemon_start(&DaemonLifecyclePaths::detect()?).await,
+        DaemonCommands::Stop => daemon_stop(&DaemonLifecyclePaths::detect()?).await,
         DaemonCommands::Status => daemon_status().await,
     }
 }
 
-/// Read the daemon PID file and check if the process is alive.
-fn daemon_pid() -> Option<u32> {
-    let pid_path = hearth_lib::run_dir().join("daemon.pid");
-    let content = std::fs::read_to_string(&pid_path).ok()?;
+/// Validated daemon-lifecycle paths (review 5594 B6-1): the log dir, pid
+/// file, and socket spellings all derive from the validated `roots.hearth`
+/// of a single `ProviderRoots` snapshot — never from a second raw
+/// `config_dir()`/`log_dir()`/`run_dir()`/`socket_path()` env read.
+struct DaemonLifecyclePaths {
+    log_dir: std::path::PathBuf,
+    pid_file: std::path::PathBuf,
+    socket: std::path::PathBuf,
+}
+
+impl DaemonLifecyclePaths {
+    fn from_roots(roots: &hearth_lib::php::targets::ProviderRoots) -> Self {
+        Self {
+            log_dir: roots.hearth.join("log"),
+            pid_file: roots.hearth.join("run").join("daemon.pid"),
+            socket: roots.hearth.join("hearth.sock"),
+        }
+    }
+
+    fn detect() -> anyhow::Result<Self> {
+        let roots = hearth_lib::php::targets::ProviderRoots::detect()
+            .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?;
+        Ok(Self::from_roots(&roots))
+    }
+}
+
+/// Read a daemon PID file and check whether that process is alive.
+/// Signal 0 checks liveness without sending an actual signal — probe only.
+fn daemon_pid_at(pid_file: &std::path::Path) -> Option<u32> {
+    let content = std::fs::read_to_string(pid_file).ok()?;
     let pid: u32 = content.trim().parse().ok()?;
 
-    // Signal 0 checks if process is alive without actually sending a signal
     let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
     let alive = nix::sys::signal::kill(nix_pid, None).is_ok();
     if alive { Some(pid) } else { None }
 }
 
-async fn daemon_start() -> anyhow::Result<()> {
-    if let Some(pid) = daemon_pid() {
+/// Read-only liveness probe on the raw path seam (status/display only —
+/// mutating lifecycle paths go through [`DaemonLifecyclePaths`]).
+fn daemon_pid() -> Option<u32> {
+    daemon_pid_at(&hearth_lib::run_dir().join("daemon.pid"))
+}
+
+async fn daemon_start(paths: &DaemonLifecyclePaths) -> anyhow::Result<()> {
+    if let Some(pid) = daemon_pid_at(&paths.pid_file) {
         println!("Daemon is already running (PID {})", pid);
         return Ok(());
     }
 
-    let log_dir = hearth_lib::log_dir();
-    std::fs::create_dir_all(&log_dir)?;
+    std::fs::create_dir_all(&paths.log_dir)?;
 
-    let stdout_file = std::fs::File::create(log_dir.join("daemon.out.log"))?;
-    let stderr_file = std::fs::File::create(log_dir.join("daemon.err.log"))?;
+    let stdout_file = std::fs::File::create(paths.log_dir.join("daemon.out.log"))?;
+    let stderr_file = std::fs::File::create(paths.log_dir.join("daemon.err.log"))?;
 
     // Resolve hearth-daemon as a sibling of the current `hearth` binary first,
     // then fall back to PATH. Without sibling-first resolution, a stale brew
@@ -559,35 +993,38 @@ async fn daemon_start() -> anyhow::Result<()> {
                 .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
         });
     }
-    let child = command
-        .spawn()
-        .context("Failed to start hearth-daemon. Is it installed next to the `hearth` binary or on PATH?")?;
+    let child = command.spawn().context(
+        "Failed to start hearth-daemon. Is it installed next to the `hearth` binary or on PATH?",
+    )?;
 
     let pid = child.id();
     println!("Daemon starting (PID {})...", pid);
 
-    // Wait briefly for the socket to appear
-    let socket_path = hearth_lib::socket::socket_path();
+    // Wait briefly for the socket to appear — same validated spelling the
+    // spawned daemon derives from its own boot snapshot.
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if socket_path.exists() {
+        if paths.socket.exists() {
             println!("Daemon is running.");
             return Ok(());
         }
     }
 
-    println!("Daemon started but socket not yet available. Check logs at {}", log_dir.display());
+    println!(
+        "Daemon started but socket not yet available. Check logs at {}",
+        paths.log_dir.display()
+    );
     Ok(())
 }
 
-async fn daemon_stop() -> anyhow::Result<()> {
-    let Some(pid) = daemon_pid() else {
+async fn daemon_stop(paths: &DaemonLifecyclePaths) -> anyhow::Result<()> {
+    let Some(pid) = daemon_pid_at(&paths.pid_file) else {
         println!("Daemon is not running.");
         return Ok(());
     };
 
     // Gracefully stop all supervised services before killing the daemon
-    if let Ok(_) = send_to_daemon(DaemonRequest::Stop).await {
+    if let Ok(_) = send_to_daemon_at(&paths.socket, DaemonRequest::Stop).await {
         println!("Services stopped.");
     }
 
@@ -604,14 +1041,17 @@ async fn daemon_stop() -> anyhow::Result<()> {
         let alive = nix::sys::signal::kill(nix_pid, None).is_ok();
         if !alive {
             // Clean up stale files
-            let _ = std::fs::remove_file(hearth_lib::run_dir().join("daemon.pid"));
-            let _ = std::fs::remove_file(hearth_lib::socket::socket_path());
+            let _ = std::fs::remove_file(&paths.pid_file);
+            let _ = std::fs::remove_file(&paths.socket);
             println!("Daemon stopped.");
             return Ok(());
         }
     }
 
-    println!("Daemon did not stop within 5 seconds. You may need to kill PID {} manually.", pid);
+    println!(
+        "Daemon did not stop within 5 seconds. You may need to kill PID {} manually.",
+        pid
+    );
     Ok(())
 }
 
@@ -675,13 +1115,11 @@ async fn run_add(
     yes: bool,
     no_supervise: bool,
     dry_run: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ExitClass> {
     use std::io::IsTerminal;
 
     if !yes && !std::io::stdin().is_terminal() {
-        anyhow::bail!(
-            "refusing to prompt on non-TTY; pass --yes to accept defaults"
-        );
+        anyhow::bail!("refusing to prompt on non-TTY; pass --yes to accept defaults");
     }
 
     let site_path = site
@@ -720,8 +1158,7 @@ async fn run_add(
     };
 
     let response = send_to_daemon(request).await?;
-    print_response(response);
-    Ok(())
+    Ok(print_response(response))
 }
 
 /// Collect Telescope-specific answers. With `--yes`, takes defaults:
@@ -811,10 +1248,11 @@ fn reverb_prompts(yes: bool) -> anyhow::Result<AddAnswers> {
         let port = if port_is_free(8080) {
             8080
         } else {
-            first_free_port(8080, 8099, 20)
-                .ok_or_else(|| anyhow::anyhow!(
+            first_free_port(8080, 8099, 20).ok_or_else(|| {
+                anyhow::anyhow!(
                     "ports 8080..=8099 are all busy; pass --site and rerun without --yes"
-                ))?
+                )
+            })?
         };
         answers.reverb_port = Some(port);
         return Ok(answers);
@@ -937,4 +1375,540 @@ async fn run_mcp_bridge(mcp_url: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hearth_lib::socket::{
+        FileOutcome, PhpConfigAction, PhpConfigOutcome, PhpScope, PhpTargetRow,
+    };
+
+    fn build(
+        key: Option<&str>,
+        value: Option<&str>,
+        global: bool,
+        php: Option<&str>,
+        show: bool,
+        unset: bool,
+        status: bool,
+        sync: bool,
+        unmanage: bool,
+    ) -> Result<PhpConfigAction, String> {
+        build_php_config_action(
+            key.map(String::from),
+            value.map(String::from),
+            global,
+            php.map(String::from),
+            show,
+            unset,
+            status,
+            sync,
+            unmanage,
+        )
+    }
+
+    #[test]
+    fn flag_matrix_rejects_invalid_combinations() {
+        // More than one action flag.
+        assert!(
+            build(
+                Some("k"),
+                None,
+                false,
+                None,
+                true,
+                true,
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(build(None, None, false, None, false, false, true, true, false).is_err());
+        // --global with --php.
+        assert!(
+            build(
+                Some("k"),
+                Some("v"),
+                true,
+                Some("8.3"),
+                false,
+                false,
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
+        // Status/Sync/Unmanage take no key/value/scope.
+        assert!(
+            build(
+                Some("k"),
+                None,
+                false,
+                None,
+                false,
+                false,
+                true,
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            build(
+                None,
+                Some("v"),
+                false,
+                None,
+                false,
+                false,
+                false,
+                true,
+                false
+            )
+            .is_err()
+        );
+        assert!(build(None, None, true, None, false, false, false, false, true).is_err());
+        assert!(
+            build(
+                None,
+                None,
+                false,
+                Some("8.3"),
+                false,
+                false,
+                true,
+                false,
+                false
+            )
+            .is_err()
+        );
+        // --show forbids a value.
+        assert!(
+            build(
+                Some("k"),
+                Some("v"),
+                false,
+                None,
+                true,
+                false,
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
+        // --unset requires a key, forbids a value.
+        assert!(build(None, None, false, None, false, true, false, false, false).is_err());
+        assert!(
+            build(
+                Some("k"),
+                Some("v"),
+                false,
+                None,
+                false,
+                true,
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
+        // Implicit Set needs both key and value.
+        assert!(
+            build(
+                Some("k"),
+                None,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(build(None, None, false, None, false, false, false, false, false).is_err());
+    }
+
+    #[test]
+    fn flag_matrix_builds_expected_actions() {
+        // Bare invocation keeps Active-version behavior.
+        assert_eq!(
+            build(
+                Some("memory_limit"),
+                Some("1G"),
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            Ok(PhpConfigAction::Set {
+                scope: PhpScope::Active,
+                key: "memory_limit".to_string(),
+                value: "1G".to_string(),
+            })
+        );
+        assert_eq!(
+            build(
+                Some("k"),
+                Some("v"),
+                true,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            Ok(PhpConfigAction::Set {
+                scope: PhpScope::Global,
+                key: "k".to_string(),
+                value: "v".to_string(),
+            })
+        );
+        assert_eq!(
+            build(
+                Some("k"),
+                Some("v"),
+                false,
+                Some("8.3"),
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            Ok(PhpConfigAction::Set {
+                scope: PhpScope::Version {
+                    version: "8.3".to_string()
+                },
+                key: "k".to_string(),
+                value: "v".to_string(),
+            })
+        );
+        assert_eq!(
+            build(
+                Some("k"),
+                None,
+                true,
+                None,
+                false,
+                true,
+                false,
+                false,
+                false
+            ),
+            Ok(PhpConfigAction::Unset {
+                scope: PhpScope::Global,
+                key: "k".to_string(),
+            })
+        );
+        assert_eq!(
+            build(None, None, false, None, true, false, false, false, false),
+            Ok(PhpConfigAction::Show { key: None })
+        );
+        assert_eq!(
+            build(
+                Some("k"),
+                None,
+                false,
+                None,
+                true,
+                false,
+                false,
+                false,
+                false
+            ),
+            Ok(PhpConfigAction::Show {
+                key: Some("k".to_string())
+            })
+        );
+        assert_eq!(
+            build(None, None, false, None, false, false, true, false, false),
+            Ok(PhpConfigAction::Status)
+        );
+        assert_eq!(
+            build(None, None, false, None, false, false, false, true, false),
+            Ok(PhpConfigAction::Sync)
+        );
+        assert_eq!(
+            build(None, None, false, None, false, false, false, false, true),
+            Ok(PhpConfigAction::Unmanage)
+        );
+    }
+
+    fn row(coverage: &str) -> PhpTargetRow {
+        PhpTargetRow {
+            provider: "herd".to_string(),
+            version: "8.4".to_string(),
+            sapi: "cli".to_string(),
+            context: "sanitized".to_string(),
+            channel: Some("/usr/local/etc/php/conf.d".to_string()),
+            coverage: coverage.to_string(),
+            configured: None,
+            observed: None,
+            observed_state: "n/a".to_string(),
+        }
+    }
+
+    fn outcome_with_rows(rows: Vec<PhpTargetRow>) -> PhpConfigOutcome {
+        PhpConfigOutcome {
+            persisted: None,
+            rows,
+            files: vec![],
+            fpm: FpmRestartOutcome::NotAttempted,
+        }
+    }
+
+    #[test]
+    fn render_unmanaged_row_with_remediation_and_footer_no_universal_claim() {
+        let outcome = outcome_with_rows(vec![row("UNMANAGED: privileged-dir")]);
+        let (out, err, exit) = render_php_config_report(&outcome);
+        assert!(out.contains("UNMANAGED: privileged-dir"), "got: {out}");
+        assert!(out.contains("remediation"), "got: {out}");
+        assert!(out.contains("hearth php exec"), "got: {out}");
+        assert!(out.contains("Coverage: Hearth guarantees"), "got: {out}");
+        assert!(out.contains("outside that guarantee"), "got: {out}");
+        assert!(
+            !out.to_lowercase().contains("universal"),
+            "must never claim universal coverage: {out}"
+        );
+        assert!(err.is_empty());
+        // Unmanaged-only cells exit zero.
+        assert_eq!(exit, ExitClass::Success);
+    }
+
+    #[test]
+    fn render_launch_blocked_row_cites_followup_todo() {
+        let outcome = outcome_with_rows(vec![row(
+            "LAUNCH-BLOCKED: missing fpm config — see todo #2343",
+        )]);
+        let (out, _err, exit) = render_php_config_report(&outcome);
+        assert!(out.contains("LAUNCH-BLOCKED"), "got: {out}");
+        assert!(out.contains("#2343"), "got: {out}");
+        assert_eq!(exit, ExitClass::Success);
+    }
+
+    #[test]
+    fn render_degraded_channel_blocked_row() {
+        let outcome = outcome_with_rows(vec![row(
+            "managed* — channel blocked: /opt/homebrew/etc/php/8.5/conf.d/zz-hearth.ini",
+        )]);
+        let (out, _err, _exit) = render_php_config_report(&outcome);
+        assert!(out.contains("channel blocked"), "got: {out}");
+        assert!(out.contains("--sync"), "got: {out}");
+    }
+
+    #[test]
+    fn render_four_state_observation_labels() {
+        let mut r = row("managed (channel+env)");
+        r.configured = Some("1G".to_string());
+        r.observed = Some("1G".to_string());
+        r.observed_state = "materialized".to_string();
+        let (out, _err, _exit) = render_php_config_report(&outcome_with_rows(vec![r]));
+        assert!(out.contains("configured=1G"), "got: {out}");
+        assert!(out.contains("observed=1G (materialized)"), "got: {out}");
+
+        let mut r = row("managed (channel; env ignored)");
+        r.configured = Some("1G".to_string());
+        let (out, _err, _exit) = render_php_config_report(&outcome_with_rows(vec![r]));
+        assert!(out.contains("observed=n/a"), "got: {out}");
+    }
+
+    #[test]
+    fn exit_class_rules() {
+        // Refused channel file → nonzero.
+        let refused = PhpConfigOutcome {
+            persisted: Some(true),
+            rows: vec![],
+            files: vec![FileOutcome {
+                path: "/x/zz-hearth.ini".to_string(),
+                result: FileWriteResult::Refused {
+                    reason: "untracked".to_string(),
+                },
+            }],
+            fpm: FpmRestartOutcome::NotAttempted,
+        };
+        assert_eq!(render_php_config_report(&refused).2, ExitClass::Failure);
+
+        // Failed channel file → nonzero.
+        let failed = PhpConfigOutcome {
+            persisted: Some(true),
+            rows: vec![],
+            files: vec![FileOutcome {
+                path: "/x/zz-hearth.ini".to_string(),
+                result: FileWriteResult::Failed {
+                    error: "io".to_string(),
+                },
+            }],
+            fpm: FpmRestartOutcome::NotAttempted,
+        };
+        assert_eq!(render_php_config_report(&failed).2, ExitClass::Failure);
+
+        // Registered restart failure → nonzero.
+        let fpm_failed = PhpConfigOutcome {
+            persisted: Some(true),
+            rows: vec![],
+            files: vec![],
+            fpm: FpmRestartOutcome::Failed {
+                message: "boom".to_string(),
+            },
+        };
+        assert_eq!(render_php_config_report(&fpm_failed).2, ExitClass::Failure);
+
+        // NotRegistered / LaunchBlocked are informational → zero.
+        for fpm in [
+            FpmRestartOutcome::NotRegistered { herd_hint: true },
+            FpmRestartOutcome::NotRegistered { herd_hint: false },
+            FpmRestartOutcome::LaunchBlocked {
+                reason: "missing fpm config — see todo #2343".to_string(),
+            },
+            FpmRestartOutcome::Restarted,
+            FpmRestartOutcome::NotAttempted,
+        ] {
+            let ok = PhpConfigOutcome {
+                persisted: Some(true),
+                rows: vec![],
+                files: vec![FileOutcome {
+                    path: "/x/zz-hearth.ini".to_string(),
+                    result: FileWriteResult::Written,
+                }],
+                fpm,
+            };
+            assert_eq!(render_php_config_report(&ok).2, ExitClass::Success);
+        }
+    }
+
+    #[test]
+    fn print_response_error_branch_returns_failure_without_exiting() {
+        // Reaching the assertion proves no process exit happened.
+        let exit = print_response(DaemonResponse::Error {
+            message: "boom".to_string(),
+        });
+        assert_eq!(exit, ExitClass::Failure);
+    }
+
+    #[test]
+    fn print_response_conflict_branch_returns_failure_without_exiting() {
+        let exit = print_response(DaemonResponse::Conflict {
+            engine: "mysql".to_string(),
+            port: 3306,
+            owner_hint: Some("homebrew.mxcl.mysql".to_string()),
+        });
+        assert_eq!(exit, ExitClass::Failure);
+    }
+
+    #[test]
+    fn print_response_success_branches_return_success() {
+        assert_eq!(
+            print_response(DaemonResponse::Ok { message: None }),
+            ExitClass::Success
+        );
+        assert_eq!(print_response(DaemonResponse::Pong), ExitClass::Success);
+    }
+
+    #[test]
+    fn print_response_php_report_propagates_renderer_exit_class() {
+        let refused = PhpConfigOutcome {
+            persisted: Some(true),
+            rows: vec![],
+            files: vec![FileOutcome {
+                path: "/x/zz-hearth.ini".to_string(),
+                result: FileWriteResult::Refused {
+                    reason: "untracked".to_string(),
+                },
+            }],
+            fpm: FpmRestartOutcome::NotAttempted,
+        };
+        assert_eq!(
+            print_response(DaemonResponse::PhpConfigReport(refused)),
+            ExitClass::Failure
+        );
+    }
+
+    #[test]
+    fn daemon_lifecycle_paths_derive_from_validated_snapshot() {
+        // B6-1: every mutating lifecycle path spelling comes from the
+        // validated snapshot's hearth root — no raw env-derived helper.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let roots = hearth_lib::php::targets::ProviderRoots::isolated(
+            &base,
+            base.join("hearth"),
+            base.join("herd"),
+            base.join("homebrew"),
+        )
+        .unwrap();
+        let paths = DaemonLifecyclePaths::from_roots(&roots);
+        assert_eq!(paths.log_dir, base.join("hearth/log"));
+        assert_eq!(paths.pid_file, base.join("hearth/run/daemon.pid"));
+        assert_eq!(paths.socket, base.join("hearth/hearth.sock"));
+        for p in [&paths.log_dir, &paths.pid_file, &paths.socket] {
+            assert!(p.starts_with(&roots.hearth), "derived from roots.hearth");
+        }
+    }
+
+    #[test]
+    fn daemon_lifecycle_detect_fails_closed_before_any_mutation() {
+        // B6-1 red at 2651cdd: a relative HEARTH_CONFIG_DIR made
+        // `daemon start` create CWD-relative log dirs/files and spawn the
+        // daemon. Post-fix, path construction itself is the gate: detect()
+        // returns the typed error and daemon_start/daemon_stop (which only
+        // accept an already-validated DaemonLifecyclePaths) are never
+        // reached — zero mkdir/create/remove/kill/spawn.
+        //
+        // This is the only env-mutating test in this crate; exact prior
+        // values are restored below (no other test reads these keys).
+        let keys = [
+            "HEARTH_CONFIG_DIR",
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+        ];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+
+        // SAFETY: single env-mutating test in this binary.
+        unsafe {
+            std::env::remove_var("HEARTH_ISOLATED_ROOT");
+            std::env::remove_var("HEARTH_HERD_ROOT");
+            std::env::remove_var("HEARTH_HOMEBREW_ROOT");
+            std::env::set_var("HEARTH_CONFIG_DIR", "relative-b6-cfg");
+        }
+        let relative = DaemonLifecyclePaths::detect();
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var("HEARTH_HERD_ROOT", "/tmp/lone-override");
+            std::env::remove_var("HEARTH_CONFIG_DIR");
+        }
+        let lone = DaemonLifecyclePaths::detect();
+        // SAFETY: as above — restore the exact prior values.
+        unsafe {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+
+        let err = relative.err().expect("relative override must fail closed");
+        assert!(
+            err.to_string()
+                .contains("provider-root configuration invalid"),
+            "typed actionable error, got: {err}"
+        );
+        assert!(
+            !std::path::Path::new("relative-b6-cfg").exists(),
+            "zero mutation on rejection"
+        );
+        assert!(lone.is_err(), "lone discovery override must fail closed");
+    }
 }

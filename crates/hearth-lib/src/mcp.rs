@@ -12,9 +12,11 @@ use tokio::sync::Mutex;
 
 use crate::config::HearthConfig;
 use crate::php::PhpManager;
+use crate::php::engine::{PhpConfigEngine, restart_fpm_conditionally};
 use crate::service::supervisor::ServiceSupervisor;
 use crate::service::{ServiceKind, ServiceState};
 use crate::site::SiteManager;
+use crate::socket::{FpmRestartOutcome, PhpConfigAction, PhpScope};
 use crate::valet::ValetCli;
 
 // ---------------------------------------------------------------------------
@@ -55,6 +57,13 @@ pub struct PhpConfigParams {
     pub key: String,
     /// The value to set (e.g., "512M")
     pub value: String,
+    /// Apply globally to every PHP version (mutually exclusive with `version`)
+    #[serde(default)]
+    pub global: Option<bool>,
+    /// Apply to one version's override table (e.g., "8.3"); omit for the
+    /// active version
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -81,6 +90,9 @@ pub struct HearthMcpServer {
     pub site_manager: Arc<Mutex<SiteManager>>,
     pub php_manager: Arc<Mutex<PhpManager>>,
     pub config: Arc<Mutex<HearthConfig>>,
+    /// Shared php-config engine — same instance as the daemon socket handler,
+    /// so its op lock serializes config/reconcile mutations across both.
+    pub engine: Arc<PhpConfigEngine>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -108,6 +120,7 @@ impl HearthMcpServer {
         site_manager: Arc<Mutex<SiteManager>>,
         php_manager: Arc<Mutex<PhpManager>>,
         config: Arc<Mutex<HearthConfig>>,
+        engine: Arc<PhpConfigEngine>,
     ) -> Self {
         let tool_router = Self::tool_router();
         Self {
@@ -115,6 +128,7 @@ impl HearthMcpServer {
             site_manager,
             php_manager,
             config,
+            engine,
             tool_router,
         }
     }
@@ -200,41 +214,11 @@ impl HearthMcpServer {
         &self,
         Parameters(params): Parameters<PhpSwitchParams>,
     ) -> Result<String, String> {
-        let version = &params.version;
-        let config_dir = crate::config_dir();
-
-        // Resolve the php-fpm binary using the same resolver as the daemon
-        let fpm_binary =
-            crate::php::resolver::resolve_phpfpm_binary(version, &config_dir).ok_or_else(|| {
-                format!("PHP {version} php-fpm binary not found")
-            })?;
-
-        // Lock ordering: config first, then supervisor
-        {
-            let mut cfg = self.config.lock().await;
-            cfg.default_php = version.clone();
-            cfg.save()
-                .map_err(|e| format!("Failed to save config: {e}"))?;
-        }
-
-        // Stop php-fpm, reconfigure with full args, restart
-        let mut sup = self.supervisor.lock().await;
-        let _ = sup.stop_service(ServiceKind::PhpFpm);
-        sup.reconfigure_service(
-            ServiceKind::PhpFpm,
-            fpm_binary.to_string_lossy().to_string(),
-            vec![
-                "--nodaemonize".to_string(),
-                format!(
-                    "--fpm-config={}",
-                    config_dir.join("fpm/php-fpm.conf").display()
-                ),
-            ],
-        );
-        sup.start_service(ServiceKind::PhpFpm)
-            .map_err(|e| format!("Failed to start php-fpm {version}: {e}"))?;
-
-        Ok(format!("Switched to PHP {version}"))
+        // Same shared switch path as the daemon socket handler: injected
+        // engine paths, hard-gated reconcile, FPM service rebuilt with the
+        // new version's binary/args/env (F3/F4).
+        crate::php::engine::switch_php_version(&self.supervisor, &self.engine, &params.version)
+            .await
     }
 
     /// Link a directory through the active Valet or Herd backend.
@@ -387,27 +371,80 @@ impl HearthMcpServer {
         &self,
         Parameters(params): Parameters<PhpConfigParams>,
     ) -> Result<String, String> {
-        let version = {
-            let cfg = self.config.lock().await;
-            cfg.default_php.clone()
-        };
-
-        {
-            let pm = self.php_manager.lock().await;
-            pm.set_ini_value(&version, &params.key, &params.value)
-                .map_err(|e| format!("Failed to set php.ini value: {e}"))?;
+        if params.global == Some(true) && params.version.is_some() {
+            return Err("`global` and `version` are mutually exclusive".to_string());
         }
-
-        // Restart php-fpm to pick up the change
-        let mut sup = self.supervisor.lock().await;
-        let _ = sup.stop_service(ServiceKind::PhpFpm);
-        sup.start_service(ServiceKind::PhpFpm)
-            .map_err(|e| format!("Failed to restart php-fpm: {e}"))?;
-
+        let scope = if params.global == Some(true) {
+            PhpScope::Global
+        } else if let Some(version) = params.version.clone() {
+            PhpScope::Version { version }
+        } else {
+            PhpScope::Active
+        };
+        let action = PhpConfigAction::Set {
+            scope,
+            key: params.key.clone(),
+            value: params.value.clone(),
+        };
+        // Hard gate (F4): a Refused/Failed channel outcome is returned as an
+        // actionable error (paths + reasons) and no FPM restart happens; the
+        // canonical config remains truthfully persisted.
+        crate::php::engine::require_reconciled(self.engine.apply(action).await)?;
+        let fpm = restart_fpm_conditionally(&self.supervisor, &self.engine).await;
+        let fpm_note = match &fpm {
+            FpmRestartOutcome::Restarted => "php-fpm restarted".to_string(),
+            FpmRestartOutcome::NotRegistered { herd_hint: true } => {
+                "php-fpm not restarted: not registered (Herd manages PHP-FPM)".to_string()
+            }
+            FpmRestartOutcome::NotRegistered { herd_hint: false } => {
+                "php-fpm not restarted: not registered".to_string()
+            }
+            FpmRestartOutcome::LaunchBlocked { reason } => {
+                format!("php-fpm not restarted: launch-blocked ({reason})")
+            }
+            FpmRestartOutcome::Failed { message } => {
+                return Err(format!(
+                    "Set {}={} persisted, but php-fpm restart failed: {message}",
+                    params.key, params.value
+                ));
+            }
+            FpmRestartOutcome::NotAttempted => "php-fpm restart not attempted".to_string(),
+        };
         Ok(format!(
-            "Set {}={} in PHP {} php.ini and restarted php-fpm",
-            params.key, params.value, version
+            "Set {}={} (persisted). {fpm_note}.",
+            params.key, params.value
         ))
+    }
+
+    /// Per-target PHP configuration coverage table.
+    #[tool(
+        name = "hearth_php_config_status",
+        description = "Report per-target PHP configuration coverage (provider/version/sapi/context) with truthful managed/UNMANAGED/LAUNCH-BLOCKED labels"
+    )]
+    async fn hearth_php_config_status(&self) -> Result<String, String> {
+        let outcome = self.engine.apply(PhpConfigAction::Status).await?;
+        if outcome.rows.is_empty() {
+            return Ok("No PHP targets discovered.".to_string());
+        }
+        let mut lines = Vec::with_capacity(outcome.rows.len() + 1);
+        for row in &outcome.rows {
+            lines.push(format!(
+                "{} {} {} [{}] {} — {}",
+                row.provider,
+                row.version,
+                row.sapi,
+                row.context,
+                row.channel.as_deref().unwrap_or("—"),
+                row.coverage,
+            ));
+        }
+        lines.push(
+            "Coverage: Hearth guarantees Hearth-launched processes (env-honoring binaries) \
+             and verified user-owned, version-exclusive channels. UNMANAGED/LAUNCH-BLOCKED \
+             cells are outside that guarantee."
+                .to_string(),
+        );
+        Ok(lines.join("\n"))
     }
 }
 
@@ -488,13 +525,31 @@ mod tests {
         let tmp_php = tempfile::TempDir::new().expect("tempdir");
         let pm = PhpManager::new(tmp_php.path().to_path_buf());
 
-        let config = HearthConfig::default();
+        let config = Arc::new(Mutex::new(HearthConfig::default()));
+
+        let tmp_engine = tempfile::TempDir::new().expect("tempdir");
+        let base = tmp_engine.path().to_path_buf();
+        let engine = Arc::new(PhpConfigEngine::new(
+            Arc::clone(&config),
+            base.join("config.toml"),
+            base.join("hearth"),
+            crate::php::targets::ProviderRoots::isolated(
+                &base,
+                base.join("hearth"),
+                base.join("herd"),
+                base.join("homebrew"),
+            )
+            .unwrap(),
+            Arc::new(|| false),
+            std::time::Duration::from_millis(50),
+        ));
 
         HearthMcpServer::new(
             Arc::new(Mutex::new(sup)),
             Arc::new(Mutex::new(sm)),
             Arc::new(Mutex::new(pm)),
-            Arc::new(Mutex::new(config)),
+            config,
+            engine,
         )
     }
 
@@ -540,11 +595,27 @@ mod tests {
         let tmp_valet = tempfile::TempDir::new().expect("tempdir");
         let sm = SiteManager::new(tmp_valet.path().to_path_buf(), "test".to_string());
 
+        let config = Arc::new(Mutex::new(HearthConfig::default()));
+        let engine = Arc::new(PhpConfigEngine::new(
+            Arc::clone(&config),
+            tmp_php.path().join("config.toml"),
+            tmp_php.path().join("hearth"),
+            crate::php::targets::ProviderRoots::isolated(
+                tmp_php.path(),
+                tmp_php.path().join("hearth"),
+                tmp_php.path().join("herd"),
+                tmp_php.path().join("homebrew"),
+            )
+            .unwrap(),
+            Arc::new(|| false),
+            std::time::Duration::from_millis(50),
+        ));
         let server = HearthMcpServer::new(
             Arc::new(Mutex::new(sup)),
             Arc::new(Mutex::new(sm)),
             Arc::new(Mutex::new(pm)),
-            Arc::new(Mutex::new(HearthConfig::default())),
+            config,
+            engine,
         );
 
         let result: Result<String, String> = server.hearth_php_list().await;
@@ -566,8 +637,8 @@ mod tests {
 
         let err = result.expect_err("should return an error for nonexistent PHP version");
         assert!(
-            err.contains("not found"),
-            "should mention not found, got: {err}"
+            err.contains("not installed"),
+            "should mention not installed, got: {err}"
         );
     }
 
@@ -586,8 +657,8 @@ mod tests {
         let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
         assert_eq!(
             tools.len(),
-            11,
-            "Expected 11 tools, got {}: {:?}",
+            12,
+            "Expected 12 tools, got {}: {:?}",
             tools.len(),
             names
         );
@@ -600,6 +671,7 @@ mod tests {
             "hearth_site_unlink",
             "hearth_service_restart",
             "hearth_php_config",
+            "hearth_php_config_status",
             "hearth_db_start",
             "hearth_db_stop",
             "hearth_db_status",

@@ -1,3 +1,4 @@
+pub mod engine;
 pub mod ini_guard;
 pub mod reconcile;
 pub mod resolver;
@@ -133,9 +134,41 @@ impl PhpManager {
     }
 }
 
+/// Belt-E env pair for Hearth-launched PHP processes: the leading colon means
+/// "compiled-in default scan dir first, then ours", so Hearth's `zz-hearth.ini`
+/// values win on conflict (parse order machine-verified: default entries
+/// first, marker last). Only credited to binaries whose env-honor canary
+/// passed — Herd-patched binaries ignore this variable whenever their own
+/// `HERD_PHP_XY_INI_SCAN_DIR` launcher variable is present in the
+/// environment (NOT a HOME effect; see targets.rs module docs).
+pub fn scan_dir_env(config_dir: &std::path::Path, version: &str) -> (String, String) {
+    (
+        "PHP_INI_SCAN_DIR".to_string(),
+        format!(
+            ":{}",
+            config_dir
+                .join("php")
+                .join(version)
+                .join("conf.d")
+                .display()
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_dir_env_value_is_colon_prefixed() {
+        let (key, value) = scan_dir_env(std::path::Path::new("/tmp/hearth config"), "8.4");
+        assert_eq!(key, "PHP_INI_SCAN_DIR");
+        assert_eq!(value, ":/tmp/hearth config/php/8.4/conf.d");
+        assert!(
+            value.starts_with(':'),
+            "leading colon appends after default scan dir"
+        );
+    }
 
     #[test]
     fn installed_versions_includes_hearth_cache() {

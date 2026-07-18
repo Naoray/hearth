@@ -429,7 +429,7 @@ fn write_channel_file(
     manifest_path: &Path,
     file_path: &Path,
     dir: &Path,
-    provider: PhpProvider,
+    _provider: PhpProvider,
     kind: &str,
     version: &str,
     content: &str,
@@ -492,12 +492,21 @@ fn write_channel_file(
     }
 
     // 2. Re-verify the channel and write via exclusive temp + rename.
-    //    Only Hearth-owned conf.d dirs may be created by Hearth.
-    if provider == PhpProvider::Hearth
-        && !dir.exists()
-        && let Err(e) = std::fs::create_dir_all(dir)
-    {
-        return finalize_failure(manifest, manifest_path, file_path, e.to_string());
+    //    NO creation here (review 5594 B2-5): the engine performs hardened,
+    //    verified Hearth-channel creation BEFORE reconcile. A directory that
+    //    disappeared or was substituted after classification is a typed
+    //    failure — never recreated through a possibly-changed path.
+    if !dir.exists() {
+        return finalize_failure(
+            manifest,
+            manifest_path,
+            file_path,
+            format!(
+                "channel directory {} disappeared after classification — refusing to \
+                 recreate at write time; run `hearth php config --sync`",
+                dir.display()
+            ),
+        );
     }
     let verified = match verify_user_channel(dir, allowed) {
         Ok(v) => v,
@@ -860,11 +869,13 @@ mod tests {
     }
 
     fn test_roots(base: &Path) -> ProviderRoots {
-        ProviderRoots {
-            hearth: base.join("hearth"),
-            herd: base.join("Herd"),
-            homebrew: base.join("homebrew"),
-        }
+        ProviderRoots::isolated(
+            base,
+            base.join("hearth"),
+            base.join("Herd"),
+            base.join("homebrew"),
+        )
+        .unwrap()
     }
 
     fn verified_target(
@@ -873,6 +884,10 @@ mod tests {
         sapi: PhpSapi,
         dir: &Path,
     ) -> PhpTarget {
+        // B2-5 contract: a Verified channel dir EXISTS before reconcile (the
+        // engine's hardened creation runs earlier); reconcile itself never
+        // creates directories.
+        std::fs::create_dir_all(dir).unwrap();
         PhpTarget {
             id: PhpTargetIdentity {
                 provider,
@@ -2195,6 +2210,62 @@ mod tests {
             actions
                 .iter()
                 .any(|a| a.path == tracked && matches!(a.outcome, WriteOutcome::Refused { .. }))
+        );
+    }
+
+    // ---- B2-5 adversarial write-point checks (no create-before-verify) ----
+
+    #[test]
+    fn write_fails_typed_when_dir_disappears_after_classification_no_recreation() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        let ini = simple_ini("8.4", "memory_limit", "2G");
+        let target = verified_target(PhpProvider::Hearth, "8.4", PhpSapi::Cli, &dir);
+
+        // Adversary removes the classified/created dir before the write.
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let report = reconcile(&ini, &[target], &manifest_path, &roots);
+        let file = dir.join(CHANNEL_FILE_NAME);
+        match outcome_for(&report, &file) {
+            WriteOutcome::Failed { error } => {
+                assert!(error.contains("disappeared"), "got: {error}");
+            }
+            other => panic!("expected typed Failed, got {other:?}"),
+        }
+        assert!(!dir.exists(), "write path must NOT recreate the directory");
+    }
+
+    #[test]
+    fn write_refused_when_ancestor_substituted_by_symlink_zero_outside_mutation() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        let manifest_path = base.join("manifest-outside-hearth/manifest.toml");
+        let ini = simple_ini("8.4", "memory_limit", "2G");
+        let target = verified_target(PhpProvider::Hearth, "8.4", PhpSapi::Cli, &dir);
+
+        // Adversary substitutes the `php` ancestor with a symlink escaping
+        // into an attacker-controlled directory AFTER classification.
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join("8.4/conf.d")).unwrap();
+        let php_ancestor = base.join("hearth/php");
+        std::fs::remove_dir_all(&php_ancestor).unwrap();
+        std::os::unix::fs::symlink(&outside, &php_ancestor).unwrap();
+
+        let report = reconcile(&ini, &[target], &manifest_path, &roots);
+        let file = dir.join(CHANNEL_FILE_NAME);
+        match outcome_for(&report, &file) {
+            WriteOutcome::Refused { reason } => {
+                assert!(reason.contains("symlink"), "got: {reason}");
+            }
+            other => panic!("expected typed Refused, got {other:?}"),
+        }
+        assert!(
+            !outside.join("8.4/conf.d").join(CHANNEL_FILE_NAME).exists(),
+            "zero mutation through the substituted ancestor"
         );
     }
 }
