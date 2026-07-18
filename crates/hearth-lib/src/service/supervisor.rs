@@ -63,6 +63,11 @@ pub struct ManagedService {
     /// Extra environment variables for the spawned child (e.g. the Belt-E
     /// `PHP_INI_SCAN_DIR` pair for PHP workers/FPM). Empty = inherit only.
     env: Vec<(String, String)>,
+    /// Trustworthy Hearth-owned start metadata: recorded at the moment THIS
+    /// supervisor spawned the child, cleared on stop. Never inferred from
+    /// ambient process evidence (titles, argv, /proc) — that entire evidence
+    /// class is banned (review 5594).
+    started_at: Option<std::time::SystemTime>,
 }
 
 impl ManagedService {
@@ -78,6 +83,7 @@ impl ManagedService {
             cwd: None,
             site_name: None,
             env: Vec::new(),
+            started_at: None,
         }
     }
 
@@ -115,6 +121,7 @@ impl ManagedService {
             cwd: Some(cwd),
             site_name: None,
             env: Vec::new(),
+            started_at: None,
         }
     }
 
@@ -137,6 +144,7 @@ impl ManagedService {
             cwd: Some(cwd),
             site_name: Some(site_name.into()),
             env: Vec::new(),
+            started_at: None,
         }
     }
 
@@ -153,6 +161,13 @@ impl ManagedService {
     /// Extra environment variables applied to the spawned child.
     pub fn env(&self) -> &[(String, String)] {
         &self.env
+    }
+
+    /// When THIS supervisor spawned the current child (`None` when stopped).
+    /// The trustworthy Hearth-owned start metadata behind the truthful
+    /// `pending restart` marker — never derived from ambient process facts.
+    pub fn started_at(&self) -> Option<std::time::SystemTime> {
+        self.started_at
     }
 
     /// The command this service spawns.
@@ -190,6 +205,7 @@ impl ManagedService {
         let pid = child.id();
         self.child = Some(child);
         self.state = ServiceState::Running { pid };
+        self.started_at = Some(std::time::SystemTime::now());
 
         info!(service = %self.kind, pid, "service started");
         Ok(())
@@ -200,6 +216,7 @@ impl ManagedService {
     /// - All others → SIGTERM to the process group, poll until grace expires,
     ///   then SIGKILL.
     pub fn stop(&mut self) -> anyhow::Result<()> {
+        self.started_at = None;
         let Some(mut child) = self.child.take() else {
             self.state = ServiceState::Stopped;
             return Ok(());
@@ -721,5 +738,30 @@ mod tests {
         let contents = std::fs::read_to_string(cwd.join("env-output"))
             .expect("child should have written env-output");
         assert_eq!(contents, ":/tmp/hearth/php/8.4/conf.d");
+    }
+
+    /// Task 8: the trustworthy Hearth-owned FPM start metadata — recorded at
+    /// spawn by THIS supervisor, cleared on stop, never inferred from
+    /// ambient process facts.
+    #[test]
+    fn started_at_recorded_on_start_cleared_on_stop() {
+        let mut svc = ManagedService::new(
+            ServiceKind::PhpFpm,
+            "/bin/sleep".to_string(),
+            vec!["30".to_string()],
+        );
+        assert!(svc.started_at().is_none(), "no spawn yet");
+
+        let before = std::time::SystemTime::now();
+        svc.start().unwrap();
+        let started = svc.started_at().expect("spawn recorded");
+        let after = std::time::SystemTime::now();
+        assert!(
+            started >= before && started <= after,
+            "started_at is the spawn moment"
+        );
+
+        svc.stop().unwrap();
+        assert!(svc.started_at().is_none(), "cleared on stop");
     }
 }

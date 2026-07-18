@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::php::ini_guard;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PhpProvider {
     Hearth,
@@ -697,6 +699,121 @@ fn parse_scan_dir(stdout: &str) -> Option<PathBuf> {
                 return Some(PathBuf::from(value));
             }
         }
+    }
+    None
+}
+
+/// Launch context for an effective-value probe. Each variant mirrors the
+/// EXACT environment construction of the matching launch path: `Normal` and
+/// `Sanitized` are byte-for-byte the classification-probe contexts in
+/// [`probe_scan_dirs`]; `ServiceEnv` is the supervised-service spawn
+/// (inherit + extra pairs, as in `ManagedService::start`).
+#[derive(Debug, Clone, Copy)]
+pub enum EffectiveContext<'a> {
+    /// Daemon env minus `PHP_INI_SCAN_DIR`/`PHPRC`.
+    Normal,
+    /// Cleared env, `PATH=/usr/bin:/bin`.
+    Sanitized,
+    /// Daemon env plus the exact service env pairs.
+    ServiceEnv(&'a [(String, String)]),
+}
+
+fn apply_effective_context(cmd: &mut tokio::process::Command, context: EffectiveContext<'_>) {
+    match context {
+        EffectiveContext::Normal => {
+            cmd.env_remove("PHP_INI_SCAN_DIR").env_remove("PHPRC");
+        }
+        EffectiveContext::Sanitized => {
+            cmd.env_clear().env("PATH", "/usr/bin:/bin");
+        }
+        EffectiveContext::ServiceEnv(pairs) => {
+            for (key, value) in pairs {
+                cmd.env(key, value);
+            }
+        }
+    }
+}
+
+/// Launch-probe one directive's effective value from a CLI binary:
+/// `<binary> -r 'echo ini_get("<key>");'` under the exact context env.
+/// The key must pass [`ini_guard::validate_key`] (single choke point — a
+/// validated key cannot escape the PHP string literal, and the argument is
+/// passed as one argv element with no shell involved). `Ok(None)` = the
+/// probe ran but reported no plausible value (unset/unknown directive, or
+/// output that cannot be a scalar ini value). Failures are the caller's to
+/// render truthfully — they must never fail the surrounding command.
+pub async fn probe_cli_effective(
+    binary: &Path,
+    key: &str,
+    context: EffectiveContext<'_>,
+    timeout: Duration,
+) -> Result<Option<String>, String> {
+    ini_guard::validate_key(key).map_err(|e| format!("refusing effective-value probe: {e}"))?;
+    let mut cmd = tokio::process::Command::new(binary);
+    cmd.arg("-r").arg(format!("echo ini_get(\"{key}\");"));
+    apply_effective_context(&mut cmd, context);
+    let (status, stdout) = run_probe(cmd, timeout).await?;
+    if !status.success() {
+        return Err(format!("effective-value probe exited nonzero ({status})"));
+    }
+    Ok(clean_probed_value(&stdout))
+}
+
+/// Launch-probe an FPM binary via `-i` (php-fpm has no `--ini` — it exits 64
+/// — and no `-r`) under the exact service environment, and parse the
+/// requested directive row. This is a LAUNCH probe: it reports what a fresh
+/// start under this env would load, never what a running worker holds
+/// (live observation is todo #2343).
+pub async fn probe_fpm_effective(
+    binary: &Path,
+    key: &str,
+    service_env: &[(String, String)],
+    timeout: Duration,
+) -> Result<Option<String>, String> {
+    ini_guard::validate_key(key).map_err(|e| format!("refusing effective-value probe: {e}"))?;
+    let mut cmd = tokio::process::Command::new(binary);
+    cmd.arg("-i");
+    apply_effective_context(&mut cmd, EffectiveContext::ServiceEnv(service_env));
+    let (status, stdout) = run_probe(cmd, timeout).await?;
+    if !status.success() {
+        return Err(format!("effective-value probe exited nonzero ({status})"));
+    }
+    Ok(parse_ini_value(&stdout, key))
+}
+
+/// A scalar ini value echoed by `-r 'echo ini_get(...)'`: single-line,
+/// non-empty. Anything else (empty = unset/unknown, multi-line = not a
+/// scalar echo) is "no observation", never an invented value.
+fn clean_probed_value(stdout: &str) -> Option<String> {
+    let value = stdout.trim();
+    if value.is_empty() || value.contains('\n') {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+/// Parse one directive row from phpinfo-text (`-i`) output:
+/// `key => local value => master value`. Reports the master (last) field —
+/// on a fresh launch local == master. Strips PHP 8.5 double quotes and
+/// tolerates a raw leading-colon env echo (S10); `no value`/empty → `None`.
+pub fn parse_ini_value(stdout: &str, key: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let Some(rest) = line.trim().strip_prefix(key) else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix("=>") else {
+            continue;
+        };
+        let value = rest.rsplit("=>").next().unwrap_or(rest).trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value);
+        let value = value.strip_prefix(':').unwrap_or(value);
+        if value.is_empty() || value == "no value" {
+            return None;
+        }
+        return Some(value.to_string());
     }
     None
 }
@@ -2005,5 +2122,145 @@ echo "Scan for additional .ini files in: {normal}"
         assert!(err.reason.contains("component"), "got: {err}");
         assert!(!base.join("escape").exists(), "zero out-of-root creation");
         assert!(!hearth_root.join("php").exists(), "zero partial creation");
+    }
+
+    // ---- effective-value probing (Task 8) ----
+
+    #[test]
+    fn parse_ini_value_handles_arrows_quotes_colon_and_no_value() {
+        let stdout = "\
+phpinfo\n\
+memory_limit => 1G => 1G\n\
+memory_limit_extra => 9G => 9G\n\
+upload_tmp_dir => :/tmp/up => :/tmp/up\n\
+error_log => no value => no value\n\
+date.timezone => \"Europe/Berlin\" => \"Europe/Berlin\"\n";
+        assert_eq!(
+            parse_ini_value(stdout, "memory_limit"),
+            Some("1G".to_string()),
+            "master field, exact-key match (never the _extra row)"
+        );
+        assert_eq!(
+            parse_ini_value(stdout, "upload_tmp_dir"),
+            Some("/tmp/up".to_string()),
+            "raw leading-colon echo tolerated (S10)"
+        );
+        assert_eq!(
+            parse_ini_value(stdout, "date.timezone"),
+            Some("Europe/Berlin".to_string()),
+            "PHP 8.5 double quotes stripped (S10)"
+        );
+        assert_eq!(
+            parse_ini_value(stdout, "error_log"),
+            None,
+            "`no value` → None"
+        );
+        assert_eq!(parse_ini_value(stdout, "absent_key"), None);
+    }
+
+    /// Required focused test: the CLI effective-value probe runs
+    /// `-r 'echo ini_get("<key>");'` as exact argv under BOTH context envs.
+    /// The fake asserts the exact invocation and answers per-context (HOME
+    /// present = normal inherit; cleared env = sanitized).
+    #[tokio::test]
+    async fn cli_probe_reads_ini_get_both_contexts() {
+        let (_tmp, base) = canon_tmp();
+        let script = r#"#!/bin/sh
+if [ "$1" = "--warmup" ]; then exit 0; fi
+[ "$1" = "-r" ] || exit 9
+[ "$2" = 'echo ini_get("memory_limit");' ] || exit 9
+if [ -n "$HOME" ]; then
+    printf '1G'
+else
+    printf '777M'
+fi
+"#;
+        let binary = write_fake_php(&base.join("bin"), "php", script);
+
+        let normal = probe_cli_effective(
+            &binary,
+            "memory_limit",
+            EffectiveContext::Normal,
+            PROBE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            normal,
+            Some("1G".to_string()),
+            "normal context inherits HOME"
+        );
+
+        let sanitized = probe_cli_effective(
+            &binary,
+            "memory_limit",
+            EffectiveContext::Sanitized,
+            PROBE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sanitized,
+            Some("777M".to_string()),
+            "sanitized context is env-cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_probe_empty_or_multiline_output_is_no_observation() {
+        let (_tmp, base) = canon_tmp();
+        // Empty echo = unset/unknown directive.
+        let empty = write_fake_php(&base.join("a"), "php", "#!/bin/sh\nexit 0\n");
+        assert_eq!(
+            probe_cli_effective(
+                &empty,
+                "memory_limit",
+                EffectiveContext::Normal,
+                PROBE_TIMEOUT
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        // Multi-line output cannot be a scalar ini value — never invented.
+        let noisy = write_fake_php(
+            &base.join("b"),
+            "php",
+            "#!/bin/sh\necho line1\necho line2\n",
+        );
+        assert_eq!(
+            probe_cli_effective(
+                &noisy,
+                "memory_limit",
+                EffectiveContext::Normal,
+                PROBE_TIMEOUT
+            )
+            .await
+            .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_probes_reject_invalid_key_without_exec() {
+        let (_tmp, base) = canon_tmp();
+        let marker = base.join("executed");
+        let script = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+        let binary = write_fake_php(&base.join("bin"), "php", &script);
+        // The warmup exec creates the marker once; remove it so any further
+        // invocation is visible.
+        std::fs::remove_file(&marker).ok();
+
+        for bad in ["bad key", "1leading", "inject\")); system(\"id"] {
+            let err = probe_cli_effective(&binary, bad, EffectiveContext::Normal, PROBE_TIMEOUT)
+                .await
+                .unwrap_err();
+            assert!(err.contains("refusing"), "got: {err}");
+            let err = probe_fpm_effective(&binary, bad, &[], PROBE_TIMEOUT)
+                .await
+                .unwrap_err();
+            assert!(err.contains("refusing"), "got: {err}");
+        }
+        assert!(!marker.exists(), "invalid keys must never reach the binary");
     }
 }

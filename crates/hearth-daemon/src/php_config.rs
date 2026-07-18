@@ -3,9 +3,14 @@
 //! injected engine (never the maintainer's real config).
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use hearth_lib::php::engine::restart_fpm_conditionally;
-use hearth_lib::socket::{DaemonResponse, FpmRestartOutcome, PhpConfigAction, PhpScope};
+use hearth_lib::php::reconcile::{CHANNEL_FILE_NAME, Manifest};
+use hearth_lib::service::{ServiceKind, ServiceState};
+use hearth_lib::socket::{
+    DaemonResponse, FpmRestartOutcome, PhpConfigAction, PhpConfigOutcome, PhpScope,
+};
 
 use crate::DaemonState;
 
@@ -25,9 +30,87 @@ pub async fn php_config(state: &Arc<DaemonState>, action: PhpConfigAction) -> Da
             if restart && outcome.hard_failures().is_empty() {
                 outcome.fpm = restart_fpm_conditionally(&state.supervisor, &state.php_engine).await;
             }
+            annotate_fpm_runtime(state, &mut outcome).await;
             DaemonResponse::PhpConfigReport(outcome)
         }
     }
+}
+
+/// Task 8: truthful runtime annotation for the supervised FPM row
+/// (context `launched`). `run_state` comes from the supervisor's own state
+/// table; `pending restart` is claimed ONLY when a Hearth-written manifest
+/// timestamp is newer than the supervisor's own spawn time for the running
+/// FPM — never from ambient process evidence (that class is banned).
+/// Annotation is read-only and can never fail the command.
+async fn annotate_fpm_runtime(state: &Arc<DaemonState>, outcome: &mut PhpConfigOutcome) {
+    let Some(pos) = outcome
+        .rows
+        .iter()
+        .position(|r| r.sapi == "fpm" && r.context == "launched")
+    else {
+        return;
+    };
+    let snapshot = {
+        let sup = state.supervisor.lock().await;
+        sup.service(ServiceKind::PhpFpm)
+            .map(|svc| (svc.state.clone(), svc.started_at()))
+    };
+    let Some((service_state, started_at)) = snapshot else {
+        // Unregistered FPM keeps its truthful static row (LAUNCH-BLOCKED /
+        // herd-owned); there is no run state to report.
+        return;
+    };
+    let row = &mut outcome.rows[pos];
+    match service_state {
+        ServiceState::Running { .. } => {
+            row.run_state = Some("running".to_string());
+            row.pending_restart = pending_restart_marker(
+                channel_applied_at_ms(state, &row.version),
+                started_at.and_then(unix_ms),
+            );
+        }
+        _ => {
+            row.run_state = Some("not running".to_string());
+        }
+    }
+}
+
+/// `pending restart` is truthful only with BOTH timestamps present and the
+/// materialization strictly newer than the Hearth-owned spawn time. Any
+/// missing side (old manifest without timestamps, no recorded spawn) must
+/// stay `false` — never claim staleness that cannot be proven.
+fn pending_restart_marker(
+    applied_at_unix_ms: Option<u64>,
+    started_at_unix_ms: Option<u64>,
+) -> bool {
+    matches!(
+        (applied_at_unix_ms, started_at_unix_ms),
+        (Some(applied), Some(started)) if applied > started
+    )
+}
+
+fn unix_ms(t: SystemTime) -> Option<u64> {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+/// Materialization timestamp of the Hearth channel file feeding the
+/// supervised FPM (Belt E scan dir for `version`), from the manifest.
+fn channel_applied_at_ms(state: &Arc<DaemonState>, version: &str) -> Option<u64> {
+    let engine = &state.php_engine;
+    let channel_file = engine
+        .config_dir()
+        .join("php")
+        .join(version)
+        .join("conf.d")
+        .join(CHANNEL_FILE_NAME);
+    let manifest = Manifest::load(&engine.manifest_path()).ok()?;
+    manifest
+        .files
+        .iter()
+        .find(|e| e.path == channel_file)
+        .and_then(|e| e.applied_at_unix_ms)
 }
 
 /// Handle the legacy `PhpConfig { version, key, value }` request (protocol
@@ -386,5 +469,155 @@ mod tests {
             }
             other => panic!("expected legacy Error, got {other:?}"),
         }
+    }
+
+    // ---- Task 8: pending-restart marker + run-state annotation ----
+
+    /// Required focused test: the marker is truthful ONLY with both
+    /// Hearth-owned timestamps present and a strictly newer materialization.
+    #[test]
+    fn pending_restart_marker_logic() {
+        // Missing either side → never claim staleness.
+        assert!(!pending_restart_marker(None, None));
+        assert!(!pending_restart_marker(Some(2_000), None));
+        assert!(!pending_restart_marker(None, Some(1_000)));
+        // Older or equal materialization → the running FPM already has it.
+        assert!(!pending_restart_marker(Some(1_000), Some(2_000)));
+        assert!(!pending_restart_marker(Some(2_000), Some(2_000)));
+        // Strictly newer materialization → restart pending.
+        assert!(pending_restart_marker(Some(2_001), Some(2_000)));
+    }
+
+    fn launched_row(version: &str) -> hearth_lib::socket::PhpTargetRow {
+        hearth_lib::socket::PhpTargetRow {
+            provider: "hearth".to_string(),
+            version: version.to_string(),
+            sapi: "fpm".to_string(),
+            context: "launched".to_string(),
+            channel: None,
+            coverage: "supervised (scan-dir env at launch)".to_string(),
+            configured: Some("1G".to_string()),
+            observed: Some("1G".to_string()),
+            observed_state: "launch-probed".to_string(),
+            pending_restart: false,
+            run_state: None,
+        }
+    }
+
+    fn outcome_with(rows: Vec<hearth_lib::socket::PhpTargetRow>) -> PhpConfigOutcome {
+        PhpConfigOutcome {
+            persisted: None,
+            rows,
+            files: vec![],
+            fpm: FpmRestartOutcome::NotAttempted,
+        }
+    }
+
+    #[tokio::test]
+    async fn annotate_marks_running_fpm_and_pending_restart_from_manifest() {
+        use hearth_lib::php::reconcile::{EntryState, LastOutcome, Manifest, ManifestEntry};
+        use hearth_lib::service::supervisor::ManagedService;
+
+        let (_tmp, _config_path, state) = state_fixture();
+        let default_php = state.config.lock().await.default_php.clone();
+
+        // A real supervisor-spawned child (isolated /bin/sleep) records the
+        // trustworthy start time.
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.register(ManagedService::new(
+                hearth_lib::service::ServiceKind::PhpFpm,
+                "/bin/sleep".to_string(),
+                vec!["30".to_string()],
+            ));
+            sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+        }
+
+        // Manifest entry materialized BEFORE the spawn → no pending claim.
+        let channel_file = state
+            .php_engine
+            .config_dir()
+            .join("php")
+            .join(&default_php)
+            .join("conf.d")
+            .join(CHANNEL_FILE_NAME);
+        let manifest_path = state.php_engine.manifest_path();
+        let entry = |applied: u64| ManifestEntry {
+            path: channel_file.clone(),
+            php_version: default_php.clone(),
+            channel: "hearth".to_string(),
+            sha256: "abc".to_string(),
+            state: EntryState::Applied,
+            expected_old_sha256: None,
+            desired_sha256: None,
+            last_outcome: LastOutcome::Written,
+            applied_at_unix_ms: Some(applied),
+        };
+        let save = |applied: u64| {
+            let manifest = Manifest {
+                version: hearth_lib::php::reconcile::MANIFEST_VERSION,
+                files: vec![entry(applied)],
+            };
+            manifest.save(&manifest_path).unwrap();
+        };
+
+        save(1); // long before any possible spawn time
+        let mut outcome = outcome_with(vec![launched_row(&default_php)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        let row = &outcome.rows[0];
+        assert_eq!(row.run_state.as_deref(), Some("running"));
+        assert!(
+            !row.pending_restart,
+            "materialized before spawn → already loaded"
+        );
+
+        // Materialized AFTER the spawn → truthful pending restart.
+        save(i64::MAX as u64); // strictly after any spawn time (TOML-safe)
+        let mut outcome = outcome_with(vec![launched_row(&default_php)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        let row = &outcome.rows[0];
+        assert_eq!(row.run_state.as_deref(), Some("running"));
+        assert!(row.pending_restart, "newer materialization → pending");
+
+        let mut sup = state.supervisor.lock().await;
+        sup.stop_service(hearth_lib::service::ServiceKind::PhpFpm)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn annotate_marks_registered_stopped_fpm_not_running() {
+        use hearth_lib::service::supervisor::ManagedService;
+
+        let (_tmp, _config_path, state) = state_fixture();
+        let default_php = state.config.lock().await.default_php.clone();
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.register(ManagedService::new(
+                hearth_lib::service::ServiceKind::PhpFpm,
+                "/bin/sleep".to_string(),
+                vec!["30".to_string()],
+            ));
+            // Registered but never started.
+        }
+        let mut outcome = outcome_with(vec![launched_row(&default_php)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        let row = &outcome.rows[0];
+        assert_eq!(row.run_state.as_deref(), Some("not running"));
+        assert!(!row.pending_restart, "nothing running can be stale");
+    }
+
+    #[tokio::test]
+    async fn annotate_leaves_unregistered_fpm_row_untouched() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let default_php = state.config.lock().await.default_php.clone();
+        let mut outcome = outcome_with(vec![launched_row(&default_php)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        let row = &outcome.rows[0];
+        assert_eq!(
+            row.run_state, None,
+            "unregistered FPM keeps its static truthful row"
+        );
+        assert!(!row.pending_restart);
     }
 }

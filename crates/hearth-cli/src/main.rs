@@ -497,16 +497,32 @@ fn render_php_config_report(
                 "{:<9} {:<7} {:<4} {:<10} {:<48} {}",
                 row.provider, row.version, row.sapi, row.context, channel, row.coverage
             );
-            if let Some(configured) = &row.configured {
-                let _ = write!(line, "  configured={configured}");
-                match &row.observed {
-                    Some(observed) => {
-                        let _ = write!(line, " observed={observed} ({})", row.observed_state);
-                    }
-                    None => {
-                        let _ = write!(line, " observed=n/a");
-                    }
+            if row.run_state.as_deref() == Some("not running") {
+                let _ = write!(line, " [not running]");
+            }
+            // Four-state vocabulary stays intact in the label; the truthful
+            // `pending restart` marker rides alongside, never replacing it.
+            let observed_label = if row.pending_restart {
+                format!("{}; pending restart", row.observed_state)
+            } else {
+                row.observed_state.clone()
+            };
+            match (&row.configured, &row.observed) {
+                (Some(configured), Some(observed)) => {
+                    let _ = write!(
+                        line,
+                        "  configured={configured} observed={observed} ({observed_label})"
+                    );
                 }
+                (Some(configured), None) => {
+                    let _ = write!(line, "  configured={configured} observed=n/a");
+                }
+                // A launch-probe can surface a real effective value (e.g. a
+                // PHP default) for a key Hearth does not configure.
+                (None, Some(observed)) => {
+                    let _ = write!(line, "  observed={observed} ({observed_label})");
+                }
+                (None, None) => {}
             }
             let _ = writeln!(out, "{line}");
             if row.coverage.starts_with("UNMANAGED: privileged-dir") {
@@ -1655,6 +1671,8 @@ mod tests {
             configured: None,
             observed: None,
             observed_state: "n/a".to_string(),
+            pending_restart: false,
+            run_state: None,
         }
     }
 
@@ -1720,6 +1738,81 @@ mod tests {
         r.configured = Some("1G".to_string());
         let (out, _err, _exit) = render_php_config_report(&outcome_with_rows(vec![r]));
         assert!(out.contains("observed=n/a"), "got: {out}");
+    }
+
+    /// Task 8 label-vocabulary fixture: a value read from a channel FILE is
+    /// only ever `materialized`; `launch-probed` marks an executed binary; a
+    /// probed PHP default renders without a configured value; and the word
+    /// "effective" appears in NO rendering — file parses are never dressed
+    /// up as effective/observed-live state.
+    #[test]
+    fn render_labels_never_claim_effective_for_file_parse() {
+        let mut file_parse = row("managed (channel)");
+        file_parse.configured = Some("1G".to_string());
+        file_parse.observed = Some("1G".to_string());
+        file_parse.observed_state = "materialized".to_string();
+
+        let mut probed = row("managed (channel+env)");
+        probed.context = "normal".to_string();
+        probed.configured = Some("1G".to_string());
+        probed.observed = Some("1G".to_string());
+        probed.observed_state = "launch-probed".to_string();
+
+        let mut default_only = row("managed (channel+env)");
+        default_only.context = "normal".to_string();
+        default_only.configured = None;
+        default_only.observed = Some("128M".to_string());
+        default_only.observed_state = "launch-probed".to_string();
+
+        let (out, _err, exit) =
+            render_php_config_report(&outcome_with_rows(vec![file_parse, probed, default_only]));
+        assert!(out.contains("observed=1G (materialized)"), "got: {out}");
+        assert!(out.contains("observed=1G (launch-probed)"), "got: {out}");
+        assert!(
+            out.contains("observed=128M (launch-probed)"),
+            "a probed PHP default renders without configured=: {out}"
+        );
+        assert!(
+            !out.to_lowercase().contains("effective"),
+            "file parses must never be labeled effective: {out}"
+        );
+        assert_eq!(exit, ExitClass::Success);
+    }
+
+    /// Task 8: the pending-restart marker rides beside the four-state label
+    /// (never replacing it), and a stopped supervised FPM renders its
+    /// truthful `[not running]` marker.
+    #[test]
+    fn render_pending_restart_and_not_running_markers() {
+        let mut pending = row("supervised (scan-dir env at launch)");
+        pending.sapi = "fpm".to_string();
+        pending.context = "launched".to_string();
+        pending.channel = None;
+        pending.configured = Some("2G".to_string());
+        pending.observed = Some("2G".to_string());
+        pending.observed_state = "launch-probed".to_string();
+        pending.pending_restart = true;
+        pending.run_state = Some("running".to_string());
+
+        let (out, _err, exit) = render_php_config_report(&outcome_with_rows(vec![pending]));
+        assert!(
+            out.contains("observed=2G (launch-probed; pending restart)"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("[not running]"),
+            "running service renders no run-state noise: {out}"
+        );
+        assert_eq!(exit, ExitClass::Success, "pending restart is informational");
+
+        let mut stopped = row("supervised (scan-dir env at launch)");
+        stopped.sapi = "fpm".to_string();
+        stopped.context = "launched".to_string();
+        stopped.channel = None;
+        stopped.run_state = Some("not running".to_string());
+        let (out, _err, exit) = render_php_config_report(&outcome_with_rows(vec![stopped]));
+        assert!(out.contains("[not running]"), "got: {out}");
+        assert_eq!(exit, ExitClass::Success, "run state alone never fails");
     }
 
     #[test]

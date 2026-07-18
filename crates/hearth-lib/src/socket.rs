@@ -140,12 +140,25 @@ pub struct PhpTargetRow {
     pub coverage: String,
     /// Configured value from the canonical store (Show/Set/Unset with a key).
     pub configured: Option<String>,
-    /// Observed value. In this release only `materialized` observation exists;
-    /// launch-probed and live-observed values arrive with todos #2321-C/#2343.
+    /// Observed value: `materialized` (channel-file state) or `launch-probed`
+    /// (binary executed under the exact launch env). Live observation of a
+    /// running FPM worker arrives with todo #2343.
     pub observed: Option<String>,
     /// Observation vocabulary state: `configured` | `materialized` |
     /// `launch-probed` | `live-observed` | `n/a`.
     pub observed_state: String,
+    /// True only when a Hearth-written manifest timestamp is newer than the
+    /// supervisor's own spawn time for the running FPM service — the running
+    /// process may not yet load `observed`. Never inferred from ambient
+    /// process evidence. `#[serde(default)]` keeps the legacy protocol
+    /// window parseable.
+    #[serde(default)]
+    pub pending_restart: bool,
+    /// Supervised-FPM run state for the `launched` row (`running` |
+    /// `not running`), from the supervisor's own state table. `None` for
+    /// every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_state: Option<String>,
 }
 
 /// Typed per-file reconcile result (wire form of the library's WriteOutcome).
@@ -484,6 +497,8 @@ mod tests {
                     configured: Some("1G".to_string()),
                     observed: Some("1G".to_string()),
                     observed_state: "materialized".to_string(),
+                    pending_restart: true,
+                    run_state: Some("running".to_string()),
                 }],
                 files: vec![FileOutcome {
                     path: "/opt/homebrew/etc/php/8.5/conf.d/zz-hearth.ini".to_string(),
@@ -500,6 +515,27 @@ mod tests {
                 other => panic!("expected PhpConfigReport, got {other:?}"),
             }
         }
+    }
+
+    /// Task 8 protocol-window guard: rows serialized by a pre-Task-8 daemon
+    /// (no `pending_restart`/`run_state` fields) must still parse, with the
+    /// truthful defaults (no pending-restart claim, no run state).
+    #[test]
+    fn php_target_row_without_new_fields_parses_with_defaults() {
+        let legacy = r#"{
+            "provider": "homebrew",
+            "version": "8.5",
+            "sapi": "cli",
+            "context": "normal",
+            "channel": null,
+            "coverage": "managed (channel+env)",
+            "configured": "1G",
+            "observed": "1G",
+            "observed_state": "materialized"
+        }"#;
+        let row: PhpTargetRow = serde_json::from_str(legacy).unwrap();
+        assert!(!row.pending_restart, "default: never claim pending restart");
+        assert_eq!(row.run_state, None, "default: no run state");
     }
 
     #[test]

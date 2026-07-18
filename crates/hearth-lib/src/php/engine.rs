@@ -23,8 +23,9 @@ use crate::php::reconcile::{
     sha256_hex,
 };
 use crate::php::targets::{
-    ChannelClass, PhpProvider, PhpSapi, PhpTarget, ProbeInfo, ProviderRoots, classify_channel,
-    discover_provider_targets, probe_scan_dirs,
+    ChannelClass, EffectiveContext, PhpProvider, PhpSapi, PhpTarget, ProbeInfo, ProviderRoots,
+    classify_channel, discover_provider_targets, probe_cli_effective, probe_fpm_effective,
+    probe_scan_dirs,
 };
 use crate::service::ServiceKind;
 use crate::service::supervisor::ServiceSupervisor;
@@ -228,7 +229,9 @@ impl PhpConfigEngine {
             })
             .collect();
         files.extend(creation_failures);
-        let rows = self.build_rows(&snapshot, &default_php, &targets, Some(key), &file_states);
+        let mut rows = self.build_rows(&snapshot, &default_php, &targets, Some(key), &file_states);
+        self.fill_launch_probes(&mut rows, &targets, key, &default_php)
+            .await;
 
         Ok(PhpConfigOutcome {
             persisted: Some(true),
@@ -247,7 +250,11 @@ impl PhpConfigEngine {
         };
         let (targets, _) = self.build_targets(&snapshot, false).await;
         let file_states = self.file_states_from_manifest(&snapshot, &targets);
-        let rows = self.build_rows(&snapshot, &default_php, &targets, key, &file_states);
+        let mut rows = self.build_rows(&snapshot, &default_php, &targets, key, &file_states);
+        if let Some(key) = key {
+            self.fill_launch_probes(&mut rows, &targets, key, &default_php)
+                .await;
+        }
         Ok(PhpConfigOutcome {
             persisted: None,
             rows,
@@ -504,6 +511,8 @@ impl PhpConfigEngine {
                     configured: configured.clone(),
                     observed: None,
                     observed_state: "n/a".to_string(),
+                    pending_restart: false,
+                    run_state: None,
                 });
                 continue;
             }
@@ -546,6 +555,8 @@ impl PhpConfigEngine {
                     configured: configured.clone(),
                     observed,
                     observed_state,
+                    pending_restart: false,
+                    run_state: None,
                 });
             }
         }
@@ -574,9 +585,87 @@ impl PhpConfigEngine {
                 configured: key.and_then(|k| effective.get(k).cloned()),
                 observed: None,
                 observed_state: "n/a".to_string(),
+                pending_restart: false,
+                run_state: None,
             });
         }
         rows
+    }
+
+    /// Task 8: launch-probed effective values for freshly built rows.
+    ///
+    /// CLI targets run `-r 'echo ini_get("<key>");'` under the EXACT
+    /// classification-context env (normal / sanitized). Only the
+    /// Hearth-supervised, registrable FPM service row is probed — `-i`
+    /// under the exact service env (launch-probed, never live-observed;
+    /// live FastCGI observation is todo #2343). Ambient external FPM rows
+    /// are never probed: no ambient launch context can be authenticated
+    /// (Stage-B locked design), so their static unverified row stands.
+    /// A probe failure leaves the row's truthful non-success state
+    /// untouched and can never fail the surrounding command.
+    async fn fill_launch_probes(
+        &self,
+        rows: &mut [PhpTargetRow],
+        targets: &[PhpTarget],
+        key: &str,
+        default_php: &str,
+    ) {
+        // Defense in depth: mutating actions already validated the key; Show
+        // passes user input straight here. An invalid key is never embedded.
+        if ini_guard::validate_key(key).is_err() {
+            return;
+        }
+        for target in targets {
+            if target.id.sapi != PhpSapi::Cli {
+                continue;
+            }
+            for (context, effective_context) in [
+                ("normal", EffectiveContext::Normal),
+                ("sanitized", EffectiveContext::Sanitized),
+            ] {
+                let probed = probe_cli_effective(
+                    &target.id.binary,
+                    key,
+                    effective_context,
+                    self.probe_timeout,
+                )
+                .await;
+                let Ok(Some(value)) = probed else {
+                    continue;
+                };
+                let provider = provider_str(target.id.provider);
+                if let Some(row) = rows.iter_mut().find(|r| {
+                    r.provider == provider
+                        && r.version == target.id.version
+                        && r.sapi == "cli"
+                        && r.context == context
+                }) {
+                    row.observed = Some(value);
+                    row.observed_state = "launch-probed".to_string();
+                }
+            }
+        }
+
+        // The supervised FPM service row (context `launched`), only while
+        // registrable: Herd absent, config generated, binary resolvable.
+        if self.herd_running() || self.fpm_launch_blocked_reason().is_some() {
+            return;
+        }
+        let Some(binary) =
+            crate::php::resolver::resolve_phpfpm_binary(default_php, &self.config_dir)
+        else {
+            return;
+        };
+        let service_env = vec![crate::php::scan_dir_env(&self.config_dir, default_php)];
+        if let Ok(Some(value)) =
+            probe_fpm_effective(&binary, key, &service_env, self.probe_timeout).await
+            && let Some(row) = rows
+                .iter_mut()
+                .find(|r| r.sapi == "fpm" && r.context == "launched")
+        {
+            row.observed = Some(value);
+            row.observed_state = "launch-probed".to_string();
+        }
     }
 }
 
@@ -1605,6 +1694,279 @@ mod tests {
                 .service(ServiceKind::PhpFpm)
                 .is_none(),
             "no FPM registration/restart after a hard reconcile failure"
+        );
+    }
+
+    // ---- Task 8: launch-probed observation ----
+
+    /// Fake Homebrew PHP that answers classification probes with a Verified
+    /// channel AND the effective-value probe (`-r`) with a per-context value
+    /// (HOME present = normal env, cleared = sanitized).
+    fn install_fake_homebrew_php_with_values(fx: &Fixture, version: &str) -> PathBuf {
+        let roots_homebrew = fx.engine.provider_roots.homebrew.clone();
+        let conf_d = roots_homebrew.join("etc/php").join(version).join("conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        let binary = roots_homebrew
+            .join("opt")
+            .join(format!("php@{version}"))
+            .join("bin/php");
+        write_executable(
+            &binary,
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "--warmup" ]; then exit 0; fi
+if [ "$1" = "-r" ]; then
+    [ "$2" = 'echo ini_get("memory_limit");' ] || exit 9
+    if [ -n "$HOME" ]; then printf '1G'; else printf '777M'; fi
+    exit 0
+fi
+echo "Scan for additional .ini files in: {}"
+"#,
+                conf_d.display()
+            ),
+        );
+        conf_d
+    }
+
+    #[tokio::test]
+    async fn set_and_show_fill_launch_probed_cli_values_both_contexts() {
+        let fx = fixture(false);
+        let conf_d = install_fake_homebrew_php_with_values(&fx, "8.4");
+
+        let outcome = fx
+            .engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        let normal = outcome
+            .rows
+            .iter()
+            .find(|r| r.provider == "homebrew" && r.sapi == "cli" && r.context == "normal")
+            .expect("homebrew cli normal row");
+        assert_eq!(normal.observed.as_deref(), Some("1G"));
+        assert_eq!(normal.observed_state, "launch-probed");
+        let sanitized = outcome
+            .rows
+            .iter()
+            .find(|r| r.provider == "homebrew" && r.sapi == "cli" && r.context == "sanitized")
+            .expect("homebrew cli sanitized row");
+        assert_eq!(
+            sanitized.observed.as_deref(),
+            Some("777M"),
+            "sanitized context probes under the cleared env"
+        );
+        assert_eq!(sanitized.observed_state, "launch-probed");
+
+        // The reconcile that materialized the channel file stamped the
+        // Hearth-owned timestamp behind the pending-restart marker.
+        let manifest = Manifest::load(&fx.engine.manifest_path()).unwrap();
+        let entry = manifest
+            .files
+            .iter()
+            .find(|e| e.path == conf_d.join(CHANNEL_FILE_NAME))
+            .expect("manifest entry for the written channel file");
+        assert!(
+            entry.applied_at_unix_ms.is_some(),
+            "applied_at_unix_ms stamped on materialization"
+        );
+
+        // Read-only Show reports the same launch-probed values.
+        let shown = fx
+            .engine
+            .apply(PhpConfigAction::Show {
+                key: Some("memory_limit".to_string()),
+            })
+            .await
+            .unwrap();
+        let normal = shown
+            .rows
+            .iter()
+            .find(|r| r.provider == "homebrew" && r.sapi == "cli" && r.context == "normal")
+            .unwrap();
+        assert_eq!(normal.observed.as_deref(), Some("1G"));
+        assert_eq!(normal.observed_state, "launch-probed");
+    }
+
+    #[tokio::test]
+    async fn fpm_probe_runs_dash_i_under_service_env() {
+        let fx = fixture(false);
+        std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
+        std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
+        // The fake FPM asserts the EXACT probe contract: `-i` (never
+        // `--ini`/`-r`) and the exact Belt-E service env pair. Any other
+        // invocation shape fails, so a passing test proves both.
+        let expected_env = format!(":{}", fx.config_dir.join("php/8.4/conf.d").display());
+        write_executable(
+            &fx.config_dir.join("php/8.4/php-fpm"),
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "--warmup" ]; then exit 0; fi
+[ "$1" = "-i" ] || exit 7
+[ "$PHP_INI_SCAN_DIR" = "{expected_env}" ] || exit 8
+echo "memory_limit => 1G => 1G"
+"#
+            ),
+        );
+
+        let outcome = fx
+            .engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        let launched = outcome
+            .rows
+            .iter()
+            .find(|r| r.sapi == "fpm" && r.context == "launched")
+            .expect("supervised FPM row");
+        assert_eq!(
+            launched.observed.as_deref(),
+            Some("1G"),
+            "-i probe under the exact service env parsed the directive"
+        );
+        assert_eq!(launched.observed_state, "launch-probed");
+
+        // The same binary's classification contexts are NOT effective-probed
+        // (FPM has no `-r`; only the launched service row is) — their states
+        // keep the truthful non-probe vocabulary.
+        for row in outcome
+            .rows
+            .iter()
+            .filter(|r| r.sapi == "fpm" && r.context != "launched")
+        {
+            assert_ne!(
+                row.observed_state, "launch-probed",
+                "only the launched service row may be launch-probed: {row:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_failure_renders_na_never_fails_command() {
+        let fx = fixture(false);
+        let roots_homebrew = fx.engine.provider_roots.homebrew.clone();
+        let conf_d = roots_homebrew.join("etc/php/8.4/conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        // Classification works; every effective-value probe exits nonzero.
+        write_executable(
+            &roots_homebrew.join("opt/php@8.4/bin/php"),
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "--warmup" ]; then exit 0; fi
+if [ "$1" = "-r" ]; then exit 1; fi
+echo "Scan for additional .ini files in: {}"
+"#,
+                conf_d.display()
+            ),
+        );
+
+        // Read-only Show with nothing configured: probe failure → n/a.
+        let shown = fx
+            .engine
+            .apply(PhpConfigAction::Show {
+                key: Some("memory_limit".to_string()),
+            })
+            .await
+            .unwrap();
+        for row in shown.rows.iter().filter(|r| r.provider == "homebrew") {
+            assert_eq!(row.observed, None, "failed probe never invents: {row:?}");
+            assert_eq!(row.observed_state, "n/a");
+        }
+
+        // Mutating Set: probe failure leaves the truthful materialized state
+        // and never fails the command.
+        let outcome = fx
+            .engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.persisted, Some(true));
+        assert!(outcome.hard_failures().is_empty(), "{outcome:?}");
+        let normal = outcome
+            .rows
+            .iter()
+            .find(|r| r.provider == "homebrew" && r.sapi == "cli" && r.context == "normal")
+            .unwrap();
+        assert_eq!(
+            normal.observed_state, "materialized",
+            "probe failure preserves the channel-file state, never upgrades it"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambient_external_fpm_is_never_effective_probed_and_never_writable() {
+        let fx = fixture(false);
+        let herd = fx.engine.provider_roots.herd.clone();
+        let user_channel = herd.join("config/php/84");
+        std::fs::create_dir_all(&user_channel).unwrap();
+        let log = herd.join("invocations.log");
+        // FPM-only ambient provider; every non-warmup exec is logged.
+        write_executable(
+            &herd.join("bin/php84-fpm"),
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "--warmup" ]; then exit 0; fi
+echo run >> "{}"
+echo "Scan for additional .ini files in: {}"
+"#,
+                log.display(),
+                user_channel.display()
+            ),
+        );
+
+        let first = fx
+            .engine
+            .apply(PhpConfigAction::Show {
+                key: Some("memory_limit".to_string()),
+            })
+            .await
+            .unwrap();
+        let external = first
+            .rows
+            .iter()
+            .find(|r| r.provider == "herd" && r.sapi == "fpm")
+            .expect("external FPM row");
+        assert_eq!(external.context, "external");
+        assert_eq!(external.observed, None);
+        assert_eq!(external.observed_state, "n/a");
+        assert!(external.channel.is_none());
+
+        // Classification probes are cached on (binary, mtime): a second
+        // Show-with-key adds ZERO invocations — proof the effective-value
+        // pass never executes an ambient FPM binary.
+        let count = |path: &Path| {
+            std::fs::read_to_string(path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let after_first = count(&log);
+        let second = fx
+            .engine
+            .apply(PhpConfigAction::Show {
+                key: Some("memory_limit".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&log),
+            after_first,
+            "ambient external FPM must never be launch-probed"
+        );
+        let external = second
+            .rows
+            .iter()
+            .find(|r| r.provider == "herd" && r.sapi == "fpm")
+            .unwrap();
+        assert_eq!(external.observed_state, "n/a");
+
+        // And it can never acquire a write channel: a global Set must not
+        // materialize anything in the ambient FPM's scan dir.
+        fx.engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        assert!(
+            !user_channel.join(CHANNEL_FILE_NAME).exists(),
+            "no write authority may derive from an ambient FPM target"
         );
     }
 }
