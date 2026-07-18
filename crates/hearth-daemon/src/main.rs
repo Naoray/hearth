@@ -120,6 +120,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Build supervisor with default services.
     let mut supervisor = ServiceSupervisor::new();
+    // C3-1: ONE coherent current-Herd-ownership policy for PHP-FPM, enforced
+    // inside the supervisor for every mutation path (generic start/restart,
+    // health supervision, config restart, switch). Same injectable source as
+    // boot-time service registration.
+    supervisor.set_fpm_ownership_probe(std::sync::Arc::new(
+        hearth_lib::service::manager::is_herd_running,
+    ));
     {
         let cfg = config.lock().await;
         for svc in default_services(&cfg, &config_dir, php_launches_enabled, &provider_roots) {

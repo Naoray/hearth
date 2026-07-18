@@ -331,7 +331,18 @@ impl ManagedService {
 pub struct ServiceSupervisor {
     services: HashMap<ServiceKind, ManagedService>,
     health_interval: Duration,
+    /// C3-1 (review 5650 r3): injectable "does an external tool (Herd)
+    /// currently own PHP-FPM?" probe — ONE coherent ownership policy
+    /// enforced INSIDE the supervisor so every mutation path (boot,
+    /// generic start/restart, health supervision, config restart, switch)
+    /// obeys it without per-caller audits. `None` = never externally owned.
+    fpm_ownership: Option<ExternalFpmOwnership>,
 }
+
+/// Injectable current-ownership probe for PHP-FPM (production:
+/// `service::manager::is_herd_running`; tests/smoke: the typed isolated
+/// seam through the same function).
+pub type ExternalFpmOwnership = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
 impl Default for ServiceSupervisor {
     fn default() -> Self {
@@ -344,7 +355,19 @@ impl ServiceSupervisor {
         Self {
             services: HashMap::new(),
             health_interval: Duration::from_secs(5),
+            fpm_ownership: None,
         }
+    }
+
+    /// Install the current-Herd-ownership probe for PHP-FPM (C3-1).
+    pub fn set_fpm_ownership_probe(&mut self, probe: ExternalFpmOwnership) {
+        self.fpm_ownership = Some(probe);
+    }
+
+    /// Does an external tool currently own PHP-FPM? Consulted live on every
+    /// FPM-mutating path; `false` when no probe is installed.
+    fn fpm_externally_owned(&self) -> bool {
+        self.fpm_ownership.as_ref().is_some_and(|probe| probe())
     }
 
     /// Register a service to be supervised.
@@ -359,6 +382,12 @@ impl ServiceSupervisor {
     pub fn start_all(&mut self) -> anyhow::Result<()> {
         let kinds: Vec<ServiceKind> = self.services.keys().copied().collect();
         for kind in kinds {
+            // C3-1: generic start never launches Hearth FPM while Herd
+            // currently owns it — other services start normally.
+            if kind == ServiceKind::PhpFpm && self.fpm_externally_owned() {
+                info!("php-fpm start skipped: Herd owns PHP-FPM");
+                continue;
+            }
             if let Some(svc) = self.services.get_mut(&kind) {
                 if let Err(e) = svc.start() {
                     warn!(service = %kind, error = %e, "failed to start service, skipping");
@@ -380,7 +409,12 @@ impl ServiceSupervisor {
     }
 
     /// Start a specific service. Returns an error if the service is not registered.
+    /// Starting Hearth FPM while Herd currently owns it is refused with an
+    /// actionable error (C3-1) — Hearth never contends for Herd-owned FPM.
     pub fn start_service(&mut self, kind: ServiceKind) -> anyhow::Result<()> {
+        if kind == ServiceKind::PhpFpm && self.fpm_externally_owned() {
+            anyhow::bail!("php-fpm is owned by Herd — Hearth will not start its own FPM");
+        }
         let svc = self
             .services
             .get_mut(&kind)
@@ -435,7 +469,27 @@ impl ServiceSupervisor {
 
         let kinds: Vec<ServiceKind> = self.services.keys().copied().collect();
         for kind in kinds {
+            // C3-1: health supervision obeys current Herd ownership. While
+            // Herd owns FPM, Hearth's OWN still-running FPM child is
+            // relinquished exactly once (Hearth stops only its own process
+            // group — it never signals Herd's process), and a crashed FPM is
+            // never replaced.
+            let fpm_owned = kind == ServiceKind::PhpFpm && self.fpm_externally_owned();
             if let Some(svc) = self.services.get_mut(&kind) {
+                if fpm_owned {
+                    if svc.child.is_some() {
+                        info!(
+                            "Herd owns PHP-FPM — relinquishing Hearth's own supervised FPM child"
+                        );
+                        let _ = svc.stop();
+                    } else if matches!(svc.state, ServiceState::Running { .. }) {
+                        // Crashed while Herd owns it: record truthfully, no
+                        // replacement child.
+                        svc.state = ServiceState::Stopped;
+                        svc.started_at = None;
+                    }
+                    continue;
+                }
                 if matches!(svc.state, ServiceState::Running { .. }) && !svc.is_alive() {
                     warn!(service = %kind, "service crashed");
 
@@ -763,5 +817,151 @@ mod tests {
 
         svc.stop().unwrap();
         assert!(svc.started_at().is_none(), "cleared on stop");
+    }
+
+    // ---- C3-1 (review 5650 r3): current-ownership policy in the supervisor ----
+
+    fn owned_flag() -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ExternalFpmOwnership,
+    ) {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_flag = std::sync::Arc::clone(&flag);
+        let probe: ExternalFpmOwnership =
+            std::sync::Arc::new(move || probe_flag.load(std::sync::atomic::Ordering::SeqCst));
+        (flag, probe)
+    }
+
+    fn sleeper(kind: ServiceKind) -> ManagedService {
+        ManagedService::new(kind, "/bin/sleep".to_string(), vec!["30".to_string()])
+    }
+
+    /// Registered (stopped) FPM + Herd owns it: generic start_all skips FPM
+    /// while other services still start; explicit start_service refuses.
+    #[test]
+    fn generic_start_skips_fpm_under_external_ownership() {
+        let (flag, probe) = owned_flag();
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(probe);
+        sup.register(sleeper(ServiceKind::PhpFpm));
+        sup.register(sleeper(ServiceKind::Mailpit));
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        sup.start_all().unwrap();
+        let fpm = sup.service(ServiceKind::PhpFpm).unwrap();
+        assert!(fpm.started_at().is_none(), "no FPM child under Herd");
+        assert!(matches!(fpm.state, ServiceState::Stopped));
+        let other = sup.service(ServiceKind::Mailpit).unwrap();
+        assert!(
+            other.started_at().is_some(),
+            "non-conflicting services start normally"
+        );
+
+        let err = sup.start_service(ServiceKind::PhpFpm).unwrap_err();
+        assert!(err.to_string().contains("Herd"), "got: {err}");
+        assert!(
+            sup.service(ServiceKind::PhpFpm)
+                .unwrap()
+                .started_at()
+                .is_none(),
+            "explicit start refused with zero spawn"
+        );
+
+        sup.stop_all().unwrap();
+    }
+
+    /// Running Hearth FPM + Herd becomes live: the next health tick
+    /// relinquishes Hearth's OWN child exactly once (state becomes truthful
+    /// Stopped, spawn record cleared) and never restarts it afterwards.
+    #[test]
+    fn health_relinquishes_running_fpm_once_when_ownership_appears() {
+        let (flag, probe) = owned_flag();
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(probe);
+        sup.register(sleeper(ServiceKind::PhpFpm));
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        assert!(
+            sup.service(ServiceKind::PhpFpm)
+                .unwrap()
+                .started_at()
+                .is_some()
+        );
+
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        sup.health_check();
+        let fpm = sup.service(ServiceKind::PhpFpm).unwrap();
+        assert!(
+            matches!(fpm.state, ServiceState::Stopped),
+            "{:?}",
+            fpm.state
+        );
+        assert!(fpm.started_at().is_none(), "own child relinquished");
+
+        // Subsequent ticks are no-ops — never restarted while Herd owns it.
+        sup.health_check();
+        sup.health_check();
+        let fpm = sup.service(ServiceKind::PhpFpm).unwrap();
+        assert!(matches!(fpm.state, ServiceState::Stopped));
+        assert!(fpm.started_at().is_none());
+    }
+
+    /// Crashed FPM (recorded Running, child gone) + Herd owns it: the health
+    /// tick must not start a replacement child.
+    #[test]
+    fn health_never_replaces_crashed_fpm_under_external_ownership() {
+        let (flag, probe) = owned_flag();
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(probe);
+        // A child that exits immediately: recorded Running, actually gone.
+        sup.register(ManagedService::new(
+            ServiceKind::PhpFpm,
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), "exit 0".to_string()],
+        ));
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        sup.health_check();
+        let fpm = sup.service(ServiceKind::PhpFpm).unwrap();
+        assert!(
+            !matches!(fpm.state, ServiceState::Running { .. }),
+            "no replacement child under Herd: {:?}",
+            fpm.state
+        );
+        assert!(fpm.started_at().is_none(), "no new spawn recorded");
+    }
+
+    /// Ownership false: behavior is exactly the pre-C3-1 behavior — health
+    /// restarts a crashed service, start_all starts FPM.
+    #[test]
+    fn ownership_false_keeps_existing_behavior() {
+        let (_flag, probe) = owned_flag(); // stays false
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(probe);
+        sup.register(ManagedService::new(
+            ServiceKind::PhpFpm,
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), "exit 0".to_string()],
+        ));
+        sup.start_all().unwrap();
+        assert!(
+            sup.service(ServiceKind::PhpFpm)
+                .unwrap()
+                .started_at()
+                .is_some()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let crashed = sup.health_check();
+        assert!(crashed.contains(&ServiceKind::PhpFpm), "crash detected");
+        // Restart attempted (spawn recorded again by the restart path).
+        assert!(
+            sup.service(ServiceKind::PhpFpm)
+                .unwrap()
+                .started_at()
+                .is_some(),
+            "herd-absent crash restart unchanged"
+        );
+        let _ = sup.stop_all();
     }
 }

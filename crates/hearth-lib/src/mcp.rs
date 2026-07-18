@@ -444,19 +444,37 @@ impl HearthMcpServer {
             crate::php::ini_guard::validate_key(key)
                 .map_err(|e| format!("invalid status key: {e}"))?;
         }
+        // C3-2 parity with the CLI: bind a keyed Status to this exact
+        // request with a per-request correlation token and require BOTH
+        // echoes (in-process this always holds; the check keeps MCP and CLI
+        // on identical certification semantics).
+        let token = params.key.as_ref().map(|_| {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::time::{SystemTime, UNIX_EPOCH};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!(
+                "mcp-{}-{nanos:x}-{:x}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            )
+        });
         let outcome = self
             .engine
             .apply(PhpConfigAction::Status {
                 key: params.key.clone(),
+                token: token.clone(),
             })
             .await?;
-        // C2-2 parity with the CLI: a keyed Status must be certified by the
-        // responding engine's key echo (in-process this always holds; the
-        // check keeps MCP and CLI on identical capability semantics).
-        if params.key.is_some() && outcome.status_key != params.key {
+        if params.key.is_some()
+            && (outcome.status_key != params.key || outcome.status_token != token)
+        {
             return Err(format!(
-                "the daemon did not acknowledge the status key `{}` — hearth versions differ; \
-                 run 'hearth daemon stop && hearth daemon start' and retry.",
+                "the daemon did not certify the keyed status request (key `{}`) — hearth \
+                 versions differ; run 'hearth daemon stop && hearth daemon start' and retry.",
                 params.key.as_deref().unwrap_or_default()
             ));
         }

@@ -110,6 +110,12 @@ pub enum PhpConfigAction {
     Status {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<String>,
+        /// C3-2 correlation token: a keyed client binds its request to the
+        /// response by requiring this exact token echoed as `status_token`.
+        /// Serde-default + omitted-when-None keeps every legacy wire form
+        /// byte-identical; a legacy daemon ignores it and cannot echo it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
     /// Force journal recovery + legacy migration + reconcile.
     Sync,
@@ -228,6 +234,11 @@ pub struct PhpConfigOutcome {
     /// legacy wire forms stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_key: Option<String>,
+    /// C3-2: echo of the keyed-Status correlation token this daemon actually
+    /// applied — binds the certification to the exact request instead of a
+    /// coincidentally matching key. Absent everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_token: Option<String>,
 }
 
 impl PhpConfigOutcome {
@@ -438,9 +449,13 @@ mod tests {
         cases.push(PhpConfigAction::Show {
             key: Some("memory_limit".to_string()),
         });
-        cases.push(PhpConfigAction::Status { key: None });
+        cases.push(PhpConfigAction::Status {
+            key: None,
+            token: None,
+        });
         cases.push(PhpConfigAction::Status {
             key: Some("memory_limit".to_string()),
+            token: None,
         });
         cases.push(PhpConfigAction::Sync);
         cases.push(PhpConfigAction::Unmanage);
@@ -457,10 +472,20 @@ mod tests {
     /// `key: None` — old CLI ↔ new daemon and vice versa stay compatible.
     #[test]
     fn status_keyless_wire_form_is_legacy_byte_identical() {
-        let json = serde_json::to_string(&PhpConfigAction::Status { key: None }).unwrap();
+        let json = serde_json::to_string(&PhpConfigAction::Status {
+            key: None,
+            token: None,
+        })
+        .unwrap();
         assert_eq!(json, r#"{"action":"Status"}"#);
         let back: PhpConfigAction = serde_json::from_str(r#"{"action":"Status"}"#).unwrap();
-        assert_eq!(back, PhpConfigAction::Status { key: None });
+        assert_eq!(
+            back,
+            PhpConfigAction::Status {
+                key: None,
+                token: None,
+            }
+        );
     }
 
     /// C2-2 cross-version wire shapes, using the EXACT serialized forms of
@@ -489,6 +514,7 @@ mod tests {
             files: vec![],
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         };
         let json = serde_json::to_string(&keyless).unwrap();
         assert!(
@@ -591,6 +617,7 @@ mod tests {
                 }],
                 fpm,
                 status_key: None,
+                status_token: None,
             };
             let response = DaemonResponse::PhpConfigReport(outcome.clone());
             let json = serde_json::to_string(&response).unwrap();
@@ -632,6 +659,7 @@ mod tests {
             files: vec![],
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         let back: PhpConfigOutcome = serde_json::from_str(&json).unwrap();

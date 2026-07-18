@@ -37,13 +37,30 @@ All notable changes to Hearth will be documented in this file.
   CLI that cannot parse the new outcome fails into the actionable
   stop/start version-mismatch remediation instead of rendering a false
   state).
+- One coherent current-Herd-ownership policy for PHP-FPM now lives inside
+  the supervisor: generic `hearth start`/`hearth restart` skip (or, for an
+  explicit `restart php-fpm`, refuse with an actionable error) the FPM slot
+  while Herd owns it, and health supervision never respawns it. If Herd
+  appears while Hearth's own FPM is still running, the next health tick
+  relinquishes Hearth's own child exactly once — Hearth never signals or
+  stops Herd's process.
 - A keyed `--status` is certified by the daemon echoing the applied key
-  (`status_key` in the report). Against an older daemon that silently
-  ignores the key, the keyed request now fails with the stop/start
-  remediation instead of printing a valueless table; keyless `--status`
-  stays fully compatible in both directions. Invalid `--status`/`--show`
-  keys are rejected client-side and daemon-side. The MCP
-  `hearth_php_config_status` tool accepts the same optional `key`.
+  (`status_key`) AND a per-request correlation token (`status_token`) —
+  the certification is bound to the exact request/response pair, so an
+  unrelated success response or a stale report can never certify. Against
+  an older daemon that silently ignores the key, the keyed request fails
+  with the stop/start remediation instead of printing a valueless table;
+  keyless `--status` stays fully compatible in both directions. Invalid
+  `--status`/`--show` keys are rejected client-side and daemon-side. The
+  MCP `hearth_php_config_status` tool uses the same key + binding.
+- The truthful `pending restart` marker now requires the full chain of
+  evidence: the supervised command must equal the exact canonical
+  provider/version FPM layout binary (root-bounded, unambiguous), the
+  channel file must exist right now as a regular file whose bytes hash to
+  the recorded applied hash, and the manifest entry must be an
+  Applied/Written record for the exact path/version/channel. Targets whose
+  expected layout path resolves outside their provider root are rendered
+  `identity unverified` and are never executed.
 - Protocol-mismatch remediation now names only supported commands
   (`hearth daemon stop && hearth daemon start`); there is no
   `hearth daemon restart` command.

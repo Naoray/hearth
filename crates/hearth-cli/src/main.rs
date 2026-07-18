@@ -342,18 +342,30 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // C2-2: a keyed Status is trustworthy only when the daemon echoes the
-    // key it applied — a legacy daemon deserializes the keyed request as
-    // keyless and answers a valueless table with no error.
-    let expected_status_key = match &request {
+    // C2-2/C3-2: a keyed Status is trustworthy only on the exact expected
+    // report response, with the key AND a per-request correlation token both
+    // echoed — a legacy daemon deserializes the keyed request as keyless and
+    // answers a valueless table; a stale or unrelated success-shaped
+    // response can never satisfy the token binding.
+    let mut request = request;
+    let keyed_status = match &mut request {
         DaemonRequest::PhpConfigV2 {
-            action: hearth_lib::socket::PhpConfigAction::Status { key: Some(key) },
-        } => Some(key.clone()),
+            action:
+                hearth_lib::socket::PhpConfigAction::Status {
+                    key: Some(key),
+                    token,
+                },
+        } => {
+            let correlation = new_status_correlation_token();
+            *token = Some(correlation.clone());
+            Some((key.clone(), correlation))
+        }
         _ => None,
     };
     let response = send_to_daemon(request).await?;
-    if let Some(expected) = expected_status_key {
-        verify_keyed_status_certified(&response, &expected).map_err(|msg| anyhow::anyhow!(msg))?;
+    if let Some((expected_key, expected_token)) = keyed_status {
+        verify_keyed_status_certified(&response, &expected_key, &expected_token)
+            .map_err(|msg| anyhow::anyhow!(msg))?;
     }
     // print_response is a pure renderer (returns ExitClass); main owns the
     // only process-exit application in the binary.
@@ -364,26 +376,49 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// C2-2 (review 5650 r2): fail a keyed Status actionably when the daemon did
-/// not certify the key. EOF/unparseable detection alone cannot catch a
-/// pre-round-2 daemon — it accepts the keyed payload as keyless and answers
-/// success-shaped output.
+/// C3-2 (review 5650 r3): per-request correlation token for keyed Status.
+/// Not a secret — a binding value that a stale or unrelated response cannot
+/// carry. Generated in-process (pid + monotonic-ish clock + counter), never
+/// via a shell.
+fn new_status_correlation_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "st-{}-{nanos:x}-{:x}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// C2-2/C3-2: a keyed Status may succeed ONLY on the exact expected
+/// `PhpConfigReport` whose `status_key` and `status_token` echoes both match
+/// this request. Every other success shape — an unrelated `Ok`, a service
+/// status, a stale report with a coincidentally matching key, a missing or
+/// mismatched echo — is an actionable protocol mismatch. A daemon `Error`
+/// keeps its own truthful nonzero path (it is never mislabeled success).
 fn verify_keyed_status_certified(
     response: &DaemonResponse,
     expected_key: &str,
+    expected_token: &str,
 ) -> Result<(), String> {
     match response {
         DaemonResponse::PhpConfigReport(outcome)
-            if outcome.status_key.as_deref() == Some(expected_key) =>
+            if outcome.status_key.as_deref() == Some(expected_key)
+                && outcome.status_token.as_deref() == Some(expected_token) =>
         {
             Ok(())
         }
-        DaemonResponse::PhpConfigReport(_) => Err(format!(
-            "the daemon did not acknowledge the status key `{expected_key}` — hearth CLI and \
-             daemon versions differ; run 'hearth daemon stop && hearth daemon start' and retry."
+        DaemonResponse::Error { .. } => Ok(()),
+        _ => Err(format!(
+            "the daemon did not certify the keyed status request (key `{expected_key}`) — \
+             hearth CLI and daemon versions differ; run \
+             'hearth daemon stop && hearth daemon start' and retry."
         )),
-        // Errors and other shapes render on their own truthful paths.
-        _ => Ok(()),
     }
 }
 
@@ -440,7 +475,7 @@ fn build_php_config_action(
             hearth_lib::php::ini_guard::validate_key(k)
                 .map_err(|e| format!("invalid --status key: {e}"))?;
         }
-        return Ok(PhpConfigAction::Status { key });
+        return Ok(PhpConfigAction::Status { key, token: None });
     }
 
     if sync || unmanage {
@@ -1710,7 +1745,10 @@ mod tests {
         );
         assert_eq!(
             build(None, None, false, None, false, false, true, false, false),
-            Ok(PhpConfigAction::Status { key: None })
+            Ok(PhpConfigAction::Status {
+                key: None,
+                token: None
+            })
         );
         // C1-3: --status accepts an optional key selector…
         assert_eq!(
@@ -1726,7 +1764,8 @@ mod tests {
                 false
             ),
             Ok(PhpConfigAction::Status {
-                key: Some("k".to_string())
+                key: Some("k".to_string()),
+                token: None
             })
         );
         // …but still no value and no scope flags.
@@ -1808,44 +1847,95 @@ mod tests {
             files: vec![],
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         }
     }
 
-    /// C2-2: the EXACT legacy response shape (a pre-round-2 daemon answering
-    /// a keyed Status it silently treated as keyless) must fail the keyed
-    /// certificate with the supported stop/start remediation; a certified
-    /// echo passes; keyless requests never consult the certificate.
+    /// C2-2/C3-2: keyed-Status certification is bound to the EXACT expected
+    /// report response and this request's correlation token. The exact
+    /// legacy wire shape, an unrelated success (`Ok`), a stale report with
+    /// the right key but wrong/missing token, and a mismatched key all fail
+    /// with the supported stop/start remediation; the exact echo passes; a
+    /// daemon `Error` keeps its own truthful nonzero path.
     #[test]
-    fn keyed_status_against_legacy_daemon_fails_actionably() {
+    fn keyed_status_binds_to_exact_response_and_token() {
+        let assert_mismatch = |response: &DaemonResponse| {
+            let err =
+                verify_keyed_status_certified(response, "memory_limit", "st-tok-1").unwrap_err();
+            assert!(
+                err.contains("did not certify the keyed status request"),
+                "got: {err}"
+            );
+            assert!(
+                err.contains("hearth daemon stop && hearth daemon start"),
+                "must carry the supported remediation: {err}"
+            );
+        };
+
         // Exact wire bytes a b899ff04 daemon sends for the keyed request.
         let legacy = r#"{"type":"PhpConfigReport","persisted":null,"rows":[],"files":[],"fpm":{"outcome":"NotAttempted"}}"#;
-        let response: DaemonResponse = serde_json::from_str(legacy).unwrap();
-        let err = verify_keyed_status_certified(&response, "memory_limit").unwrap_err();
+        assert_mismatch(&serde_json::from_str(legacy).unwrap());
+
+        // Unrelated success shape (the reviewer's stale-socket reproduction):
+        // an `Ok` must NEVER certify a keyed Status.
+        let unrelated = r#"{"type":"Ok","message":"stale success"}"#;
+        assert_mismatch(&serde_json::from_str(unrelated).unwrap());
+
+        // Another unrelated report-free success shape.
+        assert_mismatch(&DaemonResponse::Pong);
+
+        // Stale report: right key, wrong token (a previous request's echo).
+        let mut stale = outcome_with_rows(vec![]);
+        stale.status_key = Some("memory_limit".to_string());
+        stale.status_token = Some("st-tok-OLD".to_string());
+        assert_mismatch(&DaemonResponse::PhpConfigReport(stale));
+
+        // Right key, missing token echo.
+        let mut untokened = outcome_with_rows(vec![]);
+        untokened.status_key = Some("memory_limit".to_string());
+        assert_mismatch(&DaemonResponse::PhpConfigReport(untokened));
+
+        // Mismatched key with correct token.
+        let mut wrong_key = outcome_with_rows(vec![]);
+        wrong_key.status_key = Some("upload_max_filesize".to_string());
+        wrong_key.status_token = Some("st-tok-1".to_string());
+        assert_mismatch(&DaemonResponse::PhpConfigReport(wrong_key));
+
+        // Duplicate/ambiguous certification fields are rejected at the
+        // deserialization boundary itself ("duplicate field") — the send
+        // path surfaces that as the unparseable-response version-mismatch
+        // remediation, so a smuggled duplicate can never certify.
+        let duplicated = r#"{"type":"PhpConfigReport","persisted":null,"rows":[],"files":[],"fpm":{"outcome":"NotAttempted"},"status_key":"memory_limit","status_token":"st-tok-1","status_token":"st-tok-SMUGGLED"}"#;
+        let parse_err = serde_json::from_str::<DaemonResponse>(duplicated).unwrap_err();
         assert!(
-            err.contains("did not acknowledge the status key"),
-            "got: {err}"
-        );
-        assert!(
-            err.contains("hearth daemon stop && hearth daemon start"),
-            "must carry the supported remediation: {err}"
+            parse_err.to_string().contains("duplicate field"),
+            "ambiguous certification data must not parse: {parse_err}"
         );
 
-        // A certified echo passes.
+        // The exact echo passes.
         let mut certified = outcome_with_rows(vec![]);
         certified.status_key = Some("memory_limit".to_string());
+        certified.status_token = Some("st-tok-1".to_string());
         assert!(
             verify_keyed_status_certified(
                 &DaemonResponse::PhpConfigReport(certified),
-                "memory_limit"
+                "memory_limit",
+                "st-tok-1"
             )
             .is_ok()
         );
 
-        // A daemon Error renders on its own truthful path.
+        // A daemon Error renders on its own truthful (nonzero) path.
         let error_response = DaemonResponse::Error {
             message: "boom".to_string(),
         };
-        assert!(verify_keyed_status_certified(&error_response, "memory_limit").is_ok());
+        assert!(verify_keyed_status_certified(&error_response, "memory_limit", "st-tok-1").is_ok());
+
+        // Correlation tokens are per-request unique.
+        assert_ne!(
+            new_status_correlation_token(),
+            new_status_correlation_token()
+        );
     }
 
     #[test]
@@ -2026,6 +2116,7 @@ mod tests {
             }],
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         };
         assert_eq!(render_php_config_report(&refused).2, ExitClass::Failure);
 
@@ -2041,6 +2132,7 @@ mod tests {
             }],
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         };
         assert_eq!(render_php_config_report(&failed).2, ExitClass::Failure);
 
@@ -2053,6 +2145,7 @@ mod tests {
                 message: "boom".to_string(),
             },
             status_key: None,
+            status_token: None,
         };
         assert_eq!(render_php_config_report(&fpm_failed).2, ExitClass::Failure);
 
@@ -2076,6 +2169,7 @@ mod tests {
                 }],
                 fpm,
                 status_key: None,
+                status_token: None,
             };
             assert_eq!(render_php_config_report(&ok).2, ExitClass::Success);
         }
@@ -2122,6 +2216,7 @@ mod tests {
             }],
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         };
         assert_eq!(
             print_response(DaemonResponse::PhpConfigReport(refused)),

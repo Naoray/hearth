@@ -165,8 +165,13 @@ files, then restart the supervised php-fpm only when it is actually
 registered. An unregistered or launch-blocked FPM is reported informationally
 and never fails the command; a failed restart of a registered FPM does.
 While Herd owns PHP-FPM, configuration changes still persist and reconcile,
-but Hearth never stops, starts, or restarts FPM — the output states that the
-restart was skipped because Herd owns PHP-FPM.
+but Hearth never starts or restarts its FPM — config output states that the
+restart was skipped because Herd owns PHP-FPM, generic `hearth start`/
+`hearth restart` skip or refuse the FPM slot, and health supervision never
+respawns it. Two distinct rules: Hearth **never controls Herd's own FPM
+process**, and Hearth **may stop its own supervised FPM child exactly once**
+during an ownership handoff (when Herd appears while Hearth's FPM is still
+running) so the two never fight over port/socket ownership.
 When the running FPM predates the newest materialized config, status shows a
 truthful `pending restart` marker.
 

@@ -97,6 +97,12 @@ pub struct PhpTarget {
     /// `None` for ambient-provider FPM targets (round-4 locked design:
     /// external FPM never authorizes writes in Stage B).
     pub write_channel: Option<PathBuf>,
+    /// C3-3: proven canonical/root-bounded identity (see
+    /// [`verify_binary_identity`]). `false` = the expected layout path
+    /// escapes its provider root — the binary is NEVER executed (no
+    /// classification probe, no effective-value probe) and no channel
+    /// authority exists.
+    pub identity_verified: bool,
 }
 
 /// Injected provider base directories. Production uses the real roots
@@ -474,50 +480,100 @@ fn reject(reason: String) -> ChannelRejection {
 
 /// Enumerate all provider binaries per SAPI. A same-version binary from one
 /// provider never hides another provider's.
+/// Expected executable layout for a (provider, version, sapi) triple — the
+/// ONLY paths that may carry that provider's label (C3-3).
+pub fn expected_binary_path(
+    provider: PhpProvider,
+    version: &str,
+    sapi: PhpSapi,
+    roots: &ProviderRoots,
+) -> PathBuf {
+    let xy = version.replace('.', "");
+    match (provider, sapi) {
+        (PhpProvider::Hearth, PhpSapi::Cli) => roots.hearth.join("php").join(version).join("php"),
+        (PhpProvider::Hearth, PhpSapi::Fpm) => {
+            roots.hearth.join("php").join(version).join("php-fpm")
+        }
+        (PhpProvider::Herd, PhpSapi::Cli) => roots.herd.join("bin").join(format!("php{xy}")),
+        (PhpProvider::Herd, PhpSapi::Fpm) => roots.herd.join("bin").join(format!("php{xy}-fpm")),
+        (PhpProvider::Homebrew, PhpSapi::Cli) => roots
+            .homebrew
+            .join("opt")
+            .join(format!("php@{version}"))
+            .join("bin/php"),
+        (PhpProvider::Homebrew, PhpSapi::Fpm) => roots
+            .homebrew
+            .join("opt")
+            .join(format!("php@{version}"))
+            .join("sbin/php-fpm"),
+    }
+}
+
+/// C3-3 (review 5650 r3): canonical, root-bounded identity proof for a
+/// provider-labeled executable. The exact expected layout path must exist,
+/// canonicalize to a regular file, and remain inside the canonical provider
+/// root (which must not be `/`). Returns the canonical executable path; any
+/// failure is a reason — the caller must treat the target as UNVERIFIED and
+/// never execute it under that provider's label.
+pub fn verify_binary_identity(
+    provider: PhpProvider,
+    version: &str,
+    sapi: PhpSapi,
+    roots: &ProviderRoots,
+) -> Result<PathBuf, String> {
+    let root = match provider {
+        PhpProvider::Hearth => &roots.hearth,
+        PhpProvider::Herd => &roots.herd,
+        PhpProvider::Homebrew => &roots.homebrew,
+    };
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| format!("provider root {} not canonicalizable: {e}", root.display()))?;
+    if canonical_root.parent().is_none() {
+        return Err("provider root `/` can never bound an identity".to_string());
+    }
+    let expected = expected_binary_path(provider, version, sapi, roots);
+    let canonical = expected
+        .canonicalize()
+        .map_err(|e| format!("{} not canonicalizable: {e}", expected.display()))?;
+    if !canonical.is_file() {
+        return Err(format!("{} is not a regular file", canonical.display()));
+    }
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!(
+            "{} resolves to {} outside the canonical {:?} root {}",
+            expected.display(),
+            canonical.display(),
+            provider,
+            canonical_root.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 pub fn discover_provider_targets(roots: &ProviderRoots) -> Vec<PhpTargetIdentity> {
     let mut ids = Vec::new();
     for version in crate::php::SUPPORTED_VERSIONS {
-        let xy = version.replace('.', "");
-        let candidates: [(PhpProvider, PhpSapi, PathBuf); 6] = [
-            (
-                PhpProvider::Hearth,
-                PhpSapi::Cli,
-                roots.hearth.join("php").join(version).join("php"),
-            ),
-            (
-                PhpProvider::Hearth,
-                PhpSapi::Fpm,
-                roots.hearth.join("php").join(version).join("php-fpm"),
-            ),
-            (
-                PhpProvider::Herd,
-                PhpSapi::Cli,
-                roots.herd.join("bin").join(format!("php{xy}")),
-            ),
-            (
-                PhpProvider::Herd,
-                PhpSapi::Fpm,
-                roots.herd.join("bin").join(format!("php{xy}-fpm")),
-            ),
-            (
-                PhpProvider::Homebrew,
-                PhpSapi::Cli,
-                roots
-                    .homebrew
-                    .join("opt")
-                    .join(format!("php@{version}"))
-                    .join("bin/php"),
-            ),
-            (
-                PhpProvider::Homebrew,
-                PhpSapi::Fpm,
-                roots
-                    .homebrew
-                    .join("opt")
-                    .join(format!("php@{version}"))
-                    .join("sbin/php-fpm"),
-            ),
-        ];
+        let candidates: [(PhpProvider, PhpSapi, PathBuf); 6] = [PhpSapi::Cli, PhpSapi::Fpm]
+            .into_iter()
+            .flat_map(|sapi| {
+                [
+                    PhpProvider::Hearth,
+                    PhpProvider::Herd,
+                    PhpProvider::Homebrew,
+                ]
+                .into_iter()
+                .map(move |provider| {
+                    (
+                        provider,
+                        sapi,
+                        expected_binary_path(provider, version, sapi, roots),
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("exactly six provider/sapi candidates");
         for (provider, sapi, path) in candidates {
             if !path.is_file() {
                 continue;

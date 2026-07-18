@@ -25,7 +25,7 @@ use crate::php::reconcile::{
 use crate::php::targets::{
     ChannelClass, EffectiveContext, PhpProvider, PhpSapi, PhpTarget, ProbeInfo, ProviderRoots,
     classify_channel, discover_provider_targets, expected_channel_dir, probe_cli_effective,
-    probe_fpm_effective, probe_scan_dirs, verify_user_channel,
+    probe_fpm_effective, probe_scan_dirs, verify_binary_identity, verify_user_channel,
 };
 use crate::service::ServiceKind;
 use crate::service::supervisor::ServiceSupervisor;
@@ -143,16 +143,19 @@ impl PhpConfigEngine {
                 }
                 self.observe(key.as_deref()).await
             }
-            PhpConfigAction::Status { key } => {
+            PhpConfigAction::Status { key, token } => {
                 if let Some(k) = &key {
                     ini_guard::validate_key(k).map_err(|e| e.to_string())?;
                 }
                 let mut outcome = self.observe(key.as_deref()).await?;
-                // C2-2: certify keyed-Status capability by echoing the key
-                // this engine actually applied. A legacy daemon ignores the
-                // keyed field and cannot echo — clients treat the missing
-                // echo as a version mismatch.
+                // C2-2/C3-2: certify the keyed-Status capability by echoing
+                // BOTH the key this engine actually applied and the caller's
+                // per-request correlation token. A legacy daemon ignores the
+                // fields and can echo neither — clients treat any missing or
+                // mismatched echo as a version mismatch, and a stale report
+                // (right key, wrong request) fails the token binding.
                 outcome.status_key = key;
+                outcome.status_token = token;
                 Ok(outcome)
             }
             PhpConfigAction::Sync => self.sync_locked().await,
@@ -257,6 +260,7 @@ impl PhpConfigEngine {
             files,
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         })
     }
 
@@ -280,6 +284,7 @@ impl PhpConfigEngine {
             files: Vec::new(),
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         })
     }
 
@@ -329,6 +334,7 @@ impl PhpConfigEngine {
             files,
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         })
     }
 
@@ -349,6 +355,7 @@ impl PhpConfigEngine {
             files,
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         })
     }
 
@@ -400,6 +407,30 @@ impl PhpConfigEngine {
 
         let mut targets = Vec::with_capacity(ids.len());
         for id in ids {
+            // C3-3 (review 5650 r3): provider identity must be PROVEN before
+            // any use. An expected layout path whose canonical target
+            // escapes its canonical provider root is NEVER executed nor
+            // granted a channel under that label — it renders as a loudly
+            // unverified target instead of being silently skipped (the
+            // typed Hearth channel-creation refusal above still fires for
+            // symlinked ancestors, preserving Stage-B loudness).
+            if let Err(reason) =
+                verify_binary_identity(id.provider, &id.version, id.sapi, &self.provider_roots)
+            {
+                let reason = format!("target identity unverified: {reason}");
+                targets.push(PhpTarget {
+                    id,
+                    probe: ProbeInfo::default(),
+                    normal_channel: ChannelClass::BestEffort {
+                        reason: reason.clone(),
+                    },
+                    sanitized_channel: ChannelClass::BestEffort { reason },
+                    write_channel: None,
+                    identity_verified: false,
+                });
+                continue;
+            }
+
             // C1-2 (review 5650): NO FPM binary is EVER executed for
             // classification — `-i` runs only as the launch probe of the
             // registrable service under its exact service env. External FPM
@@ -429,6 +460,7 @@ impl PhpConfigEngine {
                         reason: reason.to_string(),
                     },
                     write_channel,
+                    identity_verified: true,
                 });
                 continue;
             }
@@ -459,6 +491,7 @@ impl PhpConfigEngine {
                 normal_channel,
                 sanitized_channel,
                 write_channel,
+                identity_verified: true,
             });
         }
         (targets, creation_failures)
@@ -671,7 +704,9 @@ impl PhpConfigEngine {
             return;
         }
         for target in targets {
-            if target.id.sapi != PhpSapi::Cli {
+            // C3-3: an unverified identity is never executed — not even for
+            // an effective-value probe.
+            if target.id.sapi != PhpSapi::Cli || !target.identity_verified {
                 continue;
             }
             for (context, effective_context) in [
@@ -1226,7 +1261,10 @@ mod tests {
         let fx = fixture(false);
         let outcome = fx
             .engine
-            .apply(PhpConfigAction::Status { key: None })
+            .apply(PhpConfigAction::Status {
+                key: None,
+                token: None,
+            })
             .await
             .unwrap();
         let fpm_row = outcome
@@ -1251,7 +1289,10 @@ mod tests {
         let fx = fixture(true);
         let outcome = fx
             .engine
-            .apply(PhpConfigAction::Status { key: None })
+            .apply(PhpConfigAction::Status {
+                key: None,
+                token: None,
+            })
             .await
             .unwrap();
         assert!(outcome.rows.iter().all(|r| r.context != "launched"));
@@ -1335,6 +1376,7 @@ mod tests {
                 reason: "missing fpm config — see todo #2343".to_string(),
             },
             status_key: None,
+            status_token: None,
         };
         assert!(
             require_reconciled(Ok(clean)).is_ok(),
@@ -1352,6 +1394,7 @@ mod tests {
             }],
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         };
         let err = require_reconciled(Ok(refused)).unwrap_err();
         assert!(err.contains("/chan/zz-hearth.ini"), "got: {err}");
@@ -1369,6 +1412,7 @@ mod tests {
             }],
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         };
         assert!(require_reconciled(Ok(failed)).is_err());
 
@@ -1485,7 +1529,10 @@ mod tests {
 
         let outcome = fx
             .engine
-            .apply(PhpConfigAction::Status { key: None })
+            .apply(PhpConfigAction::Status {
+                key: None,
+                token: None,
+            })
             .await
             .unwrap();
         assert!(outcome.files.is_empty(), "status is read-only");
@@ -1628,7 +1675,10 @@ mod tests {
 
         let outcome = fx
             .engine
-            .apply(PhpConfigAction::Status { key: None })
+            .apply(PhpConfigAction::Status {
+                key: None,
+                token: None,
+            })
             .await
             .unwrap();
         let fpm_rows: Vec<_> = outcome
@@ -1688,7 +1738,10 @@ mod tests {
 
         let status = fx
             .engine
-            .apply(PhpConfigAction::Status { key: None })
+            .apply(PhpConfigAction::Status {
+                key: None,
+                token: None,
+            })
             .await
             .unwrap();
         let fpm_row = status
@@ -2098,6 +2151,7 @@ echo "Scan for additional .ini files in: {}"
             .engine
             .apply(PhpConfigAction::Status {
                 key: Some("memory_limit".to_string()),
+                token: None,
             })
             .await
             .unwrap();
@@ -2120,7 +2174,10 @@ echo "Scan for additional .ini files in: {}"
         // A keyless Status never fakes values (C1-3 contract).
         let keyless = fx
             .engine
-            .apply(PhpConfigAction::Status { key: None })
+            .apply(PhpConfigAction::Status {
+                key: None,
+                token: None,
+            })
             .await
             .unwrap();
         for row in &keyless.rows {
@@ -2179,6 +2236,70 @@ echo "Scan for additional .ini files in: {}"
         );
     }
 
+    // ---- C3-3 (review 5650 r3): truthful discovery identity ----
+
+    /// An expected layout path whose canonical target escapes its provider
+    /// root is NEVER executed and renders loudly unverified with no write
+    /// channel — instead of being probed under a false provider label.
+    /// Fails at head 7c88222 (the escaped binary was executed/classified).
+    #[tokio::test]
+    async fn escaped_binary_target_is_unverified_and_never_executed() {
+        let fx = fixture(false);
+        let base = fx._tmp.path().canonicalize().unwrap();
+        let herd = fx.engine.provider_roots.herd.clone();
+        let log = base.join("invocations.log");
+        // Outside script that logs every non-warmup exec.
+        let outside = base.join("outside-php");
+        write_executable(
+            &outside,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--warmup\" ]; then exit 0; fi\n\
+                 echo run >> \"{}\"\n\
+                 echo \"Scan for additional .ini files in: /tmp\"\n",
+                log.display()
+            ),
+        );
+        std::fs::create_dir_all(herd.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&outside, herd.join("bin/php84")).unwrap();
+        let count = |path: &Path| {
+            std::fs::read_to_string(path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+
+        let outcome = fx
+            .engine
+            .apply(PhpConfigAction::Show {
+                key: Some("memory_limit".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(count(&log), 0, "escaped binary must never be executed");
+        let row = outcome
+            .rows
+            .iter()
+            .find(|r| r.provider == "herd" && r.sapi == "cli" && r.context == "normal")
+            .expect("unverified herd cli row still renders loudly");
+        assert!(
+            row.coverage.contains("identity unverified"),
+            "got: {}",
+            row.coverage
+        );
+        assert_eq!(row.observed, None);
+        assert_eq!(row.observed_state, "n/a");
+
+        // And a Set grants it nothing: zero execs, no herd channel write.
+        fx.engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        assert_eq!(count(&log), 0, "Set must not execute the escaped binary");
+        assert!(
+            !herd.join("config/php/84").join(CHANNEL_FILE_NAME).exists(),
+            "no write authority under a forged identity"
+        );
+    }
+
     // ---- C2-2/C2-4 (review 5650 r2): keyed-Status certificate + validation ----
 
     #[tokio::test]
@@ -2191,6 +2312,7 @@ echo "Scan for additional .ini files in: {}"
             .engine
             .apply(PhpConfigAction::Status {
                 key: Some("memory_limit".to_string()),
+                token: None,
             })
             .await
             .unwrap();
@@ -2199,7 +2321,10 @@ echo "Scan for additional .ini files in: {}"
         // Keyless Status carries no echo (legacy-identical wire form).
         let keyless = fx
             .engine
-            .apply(PhpConfigAction::Status { key: None })
+            .apply(PhpConfigAction::Status {
+                key: None,
+                token: None,
+            })
             .await
             .unwrap();
         assert_eq!(keyless.status_key, None);
@@ -2212,6 +2337,7 @@ echo "Scan for additional .ini files in: {}"
                 .engine
                 .apply(PhpConfigAction::Status {
                     key: Some(bad.to_string()),
+                    token: None,
                 })
                 .await
                 .unwrap_err();

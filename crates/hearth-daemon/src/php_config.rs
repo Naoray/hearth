@@ -144,6 +144,21 @@ fn channel_applied_at_ms(
     }
     let (provider, kind, canonical_provider_root) = matched.remove(0);
 
+    // C3-3: containment is not identity. The supervised command must EQUAL
+    // the exact canonical expected provider/version/FPM layout executable —
+    // an arbitrary binary elsewhere under the root, a wrong version slot,
+    // or a symlink-escaped layout path can never certify pending restart.
+    let expected = hearth_lib::php::targets::verify_binary_identity(
+        provider,
+        version,
+        hearth_lib::php::targets::PhpSapi::Fpm,
+        roots,
+    )
+    .ok()?;
+    if expected != canonical_binary {
+        return None;
+    }
+
     // Exactly ONE expected channel for that identity. The dir must be
     // canonical (no symlink component — Stage-B rule) and must remain inside
     // the canonical provider root; a symlink escape produces no claim.
@@ -154,24 +169,35 @@ fn channel_applied_at_ms(
     }
 
     // Exact-entry match: path + php_version + channel kind + Applied +
-    // Written/Unchanged success. Pending/refused/failed/removed/unrelated
+    // Written. `Unchanged` is deliberately NOT accepted — the reconcile
+    // writer never persists it (unchanged content returns before touching
+    // the manifest), so an Applied/Unchanged record is not a genuine durable
+    // materialization state. Pending/refused/failed/removed/unrelated
     // entries are ignored; no newest-of-many selection exists.
     let channel_file = channel_dir.join(CHANNEL_FILE_NAME);
     let manifest = Manifest::load(&engine.manifest_path()).ok()?;
-    manifest
-        .files
-        .iter()
-        .find(|e| {
-            e.path == channel_file
-                && e.php_version == version
-                && e.channel == kind
-                && e.state == EntryState::Applied
-                && matches!(
-                    e.last_outcome,
-                    LastOutcome::Written | LastOutcome::Unchanged
-                )
-        })
-        .and_then(|e| e.applied_at_unix_ms)
+    let entry = manifest.files.iter().find(|e| {
+        e.path == channel_file
+            && e.php_version == version
+            && e.channel == kind
+            && e.state == EntryState::Applied
+            && matches!(e.last_outcome, LastOutcome::Written)
+    })?;
+
+    // C3-3 live evidence: the manifest record alone is not proof. The
+    // channel file must exist NOW, must not be a symlink, and its current
+    // bytes must hash to the recorded applied hash — a removed, replaced,
+    // or externally modified file voids the pending claim until reconcile
+    // repairs it.
+    let meta = std::fs::symlink_metadata(&channel_file).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(&channel_file).ok()?;
+    if hearth_lib::php::reconcile::sha256_hex(&bytes) != entry.sha256 {
+        return None;
+    }
+    entry.applied_at_unix_ms
 }
 
 /// Handle the legacy `PhpConfig { version, key, value }` request (protocol
@@ -680,6 +706,7 @@ mod tests {
             files: vec![],
             fpm: FpmRestartOutcome::NotAttempted,
             status_key: None,
+            status_token: None,
         }
     }
 
@@ -720,13 +747,16 @@ mod tests {
         }
 
         // Manifest entry materialized BEFORE the spawn → no pending claim.
+        // C3-3: live evidence — the channel file really exists and hashes to
+        // the recorded value.
+        let live_sha = write_live_channel(&conf_d);
         let channel_file = conf_d.join(CHANNEL_FILE_NAME);
         let manifest_path = state.php_engine.manifest_path();
         let entry = |applied: u64| ManifestEntry {
             path: channel_file.clone(),
             php_version: default_php.clone(),
             channel: "hearth".to_string(),
-            sha256: "abc".to_string(),
+            sha256: live_sha.clone(),
             state: EntryState::Applied,
             expected_old_sha256: None,
             desired_sha256: None,
@@ -825,7 +855,7 @@ mod tests {
         // checked against the actual dir, not a reconstructed suffix).
         let roots = state.php_engine.provider_roots().clone();
         let herd_dir = expected_channel_dir(PhpProvider::Herd, &default_php, &roots);
-        std::fs::create_dir_all(&herd_dir).unwrap();
+        let live_sha = write_live_channel(&herd_dir);
         let herd_channel = herd_dir.join(CHANNEL_FILE_NAME);
         let manifest = Manifest {
             version: hearth_lib::php::reconcile::MANIFEST_VERSION,
@@ -833,7 +863,7 @@ mod tests {
                 path: herd_channel,
                 php_version: default_php.clone(),
                 channel: "herd-user".to_string(),
-                sha256: "abc".to_string(),
+                sha256: live_sha,
                 state: EntryState::Applied,
                 expected_old_sha256: None,
                 desired_sha256: None,
@@ -908,11 +938,21 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// C3-3 live evidence: write a real channel file and return its sha256 —
+    /// the hash a truthful manifest entry must record.
+    fn write_live_channel(dir: &std::path::Path) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        let content = b"; managed by hearth\nmemory_limit=1G\n";
+        std::fs::write(dir.join(CHANNEL_FILE_NAME), content).unwrap();
+        hearth_lib::php::reconcile::sha256_hex(content)
+    }
+
     // ---- C2-3 (review 5650 r2): exact-entry + root-bounded identity ----
 
     fn herd_entry(
         path: std::path::PathBuf,
         version: &str,
+        sha256: &str,
         state: hearth_lib::php::reconcile::EntryState,
         outcome: hearth_lib::php::reconcile::LastOutcome,
     ) -> hearth_lib::php::reconcile::ManifestEntry {
@@ -920,7 +960,7 @@ mod tests {
             path,
             php_version: version.to_string(),
             channel: "herd-user".to_string(),
-            sha256: "abc".to_string(),
+            sha256: sha256.to_string(),
             state,
             expected_old_sha256: None,
             desired_sha256: None,
@@ -976,19 +1016,24 @@ mod tests {
             outcome.rows[0].pending_restart
         }
 
-        // Unrelated NEWER Hearth entry alone: ignored by a provider-backed FPM.
-        let hearth_file = state
+        // Live channel evidence for every otherwise-plausible herd entry.
+        let live_sha = write_live_channel(&herd_dir);
+
+        // Unrelated NEWER Hearth entry alone: ignored by a provider-backed
+        // FPM (with real live evidence on the hearth side too).
+        let hearth_conf_d = state
             .php_engine
             .config_dir()
             .join("php")
             .join(&default_php)
-            .join("conf.d")
-            .join(CHANNEL_FILE_NAME);
+            .join("conf.d");
+        let hearth_sha = write_live_channel(&hearth_conf_d);
+        let hearth_file = hearth_conf_d.join(CHANNEL_FILE_NAME);
         save(vec![ManifestEntry {
             path: hearth_file,
             php_version: default_php.clone(),
             channel: "hearth".to_string(),
-            sha256: "abc".to_string(),
+            sha256: hearth_sha,
             state: EntryState::Applied,
             expected_old_sha256: None,
             desired_sha256: None,
@@ -1004,6 +1049,7 @@ mod tests {
         save(vec![herd_entry(
             herd_file.clone(),
             "8.3",
+            &live_sha,
             EntryState::Applied,
             LastOutcome::Written,
         )]);
@@ -1016,6 +1062,7 @@ mod tests {
         save(vec![herd_entry(
             herd_file.clone(),
             &default_php,
+            &live_sha,
             EntryState::Pending,
             LastOutcome::Written,
         )]);
@@ -1029,6 +1076,7 @@ mod tests {
             save(vec![herd_entry(
                 herd_file.clone(),
                 &default_php,
+                &live_sha,
                 EntryState::Applied,
                 outcome_kind,
             )]);
@@ -1046,6 +1094,7 @@ mod tests {
         save(vec![herd_entry(
             herd_file.clone(),
             &default_php,
+            &live_sha,
             EntryState::Applied,
             LastOutcome::Written,
         )]);
@@ -1100,6 +1149,7 @@ mod tests {
             files: vec![herd_entry(
                 herd_file,
                 &default_php,
+                "deadbeef",
                 EntryState::Applied,
                 LastOutcome::Written,
             )],
@@ -1159,14 +1209,16 @@ mod tests {
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
-        // A perfectly valid hearth entry exists — ambiguity still voids it.
+        // A perfectly valid hearth entry WITH live evidence exists —
+        // ambiguity alone still voids it.
+        let live_sha = write_live_channel(&conf_d);
         Manifest {
             version: hearth_lib::php::reconcile::MANIFEST_VERSION,
             files: vec![ManifestEntry {
                 path: conf_d.join(CHANNEL_FILE_NAME),
                 php_version: default_php.clone(),
                 channel: "hearth".to_string(),
-                sha256: "abc".to_string(),
+                sha256: live_sha,
                 state: EntryState::Applied,
                 expected_old_sha256: None,
                 desired_sha256: None,
@@ -1183,6 +1235,222 @@ mod tests {
             !outcome.rows[0].pending_restart,
             "ambiguous provider identity must produce no pending claim"
         );
+        state
+            .supervisor
+            .lock()
+            .await
+            .stop_service(hearth_lib::service::ServiceKind::PhpFpm)
+            .unwrap();
+    }
+
+    // ---- C3-3 (review 5650 r3): exact layout + live materialization evidence ----
+
+    /// Containment is not identity: an arbitrary executable elsewhere under
+    /// the provider root, or an exact-layout path that is a symlink escaping
+    /// the root, can never certify pending restart. Fails at head 7c88222.
+    #[tokio::test]
+    async fn pending_restart_requires_exact_fpm_layout() {
+        use hearth_lib::php::reconcile::{EntryState, LastOutcome, Manifest};
+        use hearth_lib::php::targets::{PhpProvider, expected_channel_dir};
+        use hearth_lib::service::supervisor::ManagedService;
+
+        let (tmp, _config_path, state) = state_fixture();
+        let base = tmp.path().canonicalize().unwrap();
+        let default_php = state.config.lock().await.default_php.clone();
+        let roots = state.php_engine.provider_roots().clone();
+
+        // Perfect live channel + perfect manifest entry.
+        let herd_dir = expected_channel_dir(PhpProvider::Herd, &default_php, &roots);
+        let live_sha = write_live_channel(&herd_dir);
+        let herd_file = herd_dir.join(CHANNEL_FILE_NAME);
+        let save_entry = || {
+            Manifest {
+                version: hearth_lib::php::reconcile::MANIFEST_VERSION,
+                files: vec![herd_entry(
+                    herd_file.clone(),
+                    &default_php,
+                    &live_sha,
+                    EntryState::Applied,
+                    LastOutcome::Written,
+                )],
+            }
+            .save(&state.php_engine.manifest_path())
+            .unwrap();
+        };
+        save_entry();
+
+        // An ARBITRARY executable under the herd root — not the expected
+        // php{XY}-fpm layout slot.
+        let rogue = base.join("herd/libexec/php-fpm");
+        write_spawnable(&rogue);
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.register(ManagedService::new(
+                hearth_lib::service::ServiceKind::PhpFpm,
+                rogue.to_string_lossy().to_string(),
+                vec![],
+            ));
+            sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+        }
+        let mut outcome = outcome_with(vec![launched_row(&default_php)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        assert!(
+            !outcome.rows[0].pending_restart,
+            "an arbitrary executable under the root is not the provider's FPM"
+        );
+
+        // The exact-layout slot as a SYMLINK escaping the herd root.
+        let outside_bin = base.join("outside-fpm");
+        write_spawnable(&outside_bin);
+        let layout_slot = base.join("herd/bin/php84-fpm");
+        std::fs::create_dir_all(layout_slot.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside_bin, &layout_slot).unwrap();
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.stop_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+            sup.reconfigure_service(
+                hearth_lib::service::ServiceKind::PhpFpm,
+                layout_slot.to_string_lossy().to_string(),
+                vec![],
+                vec![],
+            );
+            sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+        }
+        save_entry();
+        let mut outcome = outcome_with(vec![launched_row(&default_php)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        assert!(
+            !outcome.rows[0].pending_restart,
+            "a symlink-escaped layout slot can never certify pending"
+        );
+
+        // Positive control: the REAL exact-layout binary certifies.
+        std::fs::remove_file(&layout_slot).unwrap();
+        write_spawnable(&layout_slot);
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.stop_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+            sup.reconfigure_service(
+                hearth_lib::service::ServiceKind::PhpFpm,
+                layout_slot.to_string_lossy().to_string(),
+                vec![],
+                vec![],
+            );
+            sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+        }
+        save_entry();
+        let mut outcome = outcome_with(vec![launched_row(&default_php)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        assert!(
+            outcome.rows[0].pending_restart,
+            "the exact provider/version/FPM layout binary still certifies"
+        );
+
+        state
+            .supervisor
+            .lock()
+            .await
+            .stop_service(hearth_lib::service::ServiceKind::PhpFpm)
+            .unwrap();
+    }
+
+    /// The manifest record alone is not proof: the channel file must exist
+    /// NOW, be a regular file, and hash to the recorded applied hash.
+    /// `Unchanged` — never persisted by the writer — certifies nothing.
+    /// Fails at head 7c88222.
+    #[tokio::test]
+    async fn pending_restart_requires_live_channel_evidence() {
+        use hearth_lib::php::reconcile::{EntryState, LastOutcome, Manifest};
+        use hearth_lib::php::targets::{PhpProvider, expected_channel_dir};
+        use hearth_lib::service::supervisor::ManagedService;
+
+        let (tmp, _config_path, state) = state_fixture();
+        let base = tmp.path().canonicalize().unwrap();
+        let default_php = state.config.lock().await.default_php.clone();
+        let roots = state.php_engine.provider_roots().clone();
+
+        let herd_bin = base.join("herd/bin/php84-fpm");
+        write_spawnable(&herd_bin);
+        let herd_dir = expected_channel_dir(PhpProvider::Herd, &default_php, &roots);
+        let live_sha = write_live_channel(&herd_dir);
+        let herd_file = herd_dir.join(CHANNEL_FILE_NAME);
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.register(ManagedService::new(
+                hearth_lib::service::ServiceKind::PhpFpm,
+                herd_bin.to_string_lossy().to_string(),
+                vec![],
+            ));
+            sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+        }
+        let save_with = |state_kind, outcome_kind| {
+            Manifest {
+                version: hearth_lib::php::reconcile::MANIFEST_VERSION,
+                files: vec![herd_entry(
+                    herd_file.clone(),
+                    &default_php,
+                    &live_sha,
+                    state_kind,
+                    outcome_kind,
+                )],
+            }
+            .save(&state.php_engine.manifest_path())
+            .unwrap();
+        };
+        async fn pending(state: &Arc<DaemonState>, version: &str) -> bool {
+            let mut outcome = outcome_with(vec![launched_row(version)]);
+            annotate_fpm_runtime(state, &mut outcome).await;
+            outcome.rows[0].pending_restart
+        }
+
+        // Baseline: live file + exact Written entry → pending.
+        save_with(EntryState::Applied, LastOutcome::Written);
+        assert!(pending(&state, &default_php).await, "baseline certifies");
+
+        // `Unchanged` is never a durable writer state → no claim.
+        save_with(EntryState::Applied, LastOutcome::Unchanged);
+        assert!(
+            !pending(&state, &default_php).await,
+            "Unchanged must not certify"
+        );
+
+        // Missing channel file with a stale Applied/Written entry → no claim.
+        save_with(EntryState::Applied, LastOutcome::Written);
+        std::fs::remove_file(&herd_file).unwrap();
+        assert!(
+            !pending(&state, &default_php).await,
+            "a removed channel file voids the stale record"
+        );
+
+        // Externally modified file (hash mismatch) → no claim.
+        std::fs::write(&herd_file, "; tampered\n").unwrap();
+        assert!(
+            !pending(&state, &default_php).await,
+            "a modified channel file voids the record"
+        );
+
+        // Symlink replacement → no claim, even with matching bytes behind it.
+        std::fs::remove_file(&herd_file).unwrap();
+        let decoy = base.join("decoy.ini");
+        std::fs::write(&decoy, b"; managed by hearth\nmemory_limit=1G\n").unwrap();
+        std::os::unix::fs::symlink(&decoy, &herd_file).unwrap();
+        assert!(
+            !pending(&state, &default_php).await,
+            "a symlinked channel file can never certify"
+        );
+
+        // Restore the genuine file → certifies again.
+        std::fs::remove_file(&herd_file).unwrap();
+        let restored_sha = write_live_channel(&herd_dir);
+        assert_eq!(restored_sha, live_sha, "same bytes, same hash");
+        assert!(pending(&state, &default_php).await);
+
         state
             .supervisor
             .lock()

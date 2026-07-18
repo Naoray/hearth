@@ -21,15 +21,27 @@ pub fn is_herd_running() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// `HEARTH_HERD_OWNERSHIP=1|0` — deterministic Herd-ownership answer for the
-/// isolated smoke daemon. `None` (ignored) unless the process runs in the
-/// typed isolated runtime; unparseable values are ignored, never guessed.
+/// `HEARTH_HERD_OWNERSHIP=1|0|file:<path>` — deterministic Herd-ownership
+/// answer for the isolated smoke daemon. `None` (ignored) unless the process
+/// runs in the typed isolated runtime; unparseable values are ignored, never
+/// guessed. The `file:` form reads the flag file's current content on every
+/// probe (`1` = Herd owns FPM; anything else, including a missing file,
+/// reads as not-owned) so the isolated smoke can flip CURRENT ownership at
+/// runtime and exercise the C3-1 relinquish/handoff paths.
 fn isolated_herd_ownership_override() -> Option<bool> {
     std::env::var_os("HEARTH_ISOLATED_ROOT")?;
-    match std::env::var("HEARTH_HERD_OWNERSHIP").ok()?.as_str() {
+    let value = std::env::var("HEARTH_HERD_OWNERSHIP").ok()?;
+    match value.as_str() {
         "1" => Some(true),
         "0" => Some(false),
-        _ => None,
+        other => {
+            let path = other.strip_prefix("file:")?;
+            Some(
+                std::fs::read_to_string(path)
+                    .map(|s| s.trim() == "1")
+                    .unwrap_or(false),
+            )
+        }
     }
 }
 

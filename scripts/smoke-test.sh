@@ -368,6 +368,42 @@ else
 fi
 stop_daemon
 
+# ── SH2. Runtime ownership flip: relinquish + generic control (C3-1) ─
+info "SH2: Herd ownership appears at runtime — relinquish, no restarts..."
+# Single-service control only: a generic `hearth start` would also launch
+# real nginx/DB engine binaries against the isolated root (heavyweight and
+# orphan-prone) — the generic start_all/health skip paths are covered by
+# supervisor unit tests. The fake FPM `exec`s sleep, so run-state assertions
+# use the supervisor's own truthful `hearth status` line, not pgrep.
+HERD_FLAG="$SMOKE_ROOT/herd-flag"
+echo 0 > "$HERD_FLAG"
+boot_daemon "file:$HERD_FLAG"
+$CLI restart php-fpm >/dev/null 2>&1
+if $CLI status 2>&1 | grep -i "php-fpm" | grep -qi "running"; then
+    pass "SH2: herd-absent restart launched Hearth FPM"
+else
+    fail "SH2: expected a running Hearth FPM before the flip"
+fi
+echo 1 > "$HERD_FLAG"
+sleep 7   # > health interval (5s): one ownership-aware health tick
+if $CLI status 2>&1 | grep -i "php-fpm" | grep -qi "running"; then
+    fail "SH2: Hearth FPM child must be relinquished after Herd appears"
+else
+    pass "SH2: health tick relinquished Hearth's own FPM child"
+fi
+OUTPUT=$($CLI restart php-fpm 2>&1)
+if echo "$OUTPUT" | grep -qi "owned by Herd"; then
+    pass "SH2: explicit php-fpm restart names the Herd ownership"
+else
+    fail "SH2: got: $OUTPUT"
+fi
+if $CLI status 2>&1 | grep -i "php-fpm" | grep -qi "running"; then
+    fail "SH2: restart must not revive FPM under Herd"
+else
+    pass "SH2: no FPM revival under Herd ownership"
+fi
+stop_daemon
+
 # ── Main phase: deterministic Herd-absent daemon ─────────────────
 info "Starting isolated daemon (herd-absent, bounded port-collision retry)..."
 boot_daemon 0
@@ -478,10 +514,11 @@ if echo "$OUTPUT" | grep -q "Switched to PHP 8.3; php-fpm restarted"; then
 else
     fail "S7: got: $OUTPUT"
 fi
-if $CLI status 2>&1 | grep -q "php-fpm"; then
+STATUS_OUT=$($CLI status 2>&1)
+if echo "$STATUS_OUT" | grep -q "php-fpm"; then
     pass "S7: php-fpm registered after switch"
 else
-    fail "S7: php-fpm missing from status"
+    fail "S7: php-fpm missing from status: $STATUS_OUT"
 fi
 OUTPUT=$($CLI php exec -- -r 'echo getenv("PHP_INI_SCAN_DIR");' 2>/dev/null)
 if [ "$OUTPUT" = ":$HEARTH_CONFIG_DIR/php/8.3/conf.d" ]; then
