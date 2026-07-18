@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod download;
 pub mod dump;
+pub(crate) mod fsync;
 pub mod mailpit;
 pub mod mcp;
 pub mod php;
