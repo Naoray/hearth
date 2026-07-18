@@ -48,6 +48,9 @@ pub enum SiteResolutionError {
 pub struct SiteContext {
     pub site: Site,
     pub php_binary: PathBuf,
+    /// Version `php_binary` was resolved for (site isolation or default_php).
+    /// Threaded into workers so their scan-dir env can be reconstructed later.
+    pub php_version: String,
     pub laravel_constraint: String,
 }
 
@@ -102,6 +105,7 @@ pub fn resolve(
     Ok(SiteContext {
         site,
         php_binary,
+        php_version: version,
         laravel_constraint,
     })
 }

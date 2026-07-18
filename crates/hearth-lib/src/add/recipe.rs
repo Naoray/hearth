@@ -29,6 +29,13 @@ pub struct RecipeContext {
     pub dry_run: bool,
     /// Optional log file for composer/artisan tail. CLI surfaces this to the user.
     pub log_path: Option<PathBuf>,
+    /// PHP version `php_binary` was resolved for. Threaded into
+    /// `SupervisedSpec`/`AddedPackage` so worker env can be reconstructed on
+    /// daemon boot.
+    pub php_version: Option<String>,
+    /// Belt-E `PHP_INI_SCAN_DIR` pair applied to every PHP process this recipe
+    /// launches (composer + artisan). `None` = no env injection.
+    pub scan_env: Option<(String, String)>,
     /// Used as the `installed_at` for any persisted `AddedPackage`.
     pub now: DateTime<Utc>,
 }
@@ -46,6 +53,8 @@ impl RecipeContext {
             no_supervise: false,
             dry_run: true,
             log_path: None,
+            php_version: None,
+            scan_env: None,
             now: Utc::now(),
         }
     }
@@ -64,6 +73,8 @@ pub struct SupervisedSpec {
     /// Site name; lets `hearth status` disambiguate multiple supervised rows of the same
     /// package across different Laravel sites (e.g. `horizon[shopfront]`).
     pub site_name: String,
+    /// PHP version `command` was resolved for (worker env provenance).
+    pub php_version: Option<String>,
 }
 
 /// What a recipe actually did — used by the daemon to build the user-facing summary.

@@ -224,6 +224,12 @@ impl HearthMcpServer {
                 .map_err(|e| format!("Failed to save config: {e}"))?;
         }
 
+        // Reconcile channel files for the new active version before touching
+        // the supervisor (parity with the daemon's PhpSwitch handler).
+        if let Err(e) = self.engine.apply(PhpConfigAction::Sync).await {
+            tracing::warn!(error = %e, "post-switch php-config reconcile failed");
+        }
+
         // Stop php-fpm, reconfigure with full args, restart
         let mut sup = self.supervisor.lock().await;
         let _ = sup.stop_service(ServiceKind::PhpFpm);

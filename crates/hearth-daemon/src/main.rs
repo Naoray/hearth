@@ -14,7 +14,7 @@ use hearth_lib::php::PhpManager;
 use hearth_lib::php::engine::PhpConfigEngine;
 use hearth_lib::php::targets::ProviderRoots;
 use hearth_lib::service::manager::{default_services, prune_added_packages};
-use hearth_lib::service::supervisor::{ManagedService, ServiceSupervisor};
+use hearth_lib::service::supervisor::ServiceSupervisor;
 use hearth_lib::service::{ServiceKind, ServiceState};
 use hearth_lib::site::SiteManager;
 use hearth_lib::socket::{DaemonRequest, DaemonResponse, DbEngineStatus};
@@ -673,6 +673,18 @@ async fn process_request(
             // Build the per-request log file path so the CLI can `tail -f` it.
             let log_path = hearth_lib::log_dir().join(format!("add-{package}.log"));
 
+            // Cheap pre-launch reconcile so the site's version has current
+            // channel files before composer/artisan run (probe cache makes a
+            // repeat call a no-op).
+            if !dry_run
+                && let Err(e) = state
+                    .php_engine
+                    .apply(hearth_lib::socket::PhpConfigAction::Sync)
+                    .await
+            {
+                warn!(error = %e, "pre-add php-config reconcile failed — continuing");
+            }
+
             let recipe_ctx = hearth_lib::add::recipe::RecipeContext {
                 site_path: site_ctx.site.path.clone(),
                 site_name: site_ctx.site.name.clone(),
@@ -681,6 +693,11 @@ async fn process_request(
                 no_supervise,
                 dry_run,
                 log_path: Some(log_path),
+                php_version: Some(site_ctx.php_version.clone()),
+                scan_env: Some(hearth_lib::php::scan_dir_env(
+                    &config_dir,
+                    &site_ctx.php_version,
+                )),
                 now: chrono::Utc::now(),
             };
 
@@ -711,6 +728,15 @@ async fn process_request(
                 // Multi-site check + persist under config lock. v0.3.0 ships single-instance
                 // Horizon and Reverb; multi-site is v0.3.1.
                 let now = chrono::Utc::now();
+                let pkg = AddedPackage {
+                    package: spec.package.clone(),
+                    site_path: spec.cwd.clone(),
+                    site_name: spec.site_name.clone(),
+                    command: spec.command.clone(),
+                    args: spec.args.clone(),
+                    php_version: spec.php_version.clone(),
+                    installed_at: now,
+                };
                 {
                     let mut cfg = state.config.lock().await;
                     let existing_other_site = cfg.added_packages.iter().find(|p| {
@@ -728,14 +754,7 @@ async fn process_request(
                     // Remove an existing same-site entry (idempotent re-run) before pushing.
                     cfg.added_packages
                         .retain(|p| !(p.package == spec.package && p.site_name == spec.site_name));
-                    cfg.added_packages.push(AddedPackage {
-                        package: spec.package.clone(),
-                        site_path: spec.cwd.clone(),
-                        site_name: spec.site_name.clone(),
-                        command: spec.command.clone(),
-                        args: spec.args.clone(),
-                        installed_at: now,
-                    });
+                    cfg.added_packages.push(pkg.clone());
                     if let Err(e) = cfg.save_to(&state.config_path) {
                         return DaemonResponse::Error {
                             message: format!(
@@ -748,12 +767,13 @@ async fn process_request(
 
                 if !no_supervise {
                     let mut sup = state.supervisor.lock().await;
-                    let svc = ManagedService::with_cwd_and_site(
+                    // Same constructor as boot rehydration — worker gets the
+                    // Belt-E scan-dir env for its resolved PHP version.
+                    let svc = hearth_lib::service::manager::worker_service(
                         kind,
-                        spec.command.clone(),
-                        spec.args.clone(),
-                        spec.cwd.clone(),
-                        spec.site_name.clone(),
+                        &pkg,
+                        &config_dir,
+                        &ProviderRoots::detect(),
                     );
                     sup.register(svc);
                     if let Err(e) = sup.start_service(kind) {

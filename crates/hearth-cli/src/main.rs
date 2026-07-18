@@ -167,6 +167,19 @@ enum PhpCommands {
         /// Value to set
         value: String,
     },
+    /// Run a PHP command with Hearth's scan-dir env at the final launch
+    /// boundary (e.g. `hearth php exec -- artisan test`). Covers launchers
+    /// that clear the environment — but NOT descendants that later clear env
+    /// themselves and exec an absolute PHP path; use a Homebrew/Hearth PHP
+    /// build for those.
+    Exec {
+        /// PHP version to run (defaults to the configured default_php)
+        #[arg(long = "php")]
+        php: Option<String>,
+        /// Arguments passed to the PHP binary verbatim
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -234,6 +247,9 @@ async fn main() -> anyhow::Result<()> {
                 key,
                 value,
             },
+            PhpCommands::Exec { php, args } => {
+                return run_php_exec(php, args).await;
+            }
         },
         Commands::Db { command } => {
             return run_db(command).await;
@@ -484,6 +500,52 @@ fn print_db_status_table(engines: &[DbEngineStatus]) {
     }
 }
 
+/// `hearth php exec [--php X.Y] -- <args…>` — daemon-free shim. Reconciles
+/// channel files for the selected version, then replaces this process with
+/// the resolved PHP binary carrying the Belt-E scan-dir env (reconstructed at
+/// this final launch boundary). A descendant that clears env and execs an
+/// absolute PHP path bypasses the shim by design — use a Homebrew/Hearth PHP
+/// build for that case.
+async fn run_php_exec(
+    version: Option<String>,
+    args: Vec<std::ffi::OsString>,
+) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let config_dir = hearth_lib::config_dir();
+    let config_path = config_dir.join("config.toml");
+    let config = hearth_lib::config::HearthConfig::load()?;
+    let version = version.unwrap_or_else(|| config.default_php.clone());
+
+    // Reconcile first — same engine as the daemon; the journaled manifest
+    // keeps a concurrent daemon reconcile safe.
+    let engine = hearth_lib::php::engine::PhpConfigEngine::new(
+        std::sync::Arc::new(tokio::sync::Mutex::new(config)),
+        config_path,
+        config_dir.clone(),
+        hearth_lib::php::targets::ProviderRoots::detect(),
+        std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        std::time::Duration::from_secs(5),
+    );
+    if let Err(e) = engine
+        .apply(hearth_lib::socket::PhpConfigAction::Sync)
+        .await
+    {
+        eprintln!("warning: php-config reconcile failed: {e}");
+    }
+
+    let binary = hearth_lib::php::resolver::resolve_php_binary(&version, &config_dir)
+        .with_context(|| format!("PHP {version} binary not found"))?;
+    let (key, value) = hearth_lib::php::scan_dir_env(&config_dir, &version);
+    // exec() only returns on failure — on success this process IS php, so no
+    // unsupervised child is ever created.
+    let err = std::process::Command::new(&binary)
+        .args(&args)
+        .env(key, value)
+        .exec();
+    Err(anyhow::anyhow!("failed to exec {}: {err}", binary.display()))
+}
+
 async fn run_install() -> anyhow::Result<()> {
     println!("Hearth — first-time setup");
     println!("========================");
@@ -502,7 +564,11 @@ async fn run_install() -> anyhow::Result<()> {
     println!("\n[2/3] Creating config directory...");
     let config_dir = hearth_lib::config_dir();
     std::fs::create_dir_all(&config_dir)?;
-    let mut config = hearth_lib::config::HearthConfig::default();
+    // Load-and-preserve: re-running `hearth install` must keep existing
+    // php_ini, added_packages, and port settings. `load()` returns defaults
+    // only when no config exists, and errors (rather than clobbering) on a
+    // corrupt file.
+    let mut config = hearth_lib::config::HearthConfig::load()?;
     // Resolve composer.phar up-front so `hearth add` can shell out via the site's PHP
     // (avoids the brew composer wrapper, which uses the system PHP — scratchpad 796 B3).
     config.composer_phar = hearth_lib::add::composer::resolve_composer_phar();
@@ -513,6 +579,23 @@ async fn run_install() -> anyhow::Result<()> {
     }
     config.save()?;
     println!("  Config saved to {}", config_dir.display());
+
+    // One-shot daemon-free php-config reconcile (plan 5560 §2.3 install hook):
+    // recovers any pending journal and materializes channel files for the
+    // preserved php_ini settings.
+    let engine = hearth_lib::php::engine::PhpConfigEngine::new(
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            hearth_lib::config::HearthConfig::load()?,
+        )),
+        config_dir.join("config.toml"),
+        config_dir.clone(),
+        hearth_lib::php::targets::ProviderRoots::detect(),
+        std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        std::time::Duration::from_secs(5),
+    );
+    if let Err(e) = engine.boot_sync().await {
+        eprintln!("  Warning: php-config reconcile failed: {e}");
+    }
 
     // 3. Setup DNS resolver (requires sudo)
     println!("\n[3/3] Setting up DNS resolver (requires sudo)...");

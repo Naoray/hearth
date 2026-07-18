@@ -22,6 +22,12 @@ pub struct AddedPackage {
     /// Empty for install-only packages.
     #[serde(default)]
     pub args: Vec<String>,
+    /// PHP version the worker's `command` binary was resolved for. Used to
+    /// reconstruct the scan-dir env on daemon boot. `None` on legacy entries:
+    /// a version is then inferred only when `command` matches a discovered
+    /// target's canonical binary — otherwise the worker runs env-unguaranteed.
+    #[serde(default)]
+    pub php_version: Option<String>,
     /// When the package was installed.
     pub installed_at: chrono::DateTime<chrono::Utc>,
 }
@@ -432,6 +438,7 @@ parked_paths = []
             site_name: "shopfront".to_string(),
             command: "/opt/homebrew/opt/php@8.4/bin/php".to_string(),
             args: vec!["artisan".to_string(), "horizon".to_string()],
+            php_version: Some("8.4".to_string()),
             installed_at: chrono::Utc::now(),
         });
 
@@ -443,9 +450,62 @@ parked_paths = []
         assert_eq!(loaded.added_packages[0].site_name, "shopfront");
         assert_eq!(loaded.added_packages[0].args, vec!["artisan", "horizon"]);
         assert_eq!(
+            loaded.added_packages[0].php_version,
+            Some("8.4".to_string())
+        );
+        assert_eq!(
             loaded.composer_phar,
             Some(PathBuf::from("/opt/homebrew/bin/composer.phar"))
         );
+    }
+
+    #[test]
+    fn added_package_version_roundtrip_serde_default() {
+        // Legacy TOML without php_version must load as None (#[serde(default)]).
+        let toml = r#"
+[[added_packages]]
+package = "horizon"
+site_path = "/Users/me/Sites/shopfront"
+site_name = "shopfront"
+command = "/opt/homebrew/opt/php@8.4/bin/php"
+args = ["artisan", "horizon"]
+installed_at = "2026-01-01T00:00:00Z"
+"#;
+        let config: HearthConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.added_packages.len(), 1);
+        assert_eq!(config.added_packages[0].php_version, None);
+    }
+
+    #[test]
+    fn install_preserves_existing_config() {
+        // `hearth install` loads the existing config instead of starting from
+        // HearthConfig::default() — user php_ini/ports/packages must survive.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let mut existing = HearthConfig::default();
+        existing.mysql_port = 3307;
+        existing
+            .php_ini
+            .global
+            .insert("memory_limit".to_string(), "1G".to_string());
+        existing.save_to(&config_path).unwrap();
+
+        let loaded = HearthConfig::load_from(&config_path).unwrap();
+        assert_eq!(loaded.mysql_port, 3307);
+        assert_eq!(
+            loaded.php_ini.global.get("memory_limit"),
+            Some(&"1G".to_string())
+        );
+
+        // Missing file → defaults (fresh install), never an error.
+        let fresh = HearthConfig::load_from(&tmp.path().join("absent.toml")).unwrap();
+        assert_eq!(fresh.mysql_port, 3306);
+
+        // Corrupt file → error (install must refuse to clobber), not defaults.
+        let corrupt_path = tmp.path().join("corrupt.toml");
+        std::fs::write(&corrupt_path, "tld = [not valid").unwrap();
+        assert!(HearthConfig::load_from(&corrupt_path).is_err());
     }
 
     #[test]
