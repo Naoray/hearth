@@ -64,10 +64,17 @@ pub struct ManagedService {
     /// `PHP_INI_SCAN_DIR` pair for PHP workers/FPM). Empty = inherit only.
     env: Vec<(String, String)>,
     /// Trustworthy Hearth-owned start metadata: recorded at the moment THIS
-    /// supervisor spawned the child, cleared on stop. Never inferred from
-    /// ambient process evidence (titles, argv, /proc) — that entire evidence
-    /// class is banned (review 5594).
+    /// supervisor spawned the child, cleared only once termination is
+    /// positively confirmed. Never inferred from ambient process evidence
+    /// (titles, argv, /proc) — that entire evidence class is banned
+    /// (review 5594).
     started_at: Option<std::time::SystemTime>,
+    /// C4-1 test-only injected stop-failure seam — deterministic failure
+    /// without impossible-to-trigger OS errors; production behavior is
+    /// unchanged (`cfg(test)` only). The injected failure returns BEFORE any
+    /// mutation, so child/state/timestamp retention is exercised for real.
+    #[cfg(test)]
+    pub(crate) fail_next_stop: Option<String>,
 }
 
 impl ManagedService {
@@ -84,6 +91,8 @@ impl ManagedService {
             site_name: None,
             env: Vec::new(),
             started_at: None,
+            #[cfg(test)]
+            fail_next_stop: None,
         }
     }
 
@@ -122,6 +131,8 @@ impl ManagedService {
             site_name: None,
             env: Vec::new(),
             started_at: None,
+            #[cfg(test)]
+            fail_next_stop: None,
         }
     }
 
@@ -145,6 +156,8 @@ impl ManagedService {
             site_name: Some(site_name.into()),
             env: Vec::new(),
             started_at: None,
+            #[cfg(test)]
+            fail_next_stop: None,
         }
     }
 
@@ -215,15 +228,50 @@ impl ManagedService {
     /// - `Postgres` → `pg_ctl stop -m fast` first, then signals on fallback.
     /// - All others → SIGTERM to the process group, poll until grace expires,
     ///   then SIGKILL.
+    ///
+    /// C4-1 (review 5650 r4): stopping is a TRANSACTIONAL state transition.
+    /// The child/process-group handle and `started_at` stay tracked until
+    /// termination is positively confirmed (reaped exit or confirmed-dead
+    /// group); every unresolved failure — non-ESRCH SIGTERM, `try_wait`,
+    /// final SIGKILL, final wait — propagates as an error WITH the handle,
+    /// timestamp, and truthful state retained so the caller can retry.
+    /// `Stopped` is only ever recorded after proof.
     pub fn stop(&mut self) -> anyhow::Result<()> {
-        self.started_at = None;
-        let Some(mut child) = self.child.take() else {
+        if self.child.is_none() {
             self.state = ServiceState::Stopped;
+            self.started_at = None;
             return Ok(());
-        };
+        }
 
-        let pid = child.id();
+        #[cfg(test)]
+        if let Some(reason) = self.fail_next_stop.take() {
+            anyhow::bail!("injected stop failure: {reason}");
+        }
+
+        let pid = self.child.as_ref().map(|c| c.id()).unwrap_or_default();
         info!(service = %self.kind, pid, "stopping service");
+
+        // Fast path: an already-exited child (macOS returns EPERM — not
+        // ESRCH — for signals to a fully-zombie group, so signaling first
+        // would misread a dead group as a signal failure) is reaped and
+        // finalized without any signal.
+        match self.child.as_mut().expect("checked above").try_wait() {
+            Ok(Some(_status)) => {
+                info!(service = %self.kind, "child had already exited");
+                self.child = None;
+                self.state = ServiceState::Stopped;
+                self.started_at = None;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(e) => {
+                anyhow::bail!(
+                    "could not verify {} liveness before stop (try_wait: {e}) — child \
+                     remains supervised for retry",
+                    self.kind
+                );
+            }
+        }
 
         let mut needs_signal = true;
 
@@ -260,27 +308,60 @@ impl ManagedService {
         if needs_signal {
             let pgid = nix::unistd::Pid::from_raw(pid as i32);
             if let Err(e) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM) {
-                // ESRCH ("no such process") is fine — child already exited.
+                // ESRCH ("no such process") means the group is already gone
+                // — the wait below reaps and confirms. For anything else,
+                // re-check liveness once: a child that exited between the
+                // fast path and the signal also reads as a signal error
+                // (EPERM on macOS). A LIVE child we cannot signal is a
+                // genuine unresolved failure: keep everything and report.
                 if e != nix::errno::Errno::ESRCH {
-                    warn!(service = %self.kind, error = %e, "SIGTERM to group failed");
+                    match self.child.as_mut().expect("checked above").try_wait() {
+                        Ok(Some(_status)) => {
+                            info!(service = %self.kind, "child exited during stop");
+                            self.child = None;
+                            self.state = ServiceState::Stopped;
+                            self.started_at = None;
+                            return Ok(());
+                        }
+                        _ => {
+                            anyhow::bail!(
+                                "SIGTERM to {} process group {pid} failed ({e}) with the \
+                                 child still live/unresolved — child remains supervised \
+                                 for retry",
+                                self.kind
+                            );
+                        }
+                    }
                 }
             }
         }
 
         let grace = self.shutdown_strategy.grace();
         let deadline = Instant::now() + grace;
+        let child = self.child.as_mut().expect("checked above");
         loop {
-            match child.try_wait()? {
-                Some(_status) => {
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    // Confirmed exit — the ONLY place (besides the post-kill
+                    // wait) that finalizes the transition.
                     info!(service = %self.kind, "service stopped cleanly");
+                    self.child = None;
                     self.state = ServiceState::Stopped;
+                    self.started_at = None;
                     return Ok(());
                 }
-                None => {
+                Ok(None) => {
                     if Instant::now() >= deadline {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "could not verify {} termination (try_wait: {e}) — child remains \
+                         supervised for retry",
+                        self.kind
+                    );
                 }
             }
         }
@@ -290,10 +371,32 @@ impl ManagedService {
             grace_ms = grace.as_millis() as u64,
             "service did not stop within grace window — sending SIGKILL"
         );
-        let _ = child.kill();
-        let _ = child.wait();
-        self.state = ServiceState::Stopped;
-        Ok(())
+        if let Err(e) = child.kill() {
+            // Same zombie-race tolerance as SIGTERM: confirm liveness before
+            // treating the failure as unresolved.
+            if let Ok(Some(_status)) = child.try_wait() {
+                self.child = None;
+                self.state = ServiceState::Stopped;
+                self.started_at = None;
+                return Ok(());
+            }
+            anyhow::bail!(
+                "SIGKILL to {} process group failed ({e}) — child remains supervised for retry",
+                self.kind
+            );
+        }
+        match child.wait() {
+            Ok(_status) => {
+                self.child = None;
+                self.state = ServiceState::Stopped;
+                self.started_at = None;
+                Ok(())
+            }
+            Err(e) => anyhow::bail!(
+                "could not reap {} after SIGKILL ({e}) — child remains supervised for retry",
+                self.kind
+            ),
+        }
     }
 
     /// Check if the child process is still alive.
@@ -339,10 +442,24 @@ pub struct ServiceSupervisor {
     fpm_ownership: Option<ExternalFpmOwnership>,
 }
 
+/// Current external (Herd) ownership of PHP-FPM (C4-2). Boolean evidence is
+/// banned: a failed probe is `Unknown`, and every activation policy treats
+/// `Unknown` fail-CLOSED (never start/register/reconfigure FPM), reporting
+/// "ownership unknown" instead of pretending Herd absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FpmOwnership {
+    Owned,
+    Unowned,
+    /// The probe could not produce evidence; carries a non-sensitive
+    /// diagnostic (exit status / IO error class — never environment
+    /// contents).
+    Unknown(String),
+}
+
 /// Injectable current-ownership probe for PHP-FPM (production:
-/// `service::manager::is_herd_running`; tests/smoke: the typed isolated
-/// seam through the same function).
-pub type ExternalFpmOwnership = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+/// `service::manager::current_fpm_ownership`; tests/smoke: the typed
+/// isolated seam through the same function).
+pub type ExternalFpmOwnership = std::sync::Arc<dyn Fn() -> FpmOwnership + Send + Sync>;
 
 impl Default for ServiceSupervisor {
     fn default() -> Self {
@@ -364,10 +481,25 @@ impl ServiceSupervisor {
         self.fpm_ownership = Some(probe);
     }
 
-    /// Does an external tool currently own PHP-FPM? Consulted live on every
-    /// FPM-mutating path; `false` when no probe is installed.
-    fn fpm_externally_owned(&self) -> bool {
-        self.fpm_ownership.as_ref().is_some_and(|probe| probe())
+    /// Current PHP-FPM ownership, consulted live on every FPM-mutating
+    /// path; `Unowned` when no probe is installed.
+    fn current_fpm_ownership(&self) -> FpmOwnership {
+        self.fpm_ownership
+            .as_ref()
+            .map(|probe| probe())
+            .unwrap_or(FpmOwnership::Unowned)
+    }
+
+    /// May Hearth activate (start/restart) its own FPM right now? `Unknown`
+    /// fails CLOSED (C4-2).
+    fn fpm_activation_blocked(&self) -> Option<String> {
+        match self.current_fpm_ownership() {
+            FpmOwnership::Unowned => None,
+            FpmOwnership::Owned => Some("php-fpm is owned by Herd".to_string()),
+            FpmOwnership::Unknown(diag) => Some(format!(
+                "php-fpm ownership is unknown ({diag}); FPM activation skipped fail-closed"
+            )),
+        }
     }
 
     /// Register a service to be supervised.
@@ -382,10 +514,13 @@ impl ServiceSupervisor {
     pub fn start_all(&mut self) -> anyhow::Result<()> {
         let kinds: Vec<ServiceKind> = self.services.keys().copied().collect();
         for kind in kinds {
-            // C3-1: generic start never launches Hearth FPM while Herd
-            // currently owns it — other services start normally.
-            if kind == ServiceKind::PhpFpm && self.fpm_externally_owned() {
-                info!("php-fpm start skipped: Herd owns PHP-FPM");
+            // C3-1/C4-2: generic start never launches Hearth FPM while Herd
+            // currently owns it OR while ownership is unknown (fail-closed)
+            // — other services start normally.
+            if kind == ServiceKind::PhpFpm
+                && let Some(reason) = self.fpm_activation_blocked()
+            {
+                info!("php-fpm start skipped: {reason}");
                 continue;
             }
             if let Some(svc) = self.services.get_mut(&kind) {
@@ -400,20 +535,32 @@ impl ServiceSupervisor {
         Ok(())
     }
 
-    /// Stop all services, killing entire process groups.
+    /// Stop all services, killing entire process groups. Every service is
+    /// attempted; failures are AGGREGATED and returned (C4-1) — never a
+    /// false blanket success while a child could not be confirmed stopped.
     pub fn stop_all(&mut self) -> anyhow::Result<()> {
-        for (_, svc) in self.services.iter_mut() {
-            let _ = svc.stop();
+        let mut failures = Vec::new();
+        for (kind, svc) in self.services.iter_mut() {
+            if let Err(e) = svc.stop() {
+                warn!(service = %kind, error = %e, "stop failed");
+                failures.push(format!("{kind}: {e}"));
+            }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("failed to stop: {}", failures.join("; "))
+        }
     }
 
     /// Start a specific service. Returns an error if the service is not registered.
-    /// Starting Hearth FPM while Herd currently owns it is refused with an
-    /// actionable error (C3-1) — Hearth never contends for Herd-owned FPM.
+    /// Starting Hearth FPM while Herd currently owns it — or while ownership
+    /// is unknown (fail-closed, C4-2) — is refused with an actionable error.
     pub fn start_service(&mut self, kind: ServiceKind) -> anyhow::Result<()> {
-        if kind == ServiceKind::PhpFpm && self.fpm_externally_owned() {
-            anyhow::bail!("php-fpm is owned by Herd — Hearth will not start its own FPM");
+        if kind == ServiceKind::PhpFpm
+            && let Some(reason) = self.fpm_activation_blocked()
+        {
+            anyhow::bail!("{reason} — Hearth will not start its own FPM");
         }
         let svc = self
             .services
@@ -463,32 +610,65 @@ impl ServiceSupervisor {
         self.services.get(&kind)
     }
 
+    /// C4-1 test-only: arm the injected stop-failure seam for one service.
+    #[cfg(test)]
+    pub(crate) fn inject_stop_failure(&mut self, kind: ServiceKind, reason: &str) {
+        if let Some(svc) = self.services.get_mut(&kind) {
+            svc.fail_next_stop = Some(reason.to_string());
+        }
+    }
+
     /// Run one health check pass. Returns services that crashed.
     pub fn health_check(&mut self) -> Vec<ServiceKind> {
         let mut crashed = Vec::new();
 
         let kinds: Vec<ServiceKind> = self.services.keys().copied().collect();
         for kind in kinds {
-            // C3-1: health supervision obeys current Herd ownership. While
-            // Herd owns FPM, Hearth's OWN still-running FPM child is
-            // relinquished exactly once (Hearth stops only its own process
-            // group — it never signals Herd's process), and a crashed FPM is
-            // never replaced.
-            let fpm_owned = kind == ServiceKind::PhpFpm && self.fpm_externally_owned();
+            // C3-1/C4-1/C4-2: health supervision obeys CURRENT ownership.
+            // While Herd owns FPM, Hearth's OWN still-running FPM child is
+            // relinquished (Hearth stops only its own process group — it
+            // never signals Herd's process); a failed handoff stop keeps the
+            // child fully supervised with its truthful state and is retried
+            // on later ticks — never a false Stopped, never a replacement.
+            // While ownership is UNKNOWN, the conservative policy is: no
+            // restart, no relinquish, no replacement — the running child
+            // stays supervised until evidence returns.
+            let fpm_ownership = if kind == ServiceKind::PhpFpm {
+                self.current_fpm_ownership()
+            } else {
+                FpmOwnership::Unowned
+            };
             if let Some(svc) = self.services.get_mut(&kind) {
-                if fpm_owned {
-                    if svc.child.is_some() {
-                        info!(
-                            "Herd owns PHP-FPM — relinquishing Hearth's own supervised FPM child"
-                        );
-                        let _ = svc.stop();
-                    } else if matches!(svc.state, ServiceState::Running { .. }) {
-                        // Crashed while Herd owns it: record truthfully, no
-                        // replacement child.
-                        svc.state = ServiceState::Stopped;
-                        svc.started_at = None;
+                match fpm_ownership {
+                    FpmOwnership::Owned => {
+                        if svc.child.is_some() {
+                            info!(
+                                "Herd owns PHP-FPM — relinquishing Hearth's own supervised FPM child"
+                            );
+                            if let Err(e) = svc.stop() {
+                                warn!(
+                                    error = %e,
+                                    "PHP-FPM handoff stop FAILED — the child remains \
+                                     supervised with its truthful state; handoff will be \
+                                     retried on the next health tick"
+                                );
+                            }
+                        } else if matches!(svc.state, ServiceState::Running { .. }) {
+                            // Crashed while Herd owns it: record truthfully,
+                            // no replacement child.
+                            svc.state = ServiceState::Stopped;
+                            svc.started_at = None;
+                        }
+                        continue;
                     }
-                    continue;
+                    FpmOwnership::Unknown(diag) => {
+                        warn!(
+                            "php-fpm ownership unknown ({diag}) — health supervision \
+                             fail-closed: no restart, no relinquish this tick"
+                        );
+                        continue;
+                    }
+                    FpmOwnership::Unowned => {}
                 }
                 if matches!(svc.state, ServiceState::Running { .. }) && !svc.is_alive() {
                     warn!(service = %kind, "service crashed");
@@ -827,8 +1007,13 @@ mod tests {
     ) {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let probe_flag = std::sync::Arc::clone(&flag);
-        let probe: ExternalFpmOwnership =
-            std::sync::Arc::new(move || probe_flag.load(std::sync::atomic::Ordering::SeqCst));
+        let probe: ExternalFpmOwnership = std::sync::Arc::new(move || {
+            if probe_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                FpmOwnership::Owned
+            } else {
+                FpmOwnership::Unowned
+            }
+        });
         (flag, probe)
     }
 
@@ -903,6 +1088,175 @@ mod tests {
         let fpm = sup.service(ServiceKind::PhpFpm).unwrap();
         assert!(matches!(fpm.state, ServiceState::Stopped));
         assert!(fpm.started_at().is_none());
+    }
+
+    /// C4-1: stopping an already-exited (zombie) child reaps and finalizes
+    /// without misreading macOS's EPERM-for-zombie-groups as a failure.
+    #[test]
+    fn stop_reaps_already_exited_child_without_false_failure() {
+        let mut svc = ManagedService::new(
+            ServiceKind::PhpFpm,
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), "exit 0".to_string()],
+        );
+        svc.start().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        svc.stop().unwrap();
+        assert!(matches!(svc.state, ServiceState::Stopped));
+        assert!(svc.started_at().is_none());
+    }
+
+    /// C4-1: an injected stop failure is TRANSACTIONAL — child handle,
+    /// spawn timestamp, and truthful Running state are all retained, and a
+    /// later stop succeeds.
+    #[test]
+    fn injected_stop_failure_is_transactional() {
+        let mut sup = ServiceSupervisor::new();
+        sup.register(sleeper(ServiceKind::PhpFpm));
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        let started = sup
+            .service(ServiceKind::PhpFpm)
+            .unwrap()
+            .started_at()
+            .expect("running");
+
+        sup.inject_stop_failure(ServiceKind::PhpFpm, "sigterm denied");
+        let err = sup.stop_service(ServiceKind::PhpFpm).unwrap_err();
+        assert!(err.to_string().contains("injected stop failure"), "{err}");
+        let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+        assert!(
+            matches!(svc.state, ServiceState::Running { .. }),
+            "no false Stopped: {:?}",
+            svc.state
+        );
+        assert_eq!(svc.started_at(), Some(started), "timestamp retained");
+        assert!(svc.child.is_some(), "child handle retained for retry");
+
+        // Retry without injection completes the transition.
+        sup.stop_service(ServiceKind::PhpFpm).unwrap();
+        let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+        assert!(matches!(svc.state, ServiceState::Stopped));
+        assert!(svc.started_at().is_none());
+        assert!(svc.child.is_none());
+    }
+
+    /// C4-1: a FAILED handoff stop keeps the child fully supervised with
+    /// its truthful state (no false Stopped, no replacement) and a later
+    /// health tick completes the handoff.
+    #[test]
+    fn health_handoff_stop_failure_keeps_supervision_and_retries() {
+        let (flag, probe) = owned_flag();
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(probe);
+        sup.register(sleeper(ServiceKind::PhpFpm));
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        let started = sup
+            .service(ServiceKind::PhpFpm)
+            .unwrap()
+            .started_at()
+            .expect("running");
+
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        sup.inject_stop_failure(ServiceKind::PhpFpm, "handoff sigterm denied");
+        sup.health_check();
+        let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+        assert!(
+            matches!(svc.state, ServiceState::Running { .. }),
+            "failed handoff must not mark false Stopped: {:?}",
+            svc.state
+        );
+        assert_eq!(
+            svc.started_at(),
+            Some(started),
+            "same spawn — no replacement child"
+        );
+        assert!(svc.child.is_some(), "child still supervised");
+
+        // Next tick (no injection) completes the handoff exactly once.
+        sup.health_check();
+        let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+        assert!(matches!(svc.state, ServiceState::Stopped));
+        assert!(svc.started_at().is_none());
+        assert!(svc.child.is_none(), "handoff completed, no orphan handle");
+    }
+
+    /// C4-1: stop_all aggregates failures instead of returning false
+    /// success, while still stopping the other services.
+    #[test]
+    fn stop_all_aggregates_failures_but_stops_others() {
+        let mut sup = ServiceSupervisor::new();
+        sup.register(sleeper(ServiceKind::PhpFpm));
+        sup.register(sleeper(ServiceKind::Mailpit));
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        sup.start_service(ServiceKind::Mailpit).unwrap();
+
+        sup.inject_stop_failure(ServiceKind::PhpFpm, "stuck group");
+        let err = sup.stop_all().unwrap_err();
+        assert!(err.to_string().contains("php-fpm"), "{err}");
+        let other = sup.service(ServiceKind::Mailpit).unwrap();
+        assert!(
+            matches!(other.state, ServiceState::Stopped),
+            "other services still stopped: {:?}",
+            other.state
+        );
+        // The failed service is still supervised and stoppable.
+        sup.stop_service(ServiceKind::PhpFpm).unwrap();
+    }
+
+    /// C4-2: unknown ownership fails CLOSED on every supervisor path — no
+    /// start, no restart, no relinquish, no replacement.
+    #[test]
+    fn unknown_ownership_fails_closed_everywhere() {
+        let probe: ExternalFpmOwnership = std::sync::Arc::new(|| {
+            FpmOwnership::Unknown("ownership probe (pgrep) failed with status 2".to_string())
+        });
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(std::sync::Arc::clone(&probe));
+        sup.register(sleeper(ServiceKind::PhpFpm));
+        sup.register(sleeper(ServiceKind::Mailpit));
+
+        // Generic start: FPM skipped, others start.
+        sup.start_all().unwrap();
+        assert!(
+            sup.service(ServiceKind::PhpFpm)
+                .unwrap()
+                .started_at()
+                .is_none()
+        );
+        assert!(
+            sup.service(ServiceKind::Mailpit)
+                .unwrap()
+                .started_at()
+                .is_some()
+        );
+
+        // Explicit start: actionable refusal, zero spawn.
+        let err = sup.start_service(ServiceKind::PhpFpm).unwrap_err();
+        assert!(err.to_string().contains("unknown"), "{err}");
+        assert!(
+            sup.service(ServiceKind::PhpFpm)
+                .unwrap()
+                .started_at()
+                .is_none()
+        );
+
+        // Health with a RUNNING child under unknown ownership: conservative —
+        // the child stays supervised, no relinquish, no restart.
+        let mut owned_sup = ServiceSupervisor::new();
+        sup.stop_all().unwrap();
+        owned_sup.register(sleeper(ServiceKind::PhpFpm));
+        owned_sup.start_service(ServiceKind::PhpFpm).unwrap();
+        let started = owned_sup
+            .service(ServiceKind::PhpFpm)
+            .unwrap()
+            .started_at()
+            .expect("running");
+        owned_sup.set_fpm_ownership_probe(probe);
+        owned_sup.health_check();
+        let svc = owned_sup.service(ServiceKind::PhpFpm).unwrap();
+        assert!(matches!(svc.state, ServiceState::Running { .. }));
+        assert_eq!(svc.started_at(), Some(started), "no relinquish, no respawn");
+        let _ = owned_sup.stop_all();
     }
 
     /// Crashed FPM (recorded Running, child gone) + Herd owns it: the health

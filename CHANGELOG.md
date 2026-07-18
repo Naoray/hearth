@@ -42,8 +42,25 @@ All notable changes to Hearth will be documented in this file.
   explicit `restart php-fpm`, refuse with an actionable error) the FPM slot
   while Herd owns it, and health supervision never respawns it. If Herd
   appears while Hearth's own FPM is still running, the next health tick
-  relinquishes Hearth's own child exactly once — Hearth never signals or
-  stops Herd's process.
+  relinquishes Hearth's own child — Hearth never signals or stops Herd's
+  process.
+- Stopping a supervised service is transactional: the child handle and
+  spawn record are kept until termination is positively confirmed, stop
+  failures propagate (and `hearth stop`/restart aggregate them instead of
+  reporting false success), a failed FPM handoff keeps the child
+  supervised and retries on later health ticks, and "stopped" is only ever
+  recorded after proof.
+- Herd-ownership detection is typed evidence (`Owned`/`Unowned`/`Unknown`):
+  a failed probe (pgrep spawn error, signal, exit codes above the
+  documented no-match 1; missing/invalid isolated flag file) is `Unknown`,
+  and every FPM activation path fails closed on it with an actionable
+  "ownership unknown; activation skipped" report (new
+  `SkippedOwnershipUnknown` restart outcome on the wire).
+- Provider roots are validated as a SET: equal, nested, or symlink-aliased
+  Hearth/Herd/Homebrew roots are rejected at construction, and provider
+  identity additionally requires membership in exactly one canonical root —
+  ambiguous identities render `identity unverified`, are never executed,
+  and hold no channel or pending-restart authority.
 - A keyed `--status` is certified by the daemon echoing the applied key
   (`status_key`) AND a per-request correlation token (`status_token`) —
   the certification is bound to the exact request/response pair, so an

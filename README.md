@@ -169,9 +169,14 @@ but Hearth never starts or restarts its FPM — config output states that the
 restart was skipped because Herd owns PHP-FPM, generic `hearth start`/
 `hearth restart` skip or refuse the FPM slot, and health supervision never
 respawns it. Two distinct rules: Hearth **never controls Herd's own FPM
-process**, and Hearth **may stop its own supervised FPM child exactly once**
-during an ownership handoff (when Herd appears while Hearth's FPM is still
-running) so the two never fight over port/socket ownership.
+process**, and Hearth **may stop its own supervised FPM child** during an
+ownership handoff (when Herd appears while Hearth's FPM is still running).
+A handoff stop that cannot positively confirm termination is reported as a
+failure with the child kept fully supervised, and is retried on later
+health ticks — Hearth never records a false "stopped". If the Herd
+ownership probe itself fails, ownership is treated as **unknown** and every
+FPM activation fails closed (skipped with an actionable "ownership
+unknown" message) until the probe recovers.
 When the running FPM predates the newest materialized config, status shows a
 truthful `pending restart` marker.
 

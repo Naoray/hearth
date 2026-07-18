@@ -103,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
         config_path.clone(),
         config_dir.clone(),
         provider_roots.clone(),
-        Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        Arc::new(hearth_lib::service::manager::current_fpm_ownership),
         std::time::Duration::from_secs(5),
     ));
     // Boot hard gate (F4): a failed OR hard-refused reconcile disables every
@@ -125,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
     // health supervision, config restart, switch). Same injectable source as
     // boot-time service registration.
     supervisor.set_fpm_ownership_probe(std::sync::Arc::new(
-        hearth_lib::service::manager::is_herd_running,
+        hearth_lib::service::manager::current_fpm_ownership,
     ));
     {
         let cfg = config.lock().await;

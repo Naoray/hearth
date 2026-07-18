@@ -415,6 +415,9 @@ impl HearthMcpServer {
                 "php-fpm restart skipped: Herd owns PHP-FPM (registered service untouched)"
                     .to_string()
             }
+            FpmRestartOutcome::SkippedOwnershipUnknown { reason } => format!(
+                "php-fpm restart skipped: ownership unknown ({reason}) — activation fails closed"
+            ),
             FpmRestartOutcome::Failed { message } => {
                 return Err(format!(
                     "Set {}={} persisted, but php-fpm restart failed: {message}",
@@ -566,7 +569,7 @@ impl ServerHandler for HearthMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::supervisor::ManagedService;
+    use crate::service::supervisor::{FpmOwnership, ManagedService};
 
     fn make_server() -> HearthMcpServer {
         let mut sup = ServiceSupervisor::new();
@@ -602,7 +605,7 @@ mod tests {
                 base.join("homebrew"),
             )
             .unwrap(),
-            Arc::new(|| false),
+            Arc::new(|| FpmOwnership::Unowned),
             std::time::Duration::from_millis(50),
         ));
 
@@ -669,7 +672,7 @@ mod tests {
                 tmp_php.path().join("homebrew"),
             )
             .unwrap(),
-            Arc::new(|| false),
+            Arc::new(|| FpmOwnership::Unowned),
             std::time::Duration::from_millis(50),
         ));
         let server = HearthMcpServer::new(
@@ -823,7 +826,13 @@ mod tests {
                 base.join("homebrew"),
             )
             .unwrap(),
-            Arc::new(move || probe_flag.load(std::sync::atomic::Ordering::SeqCst)),
+            Arc::new(move || {
+                if probe_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    FpmOwnership::Owned
+                } else {
+                    FpmOwnership::Unowned
+                }
+            }),
             std::time::Duration::from_millis(50),
         ));
         let server = HearthMcpServer::new(

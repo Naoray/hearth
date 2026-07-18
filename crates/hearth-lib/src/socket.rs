@@ -215,6 +215,13 @@ pub enum FpmRestartOutcome {
     /// that cannot parse it fails into the actionable version-mismatch
     /// remediation instead of rendering a false state.
     SkippedHerdOwned,
+    /// C4-2: the restart was skipped because current Herd ownership could
+    /// not be determined (probe failure) — FPM activation fails CLOSED and
+    /// the report says why. Same legacy-CLI consequence as
+    /// `SkippedHerdOwned`.
+    SkippedOwnershipUnknown {
+        reason: String,
+    },
 }
 
 /// Full report for a V2 php-config action. `persisted` is `Some` only for
@@ -554,6 +561,9 @@ mod tests {
             FpmRestartOutcome::NotRegistered { herd_hint: true },
             FpmRestartOutcome::NotRegistered { herd_hint: false },
             FpmRestartOutcome::SkippedHerdOwned,
+            FpmRestartOutcome::SkippedOwnershipUnknown {
+                reason: "ownership probe (pgrep) failed with status signal".to_string(),
+            },
             FpmRestartOutcome::LaunchBlocked {
                 reason: "missing fpm config — see todo #2343".to_string(),
             },

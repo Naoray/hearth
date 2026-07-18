@@ -252,6 +252,10 @@ pub async fn php_config_legacy(
                     "php-fpm restart skipped: Herd owns PHP-FPM (registered service untouched)"
                         .to_string()
                 }
+                FpmRestartOutcome::SkippedOwnershipUnknown { reason } => format!(
+                    "php-fpm restart skipped: ownership unknown ({reason}) — \
+                     activation fails closed"
+                ),
                 FpmRestartOutcome::Failed { message } => {
                     return DaemonResponse::Error {
                         message: format!(
@@ -287,7 +291,9 @@ mod tests {
     /// Constructed daemon state — every path is a tempdir; handlers can never
     /// touch `~/Library` (the S9 hazard this seam exists to remove).
     fn state_fixture() -> (tempfile::TempDir, PathBuf, Arc<DaemonState>) {
-        state_fixture_with_probe(Arc::new(|| false))
+        state_fixture_with_probe(Arc::new(|| {
+            hearth_lib::service::supervisor::FpmOwnership::Unowned
+        }))
     }
 
     /// Flippable-ownership daemon fixture (C2-1): Herd can become live AFTER
@@ -301,7 +307,11 @@ mod tests {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let probe_flag = Arc::clone(&flag);
         let (tmp, config_path, state) = state_fixture_with_probe(Arc::new(move || {
-            probe_flag.load(std::sync::atomic::Ordering::SeqCst)
+            if probe_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                hearth_lib::service::supervisor::FpmOwnership::Owned
+            } else {
+                hearth_lib::service::supervisor::FpmOwnership::Unowned
+            }
         }));
         (tmp, config_path, state, flag)
     }

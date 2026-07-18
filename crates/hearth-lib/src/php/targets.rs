@@ -251,11 +251,16 @@ impl ProviderRoots {
         if let Ok(brew) = canonical_allowed_root("homebrew", Path::new("/opt/homebrew")) {
             allowed_write_roots.push(brew);
         }
+        let herd = home.join("Library/Application Support/Herd");
+        let homebrew = PathBuf::from("/opt/homebrew");
+        // C4-3: the root SET must be unambiguous — pairwise distinct and
+        // non-nested in canonical form.
+        reject_overlapping_provider_roots(&hearth, &herd, &homebrew)?;
         Ok(Self {
             // Provider discovery roots derive from the validated canonical
             // HOME boundary.
-            herd: home.join("Library/Application Support/Herd"),
-            homebrew: PathBuf::from("/opt/homebrew"),
+            herd,
+            homebrew,
             allowed_write_roots,
             hearth,
         })
@@ -279,12 +284,30 @@ impl ProviderRoots {
         let herd = validated_root_under("isolated herd", &canonical_root, &herd, true, true)?;
         let homebrew =
             validated_root_under("isolated homebrew", &canonical_root, &homebrew, true, true)?;
+        // C4-3: identical validation as production — the isolated root SET
+        // must be pairwise distinct and non-nested in canonical form.
+        reject_overlapping_provider_roots(&hearth, &herd, &homebrew)?;
         Ok(Self {
             hearth,
             herd,
             homebrew,
             allowed_write_roots: vec![canonical_root],
         })
+    }
+
+    /// C4-3 (review 5650 r4): resolve each provider root for identity
+    /// comparison — canonical when it exists (resolving symlink aliases),
+    /// the validated normalized literal otherwise (aliases require an
+    /// existing symlink, which canonicalization resolves). Root `/` is
+    /// rejected.
+    fn identity_resolved(name: &str, root: &Path) -> Result<PathBuf, String> {
+        let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        if resolved.parent().is_none() {
+            return Err(format!(
+                "{name} provider root resolves to `/` — it can never bound an identity"
+            ));
+        }
+        Ok(resolved)
     }
 
     /// Canonicalized allowed WRITE prefixes. Immutable per construction:
@@ -300,6 +323,51 @@ impl ProviderRoots {
 
 /// Shared root-owned, version-blind fallback scan dir — hard-denylisted:
 /// never written, never verified, always `PrivilegedDir`.
+/// C4-3: the provider-root SET must be unambiguous — pairwise distinct and
+/// non-nested after resolving each root (canonical when it exists, the
+/// validated literal otherwise). Equal, nested, or symlink-aliased roots
+/// make every layout candidate's identity ambiguous and are rejected at
+/// construction, so no partial worker/service registration can proceed.
+fn reject_overlapping_provider_roots(
+    hearth: &Path,
+    herd: &Path,
+    homebrew: &Path,
+) -> Result<(), String> {
+    let resolved = [
+        (
+            "hearth",
+            ProviderRoots::identity_resolved("hearth", hearth)?,
+        ),
+        ("herd", ProviderRoots::identity_resolved("herd", herd)?),
+        (
+            "homebrew",
+            ProviderRoots::identity_resolved("homebrew", homebrew)?,
+        ),
+    ];
+    for i in 0..resolved.len() {
+        for j in (i + 1)..resolved.len() {
+            let (name_a, a) = &resolved[i];
+            let (name_b, b) = &resolved[j];
+            if a == b {
+                return Err(format!(
+                    "provider roots {name_a} and {name_b} resolve to the same path {} — \
+                     ambiguous provider identity is rejected",
+                    a.display()
+                ));
+            }
+            if a.starts_with(b) || b.starts_with(a) {
+                return Err(format!(
+                    "provider roots {name_a} ({}) and {name_b} ({}) are nested — \
+                     ambiguous provider identity is rejected",
+                    a.display(),
+                    b.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 const PRIVILEGED_PREFIX: &str = "/usr/local/etc/php";
 
 /// Canonical allowed-root invariant (review 5594 B4-2) — the ONE constructor
@@ -546,6 +614,28 @@ pub fn verify_binary_identity(
             canonical.display(),
             provider,
             canonical_root.display()
+        ));
+    }
+    // C4-3 defense in depth: the candidate must lie inside EXACTLY ONE
+    // canonical provider root across the WHOLE set — the selected label
+    // alone is not identity. (Constructors already reject overlapping root
+    // sets; this catches post-construction aliasing too.)
+    let mut memberships = 0usize;
+    for root in [&roots.hearth, &roots.herd, &roots.homebrew] {
+        let Ok(candidate_root) = root.canonicalize() else {
+            continue;
+        };
+        if candidate_root.parent().is_none() {
+            return Err("a provider root resolves to `/` — identity rejected".to_string());
+        }
+        if canonical.starts_with(&candidate_root) {
+            memberships += 1;
+        }
+    }
+    if memberships != 1 {
+        return Err(format!(
+            "{} lies in {memberships} canonical provider roots — identity is ambiguous",
+            canonical.display()
         ));
     }
     Ok(canonical)
@@ -2325,5 +2415,73 @@ fi
             assert!(err.contains("refusing"), "got: {err}");
         }
         assert!(!marker.exists(), "invalid keys must never reach the binary");
+    }
+
+    // ---- C4-3 (review 5650 r4): unambiguous provider-root sets ----
+
+    /// Constructors reject equal, nested, and symlink-aliased root sets;
+    /// legitimate distinct roots (including paths with spaces) still pass.
+    #[test]
+    fn provider_roots_reject_equal_nested_and_aliased_sets() {
+        let (_tmp, base) = canon_tmp();
+        let hearth = base.join("hearth config"); // path with a space
+        std::fs::create_dir_all(&hearth).unwrap();
+
+        // Equal roots.
+        let err =
+            ProviderRoots::isolated(&base, hearth.clone(), hearth.clone(), base.join("homebrew"))
+                .unwrap_err();
+        assert!(err.contains("same path"), "got: {err}");
+
+        // Nested (both directions).
+        let err = ProviderRoots::isolated(
+            &base,
+            hearth.clone(),
+            hearth.join("nested-herd"),
+            base.join("homebrew"),
+        )
+        .unwrap_err();
+        assert!(err.contains("nested"), "got: {err}");
+        let err = ProviderRoots::isolated(
+            &base,
+            base.join("hearth config/deeper"),
+            hearth.clone(),
+            base.join("homebrew"),
+        )
+        .unwrap_err();
+        assert!(err.contains("nested"), "got: {err}");
+
+        // Symlink alias resolving equal.
+        let alias = base.join("herd-alias");
+        std::os::unix::fs::symlink(&hearth, &alias).unwrap();
+        let err = ProviderRoots::isolated(&base, hearth.clone(), alias, base.join("homebrew"))
+            .unwrap_err();
+        assert!(err.contains("same path"), "got: {err}");
+
+        // Distinct roots stay valid.
+        ProviderRoots::isolated(&base, hearth, base.join("herd"), base.join("homebrew"))
+            .expect("legitimate distinct roots must pass");
+    }
+
+    /// Defense in depth: even with a root set that was distinct at
+    /// construction, a post-hoc alias makes candidate membership ambiguous
+    /// and `verify_binary_identity` rejects it.
+    #[test]
+    fn verify_binary_identity_requires_unique_root_membership() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let fpm = base.join("hearth/php/8.4/php-fpm");
+        std::fs::create_dir_all(fpm.parent().unwrap()).unwrap();
+        std::fs::write(&fpm, "#!/bin/sh\nexit 0\n").unwrap();
+
+        // Unique membership: identity verifies.
+        verify_binary_identity(PhpProvider::Hearth, "8.4", PhpSapi::Fpm, &roots)
+            .expect("distinct roots verify");
+
+        // Post-hoc alias: herd root now resolves onto the hearth root.
+        std::os::unix::fs::symlink(base.join("hearth"), base.join("Herd")).unwrap();
+        let err =
+            verify_binary_identity(PhpProvider::Hearth, "8.4", PhpSapi::Fpm, &roots).unwrap_err();
+        assert!(err.contains("identity is ambiguous"), "got: {err}");
     }
 }

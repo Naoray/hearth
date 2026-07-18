@@ -28,14 +28,14 @@ use crate::php::targets::{
     probe_fpm_effective, probe_scan_dirs, verify_binary_identity, verify_user_channel,
 };
 use crate::service::ServiceKind;
-use crate::service::supervisor::ServiceSupervisor;
+use crate::service::supervisor::{FpmOwnership, ServiceSupervisor};
 use crate::socket::{
     FileOutcome, FileWriteResult, FpmRestartOutcome, PhpConfigAction, PhpConfigOutcome, PhpScope,
     PhpTargetRow,
 };
 
 /// Injected Herd-ownership probe (production: `service::manager::is_herd_running`).
-pub type HerdProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+pub type HerdProbe = Arc<dyn Fn() -> FpmOwnership + Send + Sync>;
 
 // Round-4 locked design (review 5594 rev4, brief 5625): the external-FPM
 // probe, process-fact gatherer, environment-blob matcher, and evaluator were
@@ -109,8 +109,16 @@ impl PhpConfigEngine {
         self.config_dir.join("php").join("manifest.toml")
     }
 
-    pub fn herd_running(&self) -> bool {
+    /// TYPED current ownership (C4-2) — activation decisions consume this
+    /// and fail closed on `Unknown`.
+    pub fn fpm_ownership(&self) -> FpmOwnership {
         (self.herd_running)()
+    }
+
+    /// "Is Herd PROVEN live" convenience for row/registration display
+    /// gating. Activation decisions must use [`Self::fpm_ownership`].
+    pub fn herd_running(&self) -> bool {
+        matches!(self.fpm_ownership(), FpmOwnership::Owned)
     }
 
     /// `Some(reason)` when Hearth's own FPM cannot launch because nothing has
@@ -774,19 +782,27 @@ pub async fn restart_fpm_conditionally(
     supervisor: &Arc<Mutex<ServiceSupervisor>>,
     engine: &PhpConfigEngine,
 ) -> FpmRestartOutcome {
-    if engine.herd_running() {
-        // Read-only registration peek — truthful wording either way, zero
-        // stop/start/register/remove.
-        let registered = supervisor
-            .lock()
-            .await
-            .status()
-            .contains_key(&ServiceKind::PhpFpm);
-        return if registered {
-            FpmRestartOutcome::SkippedHerdOwned
-        } else {
-            FpmRestartOutcome::NotRegistered { herd_hint: true }
-        };
+    match engine.fpm_ownership() {
+        FpmOwnership::Owned => {
+            // Read-only registration peek — truthful wording either way,
+            // zero stop/start/register/remove.
+            let registered = supervisor
+                .lock()
+                .await
+                .status()
+                .contains_key(&ServiceKind::PhpFpm);
+            return if registered {
+                FpmRestartOutcome::SkippedHerdOwned
+            } else {
+                FpmRestartOutcome::NotRegistered { herd_hint: true }
+            };
+        }
+        // C4-2: unknown evidence fails CLOSED — never a restart, and the
+        // report says WHY instead of pretending Herd absent.
+        FpmOwnership::Unknown(diag) => {
+            return FpmRestartOutcome::SkippedOwnershipUnknown { reason: diag };
+        }
+        FpmOwnership::Unowned => {}
     }
     let mut sup = supervisor.lock().await;
     if !sup.status().contains_key(&ServiceKind::PhpFpm) {
@@ -886,17 +902,25 @@ impl PhpConfigEngine {
         require_reconciled(self.sync_locked().await)
             .map_err(|e| format!("switched default_php to {version} (persisted), but: {e}"))?;
 
-        // C1-1 (review 5650): an ordinary version switch must NEVER take FPM
-        // ownership while Herd owns it — the North Star coexistence
-        // invariant has no takeover flag. Version selection + reconcile
-        // above stand; FPM handling becomes a truthful skip with ZERO
-        // supervisor mutation (no stop/register/start/remove). Ownership
-        // comes from the same injected probe the daemon's service
+        // C1-1/C4-2 (review 5650): an ordinary version switch must NEVER
+        // take FPM ownership while Herd owns it — and unknown ownership
+        // fails CLOSED. Version selection + reconcile above stand; FPM
+        // handling becomes a truthful skip with ZERO supervisor mutation.
+        // Ownership comes from the same injected probe the daemon's service
         // registration consults — never mutable process titles.
-        if self.herd_running() {
-            return Ok(format!(
-                "Switched to PHP {version}; php-fpm untouched (Herd manages PHP-FPM)"
-            ));
+        match self.fpm_ownership() {
+            FpmOwnership::Owned => {
+                return Ok(format!(
+                    "Switched to PHP {version}; php-fpm untouched (Herd manages PHP-FPM)"
+                ));
+            }
+            FpmOwnership::Unknown(diag) => {
+                return Ok(format!(
+                    "Switched to PHP {version}; php-fpm untouched (Herd ownership \
+                     unknown: {diag} — FPM activation skipped fail-closed)"
+                ));
+            }
+            FpmOwnership::Unowned => {}
         }
 
         let mut sup = supervisor.lock().await;
@@ -1050,7 +1074,13 @@ mod tests {
     }
 
     fn fixture(herd: bool) -> Fixture {
-        fixture_with_probe(Arc::new(move || herd))
+        fixture_with_probe(Arc::new(move || {
+            if herd {
+                FpmOwnership::Owned
+            } else {
+                FpmOwnership::Unowned
+            }
+        }))
     }
 
     /// Flippable-ownership fixture (C2-1): the probe reads live state, so a
@@ -1059,7 +1089,11 @@ mod tests {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let probe_flag = Arc::clone(&flag);
         let fx = fixture_with_probe(Arc::new(move || {
-            probe_flag.load(std::sync::atomic::Ordering::SeqCst)
+            if probe_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                FpmOwnership::Owned
+            } else {
+                FpmOwnership::Unowned
+            }
         }));
         (fx, flag)
     }
@@ -2233,6 +2267,135 @@ echo "Scan for additional .ini files in: {}"
         assert!(
             empty.lock().await.service(ServiceKind::PhpFpm).is_none(),
             "switch under Herd must never register FPM"
+        );
+    }
+
+    // ---- C4-2 (review 5650 r4): unknown ownership fails closed ----
+
+    /// Unknown ownership evidence must fail CLOSED across the config
+    /// surfaces: restart policy reports the skip with the reason, switch
+    /// leaves FPM untouched — zero supervisor mutation either way.
+    #[tokio::test]
+    async fn unknown_ownership_fails_closed_in_config_restart_and_switch() {
+        use crate::service::supervisor::ManagedService;
+
+        let fx = fixture_with_probe(Arc::new(|| {
+            FpmOwnership::Unknown("ownership probe (pgrep) failed with status 2".to_string())
+        }));
+        std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
+        std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
+        write_executable(&fx.config_dir.join("php/8.3/php"), "#!/bin/sh\nexit 0\n");
+
+        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        {
+            let mut sup = supervisor.lock().await;
+            sup.register(ManagedService::new(
+                ServiceKind::PhpFpm,
+                "/bin/sleep".to_string(),
+                vec!["30".to_string()],
+            ));
+            sup.start_service(ServiceKind::PhpFpm).unwrap();
+        }
+        let started = supervisor
+            .lock()
+            .await
+            .service(ServiceKind::PhpFpm)
+            .unwrap()
+            .started_at()
+            .expect("running");
+
+        // Config restart policy: actionable skip, zero mutation.
+        let fpm = restart_fpm_conditionally(&supervisor, &fx.engine).await;
+        match &fpm {
+            FpmRestartOutcome::SkippedOwnershipUnknown { reason } => {
+                assert!(reason.contains("pgrep"), "diagnostic surfaced: {reason}");
+            }
+            other => panic!("expected SkippedOwnershipUnknown, got {other:?}"),
+        }
+        {
+            let sup = supervisor.lock().await;
+            let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+            assert_eq!(svc.started_at(), Some(started), "zero stop/start");
+        }
+
+        // Switch: version persists, FPM untouched, reason surfaced.
+        let msg = fx.engine.switch(&supervisor, "8.3").await.unwrap();
+        assert!(msg.contains("php-fpm untouched"), "got: {msg}");
+        assert!(msg.contains("ownership"), "got: {msg}");
+        assert!(msg.contains("unknown"), "got: {msg}");
+        {
+            let sup = supervisor.lock().await;
+            let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+            assert_eq!(
+                svc.started_at(),
+                Some(started),
+                "switch under unknown: untouched"
+            );
+        }
+        supervisor
+            .lock()
+            .await
+            .stop_service(ServiceKind::PhpFpm)
+            .unwrap();
+    }
+
+    // ---- C4-3 (review 5650 r4): ambiguous roots fail closed everywhere ----
+
+    /// A post-construction root alias (herd → hearth) makes every hearth
+    /// target's identity ambiguous: zero execution, loudly unverified rows,
+    /// zero channel writes. Fails at head e6eedb3 (single-root membership).
+    #[tokio::test]
+    async fn aliased_roots_make_targets_unverified_zero_exec_zero_write() {
+        let fx = fixture(false);
+        let base = fx._tmp.path().canonicalize().unwrap();
+        let log = base.join("invocations.log");
+        let conf_d = fx.config_dir.join("php/8.4/conf.d");
+        write_executable(
+            &fx.config_dir.join("php/8.4/php"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--warmup\" ]; then exit 0; fi\n\
+                 echo run >> \"{}\"\n\
+                 echo \"Scan for additional .ini files in: {}\"\n",
+                log.display(),
+                conf_d.display()
+            ),
+        );
+        // Alias AFTER construction (constructors reject overlapping sets):
+        // base/herd → the hearth config dir.
+        std::os::unix::fs::symlink(&fx.config_dir, &fx.engine.provider_roots.herd).unwrap();
+        let count = |path: &Path| {
+            std::fs::read_to_string(path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+
+        let outcome = fx
+            .engine
+            .apply(PhpConfigAction::Show {
+                key: Some("memory_limit".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(count(&log), 0, "ambiguous identity is never executed");
+        let row = outcome
+            .rows
+            .iter()
+            .find(|r| r.provider == "hearth" && r.sapi == "cli" && r.context == "normal")
+            .expect("hearth cli row renders loudly");
+        assert!(
+            row.coverage.contains("identity unverified") && row.coverage.contains("ambiguous"),
+            "got: {}",
+            row.coverage
+        );
+
+        fx.engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        assert_eq!(count(&log), 0, "Set must not execute either");
+        assert!(
+            !conf_d.join(CHANNEL_FILE_NAME).exists(),
+            "no channel authority under an ambiguous identity"
         );
     }
 

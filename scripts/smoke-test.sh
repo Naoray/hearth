@@ -397,6 +397,15 @@ if echo "$OUTPUT" | grep -qi "owned by Herd"; then
 else
     fail "SH2: got: $OUTPUT"
 fi
+# C4-2: invalid flag content = UNKNOWN ownership → activation fails closed.
+echo garbage > "$HERD_FLAG"
+OUTPUT=$($CLI restart php-fpm 2>&1)
+if echo "$OUTPUT" | grep -qi "ownership is unknown"; then
+    pass "SH2: unknown ownership refuses FPM activation fail-closed"
+else
+    fail "SH2: got: $OUTPUT"
+fi
+echo 1 > "$HERD_FLAG"
 if $CLI status 2>&1 | grep -i "php-fpm" | grep -qi "running"; then
     fail "SH2: restart must not revive FPM under Herd"
 else

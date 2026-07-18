@@ -655,6 +655,12 @@ fn render_php_config_report(
         FpmRestartOutcome::SkippedHerdOwned => out.push_str(
             "php-fpm restart skipped: Herd owns PHP-FPM — registered service left untouched\n",
         ),
+        FpmRestartOutcome::SkippedOwnershipUnknown { reason } => {
+            let _ = writeln!(
+                out,
+                "php-fpm restart skipped: ownership unknown ({reason}) — activation fails closed"
+            );
+        }
         FpmRestartOutcome::Failed { message } => {
             exit = ExitClass::Failure;
             let _ = writeln!(err, "Error: php-fpm restart failed: {message}");
@@ -883,7 +889,7 @@ async fn run_php_exec(
         config_path,
         config_dir.clone(),
         provider_roots,
-        std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        std::sync::Arc::new(hearth_lib::service::manager::current_fpm_ownership),
         std::time::Duration::from_secs(5),
     );
     // Hard gate (F4): never exec PHP against unreconciled channel state.
@@ -961,7 +967,7 @@ async fn run_install() -> anyhow::Result<()> {
         config_path.clone(),
         config_dir.clone(),
         provider_roots,
-        std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        std::sync::Arc::new(hearth_lib::service::manager::current_fpm_ownership),
         std::time::Duration::from_secs(5),
     );
     // Hard gate (F4): a Refused/Failed channel outcome aborts install with a
