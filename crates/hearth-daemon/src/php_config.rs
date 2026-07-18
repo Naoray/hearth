@@ -112,29 +112,66 @@ fn channel_applied_at_ms(
     version: &str,
     supervised_binary: &std::path::Path,
 ) -> Option<u64> {
+    use hearth_lib::php::reconcile::{EntryState, LastOutcome};
     use hearth_lib::php::targets::{PhpProvider, expected_channel_dir};
 
     let engine = &state.php_engine;
     let roots = engine.provider_roots();
-    let mut candidates =
-        vec![expected_channel_dir(PhpProvider::Hearth, version, roots).join(CHANNEL_FILE_NAME)];
-    let provider = if supervised_binary.starts_with(&roots.herd) {
-        Some(PhpProvider::Herd)
-    } else if supervised_binary.starts_with(&roots.homebrew) {
-        Some(PhpProvider::Homebrew)
-    } else {
-        None
-    };
-    if let Some(provider) = provider {
-        candidates.push(expected_channel_dir(provider, version, roots).join(CHANNEL_FILE_NAME));
+    // C2-3: canonical, root-bounded, UNAMBIGUOUS provider identity of the
+    // exact supervised binary (the supervisor's own registration). Any
+    // failure below produces NO claim — never a relabel or a fallback.
+    let canonical_binary = supervised_binary.canonicalize().ok()?;
+    let mut matched: Vec<(PhpProvider, &'static str, std::path::PathBuf)> = Vec::new();
+    for (provider, root, kind) in [
+        (PhpProvider::Hearth, &roots.hearth, "hearth"),
+        (PhpProvider::Herd, &roots.herd, "herd-user"),
+        (PhpProvider::Homebrew, &roots.homebrew, "homebrew"),
+    ] {
+        let Ok(canonical_root) = root.canonicalize() else {
+            continue;
+        };
+        if canonical_root.parent().is_none() {
+            // `/` can never be a provider root — it would match everything.
+            continue;
+        }
+        if canonical_binary.starts_with(&canonical_root) {
+            matched.push((provider, kind, canonical_root));
+        }
     }
+    if matched.len() != 1 {
+        // Outside every root, or ambiguous (aliased/nested roots).
+        return None;
+    }
+    let (provider, kind, canonical_provider_root) = matched.remove(0);
+
+    // Exactly ONE expected channel for that identity. The dir must be
+    // canonical (no symlink component — Stage-B rule) and must remain inside
+    // the canonical provider root; a symlink escape produces no claim.
+    let channel_dir = expected_channel_dir(provider, version, roots);
+    let canonical_dir = channel_dir.canonicalize().ok()?;
+    if canonical_dir != channel_dir || !canonical_dir.starts_with(&canonical_provider_root) {
+        return None;
+    }
+
+    // Exact-entry match: path + php_version + channel kind + Applied +
+    // Written/Unchanged success. Pending/refused/failed/removed/unrelated
+    // entries are ignored; no newest-of-many selection exists.
+    let channel_file = channel_dir.join(CHANNEL_FILE_NAME);
     let manifest = Manifest::load(&engine.manifest_path()).ok()?;
     manifest
         .files
         .iter()
-        .filter(|e| candidates.iter().any(|c| c == &e.path))
-        .filter_map(|e| e.applied_at_unix_ms)
-        .max()
+        .find(|e| {
+            e.path == channel_file
+                && e.php_version == version
+                && e.channel == kind
+                && e.state == EntryState::Applied
+                && matches!(
+                    e.last_outcome,
+                    LastOutcome::Written | LastOutcome::Unchanged
+                )
+        })
+        .and_then(|e| e.applied_at_unix_ms)
 }
 
 /// Handle the legacy `PhpConfig { version, key, value }` request (protocol
@@ -185,6 +222,10 @@ pub async fn php_config_legacy(
                 FpmRestartOutcome::LaunchBlocked { reason } => {
                     format!("php-fpm not restarted: launch-blocked ({reason})")
                 }
+                FpmRestartOutcome::SkippedHerdOwned => {
+                    "php-fpm restart skipped: Herd owns PHP-FPM (registered service untouched)"
+                        .to_string()
+                }
                 FpmRestartOutcome::Failed { message } => {
                     return DaemonResponse::Error {
                         message: format!(
@@ -220,6 +261,28 @@ mod tests {
     /// Constructed daemon state — every path is a tempdir; handlers can never
     /// touch `~/Library` (the S9 hazard this seam exists to remove).
     fn state_fixture() -> (tempfile::TempDir, PathBuf, Arc<DaemonState>) {
+        state_fixture_with_probe(Arc::new(|| false))
+    }
+
+    /// Flippable-ownership daemon fixture (C2-1): Herd can become live AFTER
+    /// the supervisor registered/started FPM.
+    fn state_fixture_with_herd_flag() -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<DaemonState>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_flag = Arc::clone(&flag);
+        let (tmp, config_path, state) = state_fixture_with_probe(Arc::new(move || {
+            probe_flag.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+        (tmp, config_path, state, flag)
+    }
+
+    fn state_fixture_with_probe(
+        herd: hearth_lib::php::engine::HerdProbe,
+    ) -> (tempfile::TempDir, PathBuf, Arc<DaemonState>) {
         let tmp = tempfile::TempDir::new().unwrap();
         let base = tmp.path().canonicalize().unwrap();
         let config_dir = base.join("hearth");
@@ -238,7 +301,7 @@ mod tests {
             config_path.clone(),
             config_dir.clone(),
             roots,
-            Arc::new(|| false),
+            herd,
             Duration::from_millis(50),
         ));
         let state = Arc::new(DaemonState {
@@ -495,6 +558,88 @@ mod tests {
         }
     }
 
+    /// C2-1 (review 5650 r2): the FULL daemon Set path — persistence,
+    /// reconcile, restart policy — must not stop/start/restart/register/
+    /// remove a registered running FPM once Herd became live, must report
+    /// the truthful skip, and must leak no process. Fails at head 08b7232.
+    #[tokio::test]
+    async fn daemon_set_skips_registered_running_fpm_after_herd_becomes_live() {
+        use hearth_lib::service::supervisor::ManagedService;
+        use std::sync::atomic::Ordering;
+
+        let (_tmp, config_path, state, herd_live) = state_fixture_with_herd_flag();
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.register(ManagedService::new(
+                hearth_lib::service::ServiceKind::PhpFpm,
+                "/bin/sleep".to_string(),
+                vec!["30".to_string()],
+            ));
+            sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+        }
+        let started_before = state
+            .supervisor
+            .lock()
+            .await
+            .service(hearth_lib::service::ServiceKind::PhpFpm)
+            .unwrap()
+            .started_at()
+            .expect("running");
+
+        herd_live.store(true, Ordering::SeqCst);
+
+        let response = php_config(
+            &state,
+            PhpConfigAction::Set {
+                scope: PhpScope::Global,
+                key: "memory_limit".to_string(),
+                value: "1G".to_string(),
+            },
+        )
+        .await;
+        match response {
+            DaemonResponse::PhpConfigReport(outcome) => {
+                assert_eq!(outcome.persisted, Some(true), "persistence proceeds");
+                assert_eq!(
+                    outcome.fpm,
+                    FpmRestartOutcome::SkippedHerdOwned,
+                    "truthful restart-skipped status"
+                );
+            }
+            other => panic!("expected PhpConfigReport, got {other:?}"),
+        }
+        // Config really persisted.
+        let reloaded = HearthConfig::load_from(&config_path).unwrap();
+        assert_eq!(
+            reloaded.php_ini.global.get("memory_limit"),
+            Some(&"1G".to_string())
+        );
+        // Supervisor state untouched: same registration, same spawn, running.
+        {
+            let sup = state.supervisor.lock().await;
+            let svc = sup
+                .service(hearth_lib::service::ServiceKind::PhpFpm)
+                .expect("registration survives");
+            assert!(matches!(
+                svc.state,
+                hearth_lib::service::ServiceState::Running { .. }
+            ));
+            assert_eq!(
+                svc.started_at(),
+                Some(started_before),
+                "no stop/start/restart happened"
+            );
+        }
+        // No process leak: stop the reviewer-owned child explicitly.
+        state
+            .supervisor
+            .lock()
+            .await
+            .stop_service(hearth_lib::service::ServiceKind::PhpFpm)
+            .unwrap();
+    }
+
     // ---- Task 8: pending-restart marker + run-state annotation ----
 
     /// Required focused test: the marker is truthful ONLY with both
@@ -534,6 +679,7 @@ mod tests {
             rows,
             files: vec![],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
         }
     }
 
@@ -545,27 +691,36 @@ mod tests {
         let (_tmp, _config_path, state) = state_fixture();
         let default_php = state.config.lock().await.default_php.clone();
 
-        // A real supervisor-spawned child (isolated /bin/sleep) records the
-        // trustworthy start time.
+        // A real supervisor-spawned child — the HEARTH-root fake FPM, so the
+        // C2-3 canonical provider identity resolves to the hearth channel —
+        // records the trustworthy start time.
+        let hearth_bin = state
+            .php_engine
+            .config_dir()
+            .join("php")
+            .join(&default_php)
+            .join("php-fpm");
+        write_spawnable(&hearth_bin);
+        let conf_d = state
+            .php_engine
+            .config_dir()
+            .join("php")
+            .join(&default_php)
+            .join("conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
         {
             let mut sup = state.supervisor.lock().await;
             sup.register(ManagedService::new(
                 hearth_lib::service::ServiceKind::PhpFpm,
-                "/bin/sleep".to_string(),
-                vec!["30".to_string()],
+                hearth_bin.to_string_lossy().to_string(),
+                vec![],
             ));
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
 
         // Manifest entry materialized BEFORE the spawn → no pending claim.
-        let channel_file = state
-            .php_engine
-            .config_dir()
-            .join("php")
-            .join(&default_php)
-            .join("conf.d")
-            .join(CHANNEL_FILE_NAME);
+        let channel_file = conf_d.join(CHANNEL_FILE_NAME);
         let manifest_path = state.php_engine.manifest_path();
         let entry = |applied: u64| ManifestEntry {
             path: channel_file.clone(),
@@ -666,9 +821,12 @@ mod tests {
         }
 
         // Only the HERD channel file has a (newer) materialization stamp.
+        // The channel dir must really exist (C2-3: canonical containment is
+        // checked against the actual dir, not a reconstructed suffix).
         let roots = state.php_engine.provider_roots().clone();
-        let herd_channel =
-            expected_channel_dir(PhpProvider::Herd, &default_php, &roots).join(CHANNEL_FILE_NAME);
+        let herd_dir = expected_channel_dir(PhpProvider::Herd, &default_php, &roots);
+        std::fs::create_dir_all(&herd_dir).unwrap();
+        let herd_channel = herd_dir.join(CHANNEL_FILE_NAME);
         let manifest = Manifest {
             version: hearth_lib::php::reconcile::MANIFEST_VERSION,
             files: vec![ManifestEntry {
@@ -740,5 +898,296 @@ mod tests {
             "unregistered FPM keeps its static truthful row"
         );
         assert!(!row.pending_restart);
+    }
+
+    /// Spawnable fake service binary (real child process, isolated path).
+    fn write_spawnable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // ---- C2-3 (review 5650 r2): exact-entry + root-bounded identity ----
+
+    fn herd_entry(
+        path: std::path::PathBuf,
+        version: &str,
+        state: hearth_lib::php::reconcile::EntryState,
+        outcome: hearth_lib::php::reconcile::LastOutcome,
+    ) -> hearth_lib::php::reconcile::ManifestEntry {
+        hearth_lib::php::reconcile::ManifestEntry {
+            path,
+            php_version: version.to_string(),
+            channel: "herd-user".to_string(),
+            sha256: "abc".to_string(),
+            state,
+            expected_old_sha256: None,
+            desired_sha256: None,
+            last_outcome: outcome,
+            applied_at_unix_ms: Some(i64::MAX as u64),
+        }
+    }
+
+    /// The exact-entry rules: a provider-backed FPM ignores unrelated newer
+    /// Hearth entries; wrong php_version, non-Applied state, and non-success
+    /// outcomes are all ignored; the exact legitimate entry still claims
+    /// pending. Fails at head 08b7232 (newest-of-many by path alone).
+    #[tokio::test]
+    async fn pending_restart_requires_exact_entry_match() {
+        use hearth_lib::php::reconcile::{EntryState, LastOutcome, Manifest, ManifestEntry};
+        use hearth_lib::php::targets::{PhpProvider, expected_channel_dir};
+        use hearth_lib::service::supervisor::ManagedService;
+
+        let (tmp, _config_path, state) = state_fixture();
+        let base = tmp.path().canonicalize().unwrap();
+        let default_php = state.config.lock().await.default_php.clone();
+        let roots = state.php_engine.provider_roots().clone();
+
+        // Provider-backed supervised FPM (herd root), running.
+        let herd_bin = base.join("herd/bin/php84-fpm");
+        write_spawnable(&herd_bin);
+        let herd_dir = expected_channel_dir(PhpProvider::Herd, &default_php, &roots);
+        std::fs::create_dir_all(&herd_dir).unwrap();
+        let herd_file = herd_dir.join(CHANNEL_FILE_NAME);
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.register(ManagedService::new(
+                hearth_lib::service::ServiceKind::PhpFpm,
+                herd_bin.to_string_lossy().to_string(),
+                vec![],
+            ));
+            sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+        }
+
+        let manifest_path = state.php_engine.manifest_path();
+        let save = |files: Vec<ManifestEntry>| {
+            Manifest {
+                version: hearth_lib::php::reconcile::MANIFEST_VERSION,
+                files,
+            }
+            .save(&manifest_path)
+            .unwrap();
+        };
+        async fn pending_now(state: &Arc<DaemonState>, version: &str) -> bool {
+            let mut outcome = outcome_with(vec![launched_row(version)]);
+            annotate_fpm_runtime(state, &mut outcome).await;
+            outcome.rows[0].pending_restart
+        }
+
+        // Unrelated NEWER Hearth entry alone: ignored by a provider-backed FPM.
+        let hearth_file = state
+            .php_engine
+            .config_dir()
+            .join("php")
+            .join(&default_php)
+            .join("conf.d")
+            .join(CHANNEL_FILE_NAME);
+        save(vec![ManifestEntry {
+            path: hearth_file,
+            php_version: default_php.clone(),
+            channel: "hearth".to_string(),
+            sha256: "abc".to_string(),
+            state: EntryState::Applied,
+            expected_old_sha256: None,
+            desired_sha256: None,
+            last_outcome: LastOutcome::Written,
+            applied_at_unix_ms: Some(i64::MAX as u64),
+        }]);
+        assert!(
+            !pending_now(&state, &default_php).await,
+            "provider-backed FPM must ignore an unrelated newer Hearth entry"
+        );
+
+        // Wrong php_version on the exact path: ignored.
+        save(vec![herd_entry(
+            herd_file.clone(),
+            "8.3",
+            EntryState::Applied,
+            LastOutcome::Written,
+        )]);
+        assert!(
+            !pending_now(&state, &default_php).await,
+            "wrong php_version must be ignored"
+        );
+
+        // Pending (journaled, not applied): ignored.
+        save(vec![herd_entry(
+            herd_file.clone(),
+            &default_php,
+            EntryState::Pending,
+            LastOutcome::Written,
+        )]);
+        assert!(
+            !pending_now(&state, &default_php).await,
+            "journaled-but-unapplied entries must be ignored"
+        );
+
+        // Refused/failed outcomes: ignored.
+        for outcome_kind in [LastOutcome::Refused, LastOutcome::Failed] {
+            save(vec![herd_entry(
+                herd_file.clone(),
+                &default_php,
+                EntryState::Applied,
+                outcome_kind,
+            )]);
+            assert!(
+                !pending_now(&state, &default_php).await,
+                "non-success outcomes must be ignored"
+            );
+        }
+
+        // Removed/empty manifest: no claim.
+        save(vec![]);
+        assert!(!pending_now(&state, &default_php).await);
+
+        // The exact legitimate provider entry still claims pending.
+        save(vec![herd_entry(
+            herd_file.clone(),
+            &default_php,
+            EntryState::Applied,
+            LastOutcome::Written,
+        )]);
+        assert!(
+            pending_now(&state, &default_php).await,
+            "the exact provider entry newer than spawn → pending"
+        );
+
+        state
+            .supervisor
+            .lock()
+            .await
+            .stop_service(hearth_lib::service::ServiceKind::PhpFpm)
+            .unwrap();
+    }
+
+    /// A symlinked expected channel dir that escapes the provider root can
+    /// never feed a pending claim (canonical/root-bounded rule).
+    #[tokio::test]
+    async fn pending_restart_rejects_symlinked_channel_escape() {
+        use hearth_lib::php::reconcile::{EntryState, LastOutcome};
+        use hearth_lib::php::targets::{PhpProvider, expected_channel_dir};
+        use hearth_lib::service::supervisor::ManagedService;
+
+        let (tmp, _config_path, state) = state_fixture();
+        let base = tmp.path().canonicalize().unwrap();
+        let default_php = state.config.lock().await.default_php.clone();
+        let roots = state.php_engine.provider_roots().clone();
+
+        let herd_bin = base.join("herd/bin/php84-fpm");
+        write_spawnable(&herd_bin);
+        // The expected herd channel dir is a SYMLINK escaping the herd root.
+        let outside = base.join("outside-channel");
+        std::fs::create_dir_all(&outside).unwrap();
+        let herd_dir = expected_channel_dir(PhpProvider::Herd, &default_php, &roots);
+        std::fs::create_dir_all(herd_dir.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &herd_dir).unwrap();
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.register(ManagedService::new(
+                hearth_lib::service::ServiceKind::PhpFpm,
+                herd_bin.to_string_lossy().to_string(),
+                vec![],
+            ));
+            sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+        }
+        // Even a perfect-looking manifest entry on the literal path is void.
+        let herd_file = herd_dir.join(CHANNEL_FILE_NAME);
+        hearth_lib::php::reconcile::Manifest {
+            version: hearth_lib::php::reconcile::MANIFEST_VERSION,
+            files: vec![herd_entry(
+                herd_file,
+                &default_php,
+                EntryState::Applied,
+                LastOutcome::Written,
+            )],
+        }
+        .save(&state.php_engine.manifest_path())
+        .unwrap();
+
+        let mut outcome = outcome_with(vec![launched_row(&default_php)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        assert!(
+            !outcome.rows[0].pending_restart,
+            "a symlink-escaped channel can never feed a pending claim"
+        );
+        state
+            .supervisor
+            .lock()
+            .await
+            .stop_service(hearth_lib::service::ServiceKind::PhpFpm)
+            .unwrap();
+    }
+
+    /// Aliased provider roots (herd root symlinked onto the hearth root)
+    /// make the binary's provider identity ambiguous — no claim.
+    #[tokio::test]
+    async fn pending_restart_rejects_aliased_ambiguous_roots() {
+        use hearth_lib::php::reconcile::{EntryState, LastOutcome, Manifest, ManifestEntry};
+        use hearth_lib::service::supervisor::ManagedService;
+
+        let (tmp, _config_path, state) = state_fixture();
+        let base = tmp.path().canonicalize().unwrap();
+        let default_php = state.config.lock().await.default_php.clone();
+
+        // Alias: base/herd → base/hearth (the hearth config dir). The
+        // hearth-root binary now lies under BOTH canonical roots.
+        std::os::unix::fs::symlink(state.php_engine.config_dir(), base.join("herd")).unwrap();
+        let hearth_bin = state
+            .php_engine
+            .config_dir()
+            .join("php")
+            .join(&default_php)
+            .join("php-fpm");
+        write_spawnable(&hearth_bin);
+        let conf_d = state
+            .php_engine
+            .config_dir()
+            .join("php")
+            .join(&default_php)
+            .join("conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.register(ManagedService::new(
+                hearth_lib::service::ServiceKind::PhpFpm,
+                hearth_bin.to_string_lossy().to_string(),
+                vec![],
+            ));
+            sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
+                .unwrap();
+        }
+        // A perfectly valid hearth entry exists — ambiguity still voids it.
+        Manifest {
+            version: hearth_lib::php::reconcile::MANIFEST_VERSION,
+            files: vec![ManifestEntry {
+                path: conf_d.join(CHANNEL_FILE_NAME),
+                php_version: default_php.clone(),
+                channel: "hearth".to_string(),
+                sha256: "abc".to_string(),
+                state: EntryState::Applied,
+                expected_old_sha256: None,
+                desired_sha256: None,
+                last_outcome: LastOutcome::Written,
+                applied_at_unix_ms: Some(i64::MAX as u64),
+            }],
+        }
+        .save(&state.php_engine.manifest_path())
+        .unwrap();
+
+        let mut outcome = outcome_with(vec![launched_row(&default_php)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        assert!(
+            !outcome.rows[0].pending_restart,
+            "ambiguous provider identity must produce no pending claim"
+        );
+        state
+            .supervisor
+            .lock()
+            .await
+            .stop_service(hearth_lib::service::ServiceKind::PhpFpm)
+            .unwrap();
     }
 }

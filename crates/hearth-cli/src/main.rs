@@ -342,7 +342,19 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // C2-2: a keyed Status is trustworthy only when the daemon echoes the
+    // key it applied — a legacy daemon deserializes the keyed request as
+    // keyless and answers a valueless table with no error.
+    let expected_status_key = match &request {
+        DaemonRequest::PhpConfigV2 {
+            action: hearth_lib::socket::PhpConfigAction::Status { key: Some(key) },
+        } => Some(key.clone()),
+        _ => None,
+    };
     let response = send_to_daemon(request).await?;
+    if let Some(expected) = expected_status_key {
+        verify_keyed_status_certified(&response, &expected).map_err(|msg| anyhow::anyhow!(msg))?;
+    }
     // print_response is a pure renderer (returns ExitClass); main owns the
     // only process-exit application in the binary.
     if print_response(response) == ExitClass::Failure {
@@ -350,6 +362,29 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// C2-2 (review 5650 r2): fail a keyed Status actionably when the daemon did
+/// not certify the key. EOF/unparseable detection alone cannot catch a
+/// pre-round-2 daemon — it accepts the keyed payload as keyless and answers
+/// success-shaped output.
+fn verify_keyed_status_certified(
+    response: &DaemonResponse,
+    expected_key: &str,
+) -> Result<(), String> {
+    match response {
+        DaemonResponse::PhpConfigReport(outcome)
+            if outcome.status_key.as_deref() == Some(expected_key) =>
+        {
+            Ok(())
+        }
+        DaemonResponse::PhpConfigReport(_) => Err(format!(
+            "the daemon did not acknowledge the status key `{expected_key}` — hearth CLI and \
+             daemon versions differ; run 'hearth daemon stop && hearth daemon start' and retry."
+        )),
+        // Errors and other shapes render on their own truthful paths.
+        _ => Ok(()),
+    }
 }
 
 /// Build the typed php-config action from the CLI flag matrix, or an
@@ -399,6 +434,12 @@ fn build_php_config_action(
         if global || php.is_some() {
             return Err("--status takes no --global/--php scope".to_string());
         }
+        // C2-4: an invalid key is a stable actionable error before any
+        // daemon I/O — never a silent degradation to a valueless table.
+        if let Some(k) = &key {
+            hearth_lib::php::ini_guard::validate_key(k)
+                .map_err(|e| format!("invalid --status key: {e}"))?;
+        }
         return Ok(PhpConfigAction::Status { key });
     }
 
@@ -420,6 +461,10 @@ fn build_php_config_action(
     if show {
         if value.is_some() {
             return Err("--show takes an optional key but no value".to_string());
+        }
+        if let Some(k) = &key {
+            hearth_lib::php::ini_guard::validate_key(k)
+                .map_err(|e| format!("invalid --show key: {e}"))?;
         }
         return Ok(PhpConfigAction::Show { key });
     }
@@ -572,6 +617,9 @@ fn render_php_config_report(
         FpmRestartOutcome::LaunchBlocked { reason } => {
             let _ = writeln!(out, "php-fpm not restarted: LAUNCH-BLOCKED ({reason})");
         }
+        FpmRestartOutcome::SkippedHerdOwned => out.push_str(
+            "php-fpm restart skipped: Herd owns PHP-FPM — registered service left untouched\n",
+        ),
         FpmRestartOutcome::Failed { message } => {
             exit = ExitClass::Failure;
             let _ = writeln!(err, "Error: php-fpm restart failed: {message}");
@@ -1697,6 +1745,36 @@ mod tests {
             .is_err()
         );
         assert!(build(None, None, true, None, false, false, true, false, false).is_err());
+        // C2-4: invalid Status/Show keys are stable actionable errors
+        // BEFORE any daemon I/O — never silent keyless degradation.
+        for bad in ["bad key", "1leading", "inject\")); system(\"id"] {
+            let err = build(
+                Some(bad),
+                None,
+                false,
+                None,
+                false,
+                false,
+                true,
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert!(err.contains("invalid --status key"), "got: {err}");
+            let err = build(
+                Some(bad),
+                None,
+                false,
+                None,
+                true,
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert!(err.contains("invalid --show key"), "got: {err}");
+        }
         assert_eq!(
             build(None, None, false, None, false, false, false, true, false),
             Ok(PhpConfigAction::Sync)
@@ -1729,7 +1807,45 @@ mod tests {
             rows,
             files: vec![],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
         }
+    }
+
+    /// C2-2: the EXACT legacy response shape (a pre-round-2 daemon answering
+    /// a keyed Status it silently treated as keyless) must fail the keyed
+    /// certificate with the supported stop/start remediation; a certified
+    /// echo passes; keyless requests never consult the certificate.
+    #[test]
+    fn keyed_status_against_legacy_daemon_fails_actionably() {
+        // Exact wire bytes a b899ff04 daemon sends for the keyed request.
+        let legacy = r#"{"type":"PhpConfigReport","persisted":null,"rows":[],"files":[],"fpm":{"outcome":"NotAttempted"}}"#;
+        let response: DaemonResponse = serde_json::from_str(legacy).unwrap();
+        let err = verify_keyed_status_certified(&response, "memory_limit").unwrap_err();
+        assert!(
+            err.contains("did not acknowledge the status key"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("hearth daemon stop && hearth daemon start"),
+            "must carry the supported remediation: {err}"
+        );
+
+        // A certified echo passes.
+        let mut certified = outcome_with_rows(vec![]);
+        certified.status_key = Some("memory_limit".to_string());
+        assert!(
+            verify_keyed_status_certified(
+                &DaemonResponse::PhpConfigReport(certified),
+                "memory_limit"
+            )
+            .is_ok()
+        );
+
+        // A daemon Error renders on its own truthful path.
+        let error_response = DaemonResponse::Error {
+            message: "boom".to_string(),
+        };
+        assert!(verify_keyed_status_certified(&error_response, "memory_limit").is_ok());
     }
 
     #[test]
@@ -1909,6 +2025,7 @@ mod tests {
                 },
             }],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
         };
         assert_eq!(render_php_config_report(&refused).2, ExitClass::Failure);
 
@@ -1923,6 +2040,7 @@ mod tests {
                 },
             }],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
         };
         assert_eq!(render_php_config_report(&failed).2, ExitClass::Failure);
 
@@ -1934,6 +2052,7 @@ mod tests {
             fpm: FpmRestartOutcome::Failed {
                 message: "boom".to_string(),
             },
+            status_key: None,
         };
         assert_eq!(render_php_config_report(&fpm_failed).2, ExitClass::Failure);
 
@@ -1946,6 +2065,7 @@ mod tests {
             },
             FpmRestartOutcome::Restarted,
             FpmRestartOutcome::NotAttempted,
+            FpmRestartOutcome::SkippedHerdOwned,
         ] {
             let ok = PhpConfigOutcome {
                 persisted: Some(true),
@@ -1955,6 +2075,7 @@ mod tests {
                     result: FileWriteResult::Written,
                 }],
                 fpm,
+                status_key: None,
             };
             assert_eq!(render_php_config_report(&ok).2, ExitClass::Success);
         }
@@ -2000,6 +2121,7 @@ mod tests {
                 },
             }],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
         };
         assert_eq!(
             print_response(DaemonResponse::PhpConfigReport(refused)),

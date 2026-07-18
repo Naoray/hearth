@@ -193,10 +193,22 @@ pub struct FileOutcome {
 #[serde(tag = "outcome")]
 pub enum FpmRestartOutcome {
     Restarted,
-    NotRegistered { herd_hint: bool },
-    LaunchBlocked { reason: String },
-    Failed { message: String },
+    NotRegistered {
+        herd_hint: bool,
+    },
+    LaunchBlocked {
+        reason: String,
+    },
+    Failed {
+        message: String,
+    },
     NotAttempted,
+    /// C2-1: a REGISTERED Hearth FPM whose restart was skipped because live
+    /// Herd owns PHP-FPM — the registration and any running process were
+    /// left untouched. Emitted only by post-round-2 daemons; a legacy CLI
+    /// that cannot parse it fails into the actionable version-mismatch
+    /// remediation instead of rendering a false state.
+    SkippedHerdOwned,
 }
 
 /// Full report for a V2 php-config action. `persisted` is `Some` only for
@@ -208,6 +220,14 @@ pub struct PhpConfigOutcome {
     pub rows: Vec<PhpTargetRow>,
     pub files: Vec<FileOutcome>,
     pub fpm: FpmRestartOutcome,
+    /// C2-2 capability echo: present iff the daemon UNDERSTOOD a keyed
+    /// Status request (it echoes the key it applied). A legacy daemon
+    /// deserializes the keyed request as keyless and cannot echo — clients
+    /// treat the missing echo on a keyed Status as an actionable version
+    /// mismatch. Absent on Set/Unset/Show/keyless-Status responses, so
+    /// legacy wire forms stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_key: Option<String>,
 }
 
 impl PhpConfigOutcome {
@@ -443,6 +463,49 @@ mod tests {
         assert_eq!(back, PhpConfigAction::Status { key: None });
     }
 
+    /// C2-2 cross-version wire shapes, using the EXACT serialized forms of
+    /// the pre-round-2 protocol:
+    /// - a legacy report (no `status_key`) parses with `status_key: None`
+    ///   — precisely what a new keyed client uses to detect the mismatch;
+    /// - a new report WITHOUT an echo serializes byte-compatible with the
+    ///   legacy shape (old clients parse it unchanged);
+    /// - a keyed echo round-trips for new client + new daemon.
+    #[test]
+    fn status_capability_echo_cross_version_wire_shapes() {
+        // Exact legacy response shape (head b899ff04 daemon): no status_key.
+        let legacy_response =
+            r#"{"persisted":null,"rows":[],"files":[],"fpm":{"outcome":"NotAttempted"}}"#;
+        let outcome: PhpConfigOutcome = serde_json::from_str(legacy_response).unwrap();
+        assert_eq!(
+            outcome.status_key, None,
+            "legacy daemon cannot certify a keyed Status"
+        );
+
+        // New daemon, keyless Status: serialized form contains no status_key
+        // field — an old client parses it exactly like its own shape.
+        let keyless = PhpConfigOutcome {
+            persisted: None,
+            rows: vec![],
+            files: vec![],
+            fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
+        };
+        let json = serde_json::to_string(&keyless).unwrap();
+        assert!(
+            !json.contains("status_key"),
+            "keyless responses stay legacy-byte-compatible: {json}"
+        );
+
+        // New daemon, keyed Status: the echo round-trips.
+        let keyed = PhpConfigOutcome {
+            status_key: Some("memory_limit".to_string()),
+            ..keyless
+        };
+        let json = serde_json::to_string(&keyed).unwrap();
+        let back: PhpConfigOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status_key.as_deref(), Some("memory_limit"));
+    }
+
     #[test]
     fn php_config_v2_request_round_trips_inside_daemon_request() {
         let request = DaemonRequest::PhpConfigV2 {
@@ -464,6 +527,7 @@ mod tests {
             FpmRestartOutcome::Restarted,
             FpmRestartOutcome::NotRegistered { herd_hint: true },
             FpmRestartOutcome::NotRegistered { herd_hint: false },
+            FpmRestartOutcome::SkippedHerdOwned,
             FpmRestartOutcome::LaunchBlocked {
                 reason: "missing fpm config — see todo #2343".to_string(),
             },
@@ -526,6 +590,7 @@ mod tests {
                     result: FileWriteResult::Written,
                 }],
                 fpm,
+                status_key: None,
             };
             let response = DaemonResponse::PhpConfigReport(outcome.clone());
             let json = serde_json::to_string(&response).unwrap();
@@ -566,6 +631,7 @@ mod tests {
             rows: vec![],
             files: vec![],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         let back: PhpConfigOutcome = serde_json::from_str(&json).unwrap();

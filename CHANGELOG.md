@@ -30,6 +30,20 @@ All notable changes to Hearth will be documented in this file.
 - `hearth php use` never touches PHP-FPM while Herd owns it: the switch
   persists the version and reconciles channels, then truthfully skips all
   FPM supervisor mutation (`php-fpm untouched (Herd manages PHP-FPM)`).
+- Every config mutation (CLI/daemon set/unset and the MCP config write)
+  shares one centralized FPM-restart policy: under live Herd the restart is
+  skipped with zero supervisor mutation — even for an already-registered
+  FPM — and reported truthfully (`SkippedHerdOwned` on the wire; a legacy
+  CLI that cannot parse the new outcome fails into the actionable
+  stop/start version-mismatch remediation instead of rendering a false
+  state).
+- A keyed `--status` is certified by the daemon echoing the applied key
+  (`status_key` in the report). Against an older daemon that silently
+  ignores the key, the keyed request now fails with the stop/start
+  remediation instead of printing a valueless table; keyless `--status`
+  stays fully compatible in both directions. Invalid `--status`/`--show`
+  keys are rejected client-side and daemon-side. The MCP
+  `hearth_php_config_status` tool accepts the same optional `key`.
 - Protocol-mismatch remediation now names only supported commands
   (`hearth daemon stop && hearth daemon start`); there is no
   `hearth daemon restart` command.

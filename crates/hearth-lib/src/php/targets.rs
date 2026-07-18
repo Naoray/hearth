@@ -522,6 +522,13 @@ pub fn discover_provider_targets(roots: &ProviderRoots) -> Vec<PhpTargetIdentity
             if !path.is_file() {
                 continue;
             }
+            // Discovery keeps Stage-B semantics deliberately: a symlinked
+            // layout path is still DISCOVERED so the write side can refuse
+            // it LOUDLY (verify/ensure reject symlink components as typed
+            // hard failures — silent skipping here would hide the forgery).
+            // Provider identity consumed for runtime annotation is
+            // canonical/root-bounded at its consumption point (C2-3,
+            // daemon `channel_applied_at_ms`).
             let binary = path.canonicalize().unwrap_or(path);
             ids.push(PhpTargetIdentity {
                 provider,

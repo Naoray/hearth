@@ -135,8 +135,26 @@ impl PhpConfigEngine {
                 self.mutate(scope, &key, Some(&value)).await
             }
             PhpConfigAction::Unset { scope, key } => self.mutate(scope, &key, None).await,
-            PhpConfigAction::Show { key } => self.observe(key.as_deref()).await,
-            PhpConfigAction::Status { key } => self.observe(key.as_deref()).await,
+            PhpConfigAction::Show { key } => {
+                // C2-4 defense in depth: a socket client's invalid key is a
+                // stable actionable error, never a silent valueless report.
+                if let Some(k) = &key {
+                    ini_guard::validate_key(k).map_err(|e| e.to_string())?;
+                }
+                self.observe(key.as_deref()).await
+            }
+            PhpConfigAction::Status { key } => {
+                if let Some(k) = &key {
+                    ini_guard::validate_key(k).map_err(|e| e.to_string())?;
+                }
+                let mut outcome = self.observe(key.as_deref()).await?;
+                // C2-2: certify keyed-Status capability by echoing the key
+                // this engine actually applied. A legacy daemon ignores the
+                // keyed field and cannot echo — clients treat the missing
+                // echo as a version mismatch.
+                outcome.status_key = key;
+                Ok(outcome)
+            }
             PhpConfigAction::Sync => self.sync_locked().await,
             PhpConfigAction::Unmanage => self.unmanage_locked(),
         }
@@ -238,6 +256,7 @@ impl PhpConfigEngine {
             rows,
             files,
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
         })
     }
 
@@ -260,6 +279,7 @@ impl PhpConfigEngine {
             rows,
             files: Vec::new(),
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
         })
     }
 
@@ -308,6 +328,7 @@ impl PhpConfigEngine {
             rows,
             files,
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
         })
     }
 
@@ -327,6 +348,7 @@ impl PhpConfigEngine {
             rows: Vec::new(),
             files,
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
         })
     }
 
@@ -705,16 +727,35 @@ impl PhpConfigEngine {
 /// Restart the supervised php-fpm only when it is actually registered.
 /// Unregistered/optional FPM is informational (`NotRegistered`/`LaunchBlocked`),
 /// never a command failure; a registered restart failure stays a hard `Failed`.
+///
+/// C2-1 (review 5650 r2): this is THE centralized FPM-restart policy for
+/// every config mutation entry point — CLI/daemon Set & Unset and the MCP
+/// config write all route here — so the Herd-coexistence decision cannot
+/// drift between surfaces. The ownership check runs FIRST, before any
+/// supervisor access: under live Herd, persistence/reconciliation have
+/// already happened safely, and the FPM supervisor state (registered or
+/// not, running or not) is left byte-for-byte untouched.
 pub async fn restart_fpm_conditionally(
     supervisor: &Arc<Mutex<ServiceSupervisor>>,
     engine: &PhpConfigEngine,
 ) -> FpmRestartOutcome {
+    if engine.herd_running() {
+        // Read-only registration peek — truthful wording either way, zero
+        // stop/start/register/remove.
+        let registered = supervisor
+            .lock()
+            .await
+            .status()
+            .contains_key(&ServiceKind::PhpFpm);
+        return if registered {
+            FpmRestartOutcome::SkippedHerdOwned
+        } else {
+            FpmRestartOutcome::NotRegistered { herd_hint: true }
+        };
+    }
     let mut sup = supervisor.lock().await;
     if !sup.status().contains_key(&ServiceKind::PhpFpm) {
         drop(sup);
-        if engine.herd_running() {
-            return FpmRestartOutcome::NotRegistered { herd_hint: true };
-        }
         if let Some(reason) = engine.fpm_launch_blocked_reason() {
             return FpmRestartOutcome::LaunchBlocked { reason };
         }
@@ -974,6 +1015,21 @@ mod tests {
     }
 
     fn fixture(herd: bool) -> Fixture {
+        fixture_with_probe(Arc::new(move || herd))
+    }
+
+    /// Flippable-ownership fixture (C2-1): the probe reads live state, so a
+    /// test can flip Herd ownership AFTER registering/starting FPM.
+    fn fixture_with_herd_flag() -> (Fixture, Arc<std::sync::atomic::AtomicBool>) {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_flag = Arc::clone(&flag);
+        let fx = fixture_with_probe(Arc::new(move || {
+            probe_flag.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+        (fx, flag)
+    }
+
+    fn fixture_with_probe(herd: HerdProbe) -> Fixture {
         // Canonicalized base — /var → /private/var on macOS would otherwise
         // break allowlist prefix checks.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -994,7 +1050,7 @@ mod tests {
             config_path.clone(),
             config_dir.clone(),
             roots,
-            Arc::new(move || herd),
+            herd,
             Duration::from_millis(50),
         ));
         Fixture {
@@ -1278,6 +1334,7 @@ mod tests {
             fpm: FpmRestartOutcome::LaunchBlocked {
                 reason: "missing fpm config — see todo #2343".to_string(),
             },
+            status_key: None,
         };
         assert!(
             require_reconciled(Ok(clean)).is_ok(),
@@ -1294,6 +1351,7 @@ mod tests {
                 },
             }],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
         };
         let err = require_reconciled(Ok(refused)).unwrap_err();
         assert!(err.contains("/chan/zz-hearth.ini"), "got: {err}");
@@ -1310,6 +1368,7 @@ mod tests {
                 },
             }],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
         };
         assert!(require_reconciled(Ok(failed)).is_err());
 
@@ -2118,5 +2177,123 @@ echo "Scan for additional .ini files in: {}"
             empty.lock().await.service(ServiceKind::PhpFpm).is_none(),
             "switch under Herd must never register FPM"
         );
+    }
+
+    // ---- C2-2/C2-4 (review 5650 r2): keyed-Status certificate + validation ----
+
+    #[tokio::test]
+    async fn status_certifies_applied_key_and_rejects_invalid_keys() {
+        let fx = fixture(false);
+
+        // Keyed Status echoes the exact key it applied (the capability
+        // certificate a legacy daemon can never produce).
+        let keyed = fx
+            .engine
+            .apply(PhpConfigAction::Status {
+                key: Some("memory_limit".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(keyed.status_key.as_deref(), Some("memory_limit"));
+
+        // Keyless Status carries no echo (legacy-identical wire form).
+        let keyless = fx
+            .engine
+            .apply(PhpConfigAction::Status { key: None })
+            .await
+            .unwrap();
+        assert_eq!(keyless.status_key, None);
+
+        // Invalid keys over the socket are stable actionable errors — never
+        // a silent valueless report (C2-4 defense in depth), for Status AND
+        // Show.
+        for bad in ["bad key", "1leading", "inject\")); system(\"id"] {
+            let err = fx
+                .engine
+                .apply(PhpConfigAction::Status {
+                    key: Some(bad.to_string()),
+                })
+                .await
+                .unwrap_err();
+            assert!(!err.is_empty(), "invalid status key must error");
+            let err = fx
+                .engine
+                .apply(PhpConfigAction::Show {
+                    key: Some(bad.to_string()),
+                })
+                .await
+                .unwrap_err();
+            assert!(!err.is_empty(), "invalid show key must error");
+        }
+    }
+
+    // ---- C2-1 (review 5650 r2): mutation restart policy under live Herd ----
+
+    /// Ownership flips false→true AFTER a Hearth FPM is registered and
+    /// running: the centralized restart policy must leave the supervisor
+    /// state logically untouched — no stop, start, restart, register, or
+    /// remove — and report the truthful skip. Fails at head 08b7232 (the
+    /// registered branch restarted unconditionally).
+    #[tokio::test]
+    async fn config_mutation_skips_registered_running_fpm_after_herd_becomes_live() {
+        use crate::service::supervisor::ManagedService;
+        use std::sync::atomic::Ordering;
+
+        let (fx, herd_live) = fixture_with_herd_flag();
+        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        {
+            let mut sup = supervisor.lock().await;
+            sup.register(ManagedService::new(
+                ServiceKind::PhpFpm,
+                "/bin/sleep".to_string(),
+                vec!["30".to_string()],
+            ));
+            sup.start_service(ServiceKind::PhpFpm).unwrap();
+        }
+        let started_before = supervisor
+            .lock()
+            .await
+            .service(ServiceKind::PhpFpm)
+            .unwrap()
+            .started_at()
+            .expect("running");
+
+        // Herd becomes live AFTER registration.
+        herd_live.store(true, Ordering::SeqCst);
+
+        // Persistence still succeeds…
+        let outcome = fx
+            .engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.persisted, Some(true));
+
+        // …and the centralized restart policy skips with ZERO mutation.
+        let fpm = restart_fpm_conditionally(&supervisor, &fx.engine).await;
+        assert_eq!(fpm, FpmRestartOutcome::SkippedHerdOwned);
+        {
+            let sup = supervisor.lock().await;
+            let svc = sup.service(ServiceKind::PhpFpm).expect("still registered");
+            assert!(
+                matches!(svc.state, crate::service::ServiceState::Running { .. }),
+                "still running: {:?}",
+                svc.state
+            );
+            assert_eq!(
+                svc.started_at(),
+                Some(started_before),
+                "same spawn — no stop/start happened"
+            );
+        }
+
+        // Unregistered under Herd keeps the round-one truthful wording.
+        {
+            let mut sup = supervisor.lock().await;
+            sup.stop_service(ServiceKind::PhpFpm).unwrap();
+            sup.remove_service(ServiceKind::PhpFpm);
+        }
+        let fpm = restart_fpm_conditionally(&supervisor, &fx.engine).await;
+        assert_eq!(fpm, FpmRestartOutcome::NotRegistered { herd_hint: true });
     }
 }

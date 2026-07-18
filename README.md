@@ -164,6 +164,9 @@ error.
 files, then restart the supervised php-fpm only when it is actually
 registered. An unregistered or launch-blocked FPM is reported informationally
 and never fails the command; a failed restart of a registered FPM does.
+While Herd owns PHP-FPM, configuration changes still persist and reconcile,
+but Hearth never stops, starts, or restarts FPM — the output states that the
+restart was skipped because Herd owns PHP-FPM.
 When the running FPM predates the newest materialized config, status shows a
 truthful `pending restart` marker.
 

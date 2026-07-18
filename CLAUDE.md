@@ -95,7 +95,7 @@ For IDEs that only support stdio transport, use the bridge: `hearth mcp` (reads 
 | `hearth_site_unlink` | Unlink a site |
 | `hearth_service_restart` | Restart one or all services |
 | `hearth_php_config` | Set a PHP INI value (active version, `global`, or explicit `version` scope) via the shared engine; conditional FPM restart |
-| `hearth_php_config_status` | Per-target PHP config coverage table (managed/UNMANAGED/LAUNCH-BLOCKED) |
+| `hearth_php_config_status` | Per-target PHP config coverage table (managed/UNMANAGED/LAUNCH-BLOCKED); optional `key` adds configured + launch-probed values |
 | `hearth_db_start` | Start a DB engine (postgres/redis/mysql) |
 | `hearth_db_stop` | Stop a DB engine |
 | `hearth_db_status` | Per-engine status with port/data_dir/conflict info |
