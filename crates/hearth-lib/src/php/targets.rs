@@ -224,7 +224,7 @@ pub async fn probe_scan_dirs(binary: &Path, sapi: PhpSapi, timeout: Duration) ->
             .push("normal probe: HOME missing from daemon environment".to_string());
     }
     match run_probe(normal, timeout).await {
-        Ok(stdout) => info.normal_scan_dir = parse_scan_dir(&stdout),
+        Ok((_status, stdout)) => info.normal_scan_dir = parse_scan_dir(&stdout),
         Err(e) => info.failures.push(format!("normal probe: {e}")),
     }
 
@@ -232,14 +232,24 @@ pub async fn probe_scan_dirs(binary: &Path, sapi: PhpSapi, timeout: Duration) ->
     let mut sanitized = tokio::process::Command::new(binary);
     sanitized.arg(arg).env_clear().env("PATH", "/usr/bin:/bin");
     match run_probe(sanitized, timeout).await {
-        Ok(stdout) => info.sanitized_scan_dir = parse_scan_dir(&stdout),
+        Ok((_status, stdout)) => info.sanitized_scan_dir = parse_scan_dir(&stdout),
         Err(e) => info.failures.push(format!("sanitized probe: {e}")),
     }
 
     // Env-honor canary (normal env): Herd-patched binaries ignore
-    // PHP_INI_SCAN_DIR whenever HOME is set; env credit requires proof.
+    // PHP_INI_SCAN_DIR whenever HOME is set; env credit requires FUNCTIONAL
+    // proof — the marker ini must appear in `Additional .ini files parsed`,
+    // never just an echoed scan-dir path.
     match probe_env_honor(binary, arg, timeout).await {
-        Ok(honored) => info.env_honored = honored,
+        Ok(true) => info.env_honored = true,
+        Ok(false) => {
+            info.env_honored = false;
+            info.failures.push(
+                "canary: marker ini absent from 'Additional .ini files parsed' — \
+                 binary does not honor PHP_INI_SCAN_DIR in this context (no env credit)"
+                    .to_string(),
+            );
+        }
         Err(e) => {
             info.env_honored = false;
             info.failures.push(format!("canary probe: {e}"));
@@ -269,11 +279,55 @@ async fn probe_env_honor(binary: &Path, arg: &str, timeout: Duration) -> Result<
     let result = run_probe(cmd, timeout).await;
     let _ = std::fs::remove_dir_all(&canary_dir);
 
-    let stdout = result?;
-    Ok(stdout.contains(&canary_dir.display().to_string()))
+    let (status, stdout) = result?;
+    if !status.success() {
+        return Err(format!("canary probe exited nonzero ({status})"));
+    }
+    Ok(parse_parsed_ini_files(&stdout).iter().any(|p| p == &marker))
 }
 
-async fn run_probe(mut cmd: tokio::process::Command, timeout: Duration) -> Result<String, String> {
+/// Parse the `Additional .ini files parsed` list from `--ini`/`-i` output.
+/// Handles the `:`/`=>` field separators, multi-line wrapping with trailing
+/// commas, double-quoted paths (PHP 8.5), and `(none)`.
+fn parse_parsed_ini_files(stdout: &str) -> Vec<PathBuf> {
+    const FIELD: &str = "Additional .ini files parsed";
+    let mut files = Vec::new();
+    let mut lines = stdout.lines();
+    while let Some(line) = lines.next() {
+        let Some(idx) = line.find(FIELD) else {
+            continue;
+        };
+        let first = line[idx + FIELD.len()..]
+            .trim_start_matches([':', '=', '>'])
+            .trim();
+        let mut chunks = vec![first.to_string()];
+        // Continuation lines: wrapped list entries are bare or quoted
+        // absolute paths, one per line, with trailing commas.
+        for cont in lines.by_ref() {
+            let trimmed = cont.trim();
+            if trimmed.is_empty() || !(trimmed.starts_with('/') || trimmed.starts_with('"')) {
+                break;
+            }
+            chunks.push(trimmed.to_string());
+        }
+        for chunk in chunks {
+            for part in chunk.split(',') {
+                let path = part.trim().trim_matches('"').trim();
+                if path.is_empty() || path == "(none)" {
+                    continue;
+                }
+                files.push(PathBuf::from(path));
+            }
+        }
+        break;
+    }
+    files
+}
+
+async fn run_probe(
+    mut cmd: tokio::process::Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String), String> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -283,7 +337,10 @@ async fn run_probe(mut cmd: tokio::process::Command, timeout: Duration) -> Resul
         .await
         .map_err(|_| format!("timed out after {timeout:?}"))?
         .map_err(|e| format!("wait failed: {e}"))?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok((
+        output.status,
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    ))
 }
 
 /// Parse the scan-dir line from `--ini` (CLI) or `-i` (FPM) output.
@@ -685,6 +742,100 @@ echo "Scan this dir for additional .ini files => {dir}"
         );
         let probe = probe_scan_dirs(&stock, PhpSapi::Cli, PROBE_TIMEOUT).await;
         assert!(probe.env_honored, "stock fake honors the env var");
+    }
+
+    #[tokio::test]
+    async fn env_honor_canary_rejects_echo_only_binary() {
+        // Echoes the requested scan dir back but reports that NO additional
+        // ini files were parsed — functional loading did not happen, so no
+        // env credit may be granted.
+        let (_tmp, base) = canon_tmp();
+        let normal = base.join("normal conf.d");
+        let script = format!(
+            r#"#!/bin/sh
+if [ -n "$PHP_INI_SCAN_DIR" ]; then
+    echo "Scan for additional .ini files in: $PHP_INI_SCAN_DIR"
+    echo "Additional .ini files parsed:      (none)"
+else
+    echo "Scan for additional .ini files in: {normal}"
+fi
+"#,
+            normal = normal.display()
+        );
+        let php = write_fake_php(&base.join("bin"), "php", &script);
+
+        let probe = probe_scan_dirs(&php, PhpSapi::Cli, PROBE_TIMEOUT).await;
+        assert!(
+            !probe.env_honored,
+            "an echoed scan dir without the marker in the parsed list is not proof"
+        );
+        assert!(
+            probe.failures.iter().any(|f| f.contains("parsed")),
+            "degradation reason must explain the missing parsed marker: {:?}",
+            probe.failures
+        );
+    }
+
+    #[tokio::test]
+    async fn env_honor_canary_accepts_marker_in_wrapped_quoted_list() {
+        // Realistic `--ini` output wraps the parsed list across lines with
+        // trailing commas; PHP 8.5 quotes paths. The exact marker path in
+        // that list must earn credit.
+        let (_tmp, base) = canon_tmp();
+        let normal = base.join("normal conf.d");
+        let script = format!(
+            r#"#!/bin/sh
+if [ -n "$PHP_INI_SCAN_DIR" ]; then
+    parsed="${{PHP_INI_SCAN_DIR#:}}"
+    echo "Scan for additional .ini files in: $PHP_INI_SCAN_DIR"
+    echo "Additional .ini files parsed:      /opt/fake/conf.d/10-first.ini,"
+    echo "\"$parsed/hearth-canary.ini\","
+    echo "/opt/fake/conf.d/zz-last.ini"
+else
+    echo "Scan for additional .ini files in: {normal}"
+fi
+"#,
+            normal = normal.display()
+        );
+        let php = write_fake_php(&base.join("bin"), "php", &script);
+
+        let probe = probe_scan_dirs(&php, PhpSapi::Cli, PROBE_TIMEOUT).await;
+        assert!(
+            probe.env_honored,
+            "exact marker path in the wrapped/quoted parsed list must earn credit: {:?}",
+            probe.failures
+        );
+    }
+
+    #[tokio::test]
+    async fn env_honor_canary_rejects_nonzero_exit() {
+        // Output looks perfect but the probe exits nonzero — no credit.
+        let (_tmp, base) = canon_tmp();
+        let normal = base.join("normal conf.d");
+        let script = format!(
+            r#"#!/bin/sh
+if [ -n "$PHP_INI_SCAN_DIR" ]; then
+    parsed="${{PHP_INI_SCAN_DIR#:}}"
+    echo "Scan for additional .ini files in: $PHP_INI_SCAN_DIR"
+    echo "Additional .ini files parsed:      $parsed/hearth-canary.ini"
+    exit 3
+fi
+echo "Scan for additional .ini files in: {normal}"
+"#,
+            normal = normal.display()
+        );
+        let php = write_fake_php(&base.join("bin"), "php", &script);
+
+        let probe = probe_scan_dirs(&php, PhpSapi::Cli, PROBE_TIMEOUT).await;
+        assert!(
+            !probe.env_honored,
+            "nonzero canary exit must not earn credit"
+        );
+        assert!(
+            probe.failures.iter().any(|f| f.contains("exit")),
+            "failure must mention the nonzero exit: {:?}",
+            probe.failures
+        );
     }
 
     // ---- discovery ----
