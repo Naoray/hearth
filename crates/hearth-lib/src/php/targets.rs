@@ -205,9 +205,39 @@ impl ProviderRoots {
         let home = canonical_allowed_root("home", &home).map_err(|e| {
             format!("{e} — refusing to construct a production write allowlist (fail closed)")
         })?;
-        let hearth = crate::config_dir();
-        let hearth_allowed = canonical_allowed_root_allowing_missing("hearth config", &hearth)?;
-        let mut allowed_write_roots = vec![hearth_allowed, home.clone()];
+        // B5-2 locked root model: production Hearth config authority is the
+        // FIXED HOME-derived default — never an environment-selected path.
+        let default_hearth = home.join("Library/Application Support/hearth");
+        let hearth = validated_root_under("hearth config", &home, &default_hearth, true, true)?;
+        // A present HEARTH_CONFIG_DIR without typed isolated mode may never
+        // select another production authority root: it must validate to
+        // exactly the fixed default.
+        if let Some(v) = std::env::var_os("HEARTH_CONFIG_DIR") {
+            if v.is_empty() {
+                return Err("HEARTH_CONFIG_DIR is set but empty — unset it, or use \
+                     HEARTH_ISOLATED_ROOT for isolated runtimes"
+                    .to_string());
+            }
+            let override_path = PathBuf::from(v);
+            let normalized =
+                validated_root_under("HEARTH_CONFIG_DIR", &home, &override_path, true, true)
+                    .map_err(|e| {
+                        format!(
+                            "{e} — production accepts HEARTH_CONFIG_DIR only when it is exactly \
+                     the default config dir; use HEARTH_ISOLATED_ROOT for isolated runtimes"
+                        )
+                    })?;
+            if normalized != hearth {
+                return Err(format!(
+                    "HEARTH_CONFIG_DIR {} does not match the fixed production config dir \
+                     {} — an environment override can never select another production \
+                     write authority; use HEARTH_ISOLATED_ROOT for isolated runtimes",
+                    override_path.display(),
+                    hearth.display()
+                ));
+            }
+        }
+        let mut allowed_write_roots = vec![hearth.clone(), home.clone()];
         // Homebrew authority only when the canonical /opt/homebrew scope
         // actually exists; its absence removes authority, never widens it.
         if let Ok(brew) = canonical_allowed_root("homebrew", Path::new("/opt/homebrew")) {
@@ -223,57 +253,24 @@ impl ProviderRoots {
         })
     }
 
-    /// Explicit typed isolated-runtime constructor (tests/smoke). Every root
-    /// must be non-empty, absolute, outside the privileged denylist, and
-    /// contained beneath `runtime_root`; write authority is exactly
-    /// `runtime_root` and nothing else. Invalid inputs fail with actionable
-    /// errors — never a silent fallback.
+    /// Explicit typed isolated-runtime constructor (tests/smoke). The runtime
+    /// root must canonicalize to an existing directory that is neither `/`
+    /// nor denylisted; every provider/config root is validated through
+    /// [`validated_root_under`] against that exact canonical boundary and
+    /// stored ONLY in its validated normalized form (B5-3: no raw input
+    /// retention, no traversal components, no `canonicalize().unwrap_or`).
+    /// Write authority is exactly `runtime_root` and nothing else.
     pub fn isolated(
         runtime_root: &Path,
         hearth: PathBuf,
         herd: PathBuf,
         homebrew: PathBuf,
     ) -> Result<Self, String> {
-        // B4-2: the test-only constructor keeps the FULL invariant — the
-        // runtime root must canonicalize to an existing directory that is
-        // neither `/` (nor an alias of it) nor denylisted.
         let canonical_root = canonical_allowed_root("isolated runtime", runtime_root)?;
-        for (name, dir) in [
-            ("hearth", &hearth),
-            ("herd", &herd),
-            ("homebrew", &homebrew),
-        ] {
-            if dir.as_os_str().is_empty() || !dir.is_absolute() {
-                return Err(format!(
-                    "isolated {name} root must be a non-empty absolute path, got {}",
-                    dir.display()
-                ));
-            }
-            // Containment check on the canonical form of the deepest
-            // existing ancestor (roots may not exist yet).
-            let mut probe = dir.clone();
-            while !probe.exists() {
-                probe = match probe.parent() {
-                    Some(p) => p.to_path_buf(),
-                    None => break,
-                };
-            }
-            let canonical = probe.canonicalize().unwrap_or(probe);
-            if !canonical.starts_with(&canonical_root) {
-                return Err(format!(
-                    "isolated {name} root {} is not contained beneath the isolated \
-                     runtime root {}",
-                    dir.display(),
-                    canonical_root.display()
-                ));
-            }
-            if canonical.starts_with(PRIVILEGED_PREFIX) {
-                return Err(format!(
-                    "isolated {name} root {} is under {PRIVILEGED_PREFIX}",
-                    dir.display()
-                ));
-            }
-        }
+        let hearth = validated_root_under("isolated hearth", &canonical_root, &hearth, true, true)?;
+        let herd = validated_root_under("isolated herd", &canonical_root, &herd, true, true)?;
+        let homebrew =
+            validated_root_under("isolated homebrew", &canonical_root, &homebrew, true, true)?;
         Ok(Self {
             hearth,
             herd,
@@ -337,30 +334,113 @@ fn canonical_allowed_root(name: &str, path: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-/// Same invariant for a root that may not exist yet (the Hearth config dir
-/// on a first run): the deepest EXISTING ancestor must itself satisfy
-/// [`canonical_allowed_root`], and the stored authority is that validated
-/// canonical ancestor joined with the literal remainder — no later
-/// authority-expanding canonicalization happens.
-fn canonical_allowed_root_allowing_missing(name: &str, path: &Path) -> Result<PathBuf, String> {
-    if path.as_os_str().is_empty() || !path.is_absolute() {
+/// Round-5 (review 5594 B5-1/B5-3): THE boundary-aware constructor for every
+/// authority root that may not exist yet. The approved `boundary` is
+/// canonical-validated first; the candidate must be absolute and composed of
+/// nothing but normal components after the leading root — `..`, `.`, embedded
+/// roots, and platform prefixes can never form write authority. An existing
+/// candidate must canonicalize inside the boundary; a missing candidate is
+/// rebuilt from its canonicalized deepest EXISTING ancestor plus the
+/// validated normal-component suffix, and the rebuilt path is re-proven
+/// inside the boundary. Canonicalization failures are hard errors — never
+/// `unwrap_or(raw)` — and only the validated normalized form is returned.
+fn validated_root_under(
+    name: &str,
+    boundary: &Path,
+    candidate: &Path,
+    allow_missing: bool,
+    strict_child: bool,
+) -> Result<PathBuf, String> {
+    let boundary = canonical_allowed_root(&format!("{name} boundary"), boundary)?;
+    if candidate.as_os_str().is_empty() || !candidate.is_absolute() {
         return Err(format!(
             "{name} root must be a non-empty absolute path, got {}",
-            path.display()
+            candidate.display()
         ));
     }
-    let mut probe = path.to_path_buf();
-    while !probe.exists() {
-        probe = probe
-            .parent()
-            .ok_or_else(|| format!("{name} root {} has no existing ancestor", path.display()))?
-            .to_path_buf();
+    // Component inspection happens BEFORE any ancestor walk or filesystem
+    // access: the platform root is allowed only as the leading component.
+    for (i, comp) in candidate.components().enumerate() {
+        match comp {
+            std::path::Component::RootDir if i == 0 => {}
+            std::path::Component::Normal(_) => {}
+            other => {
+                return Err(format!(
+                    "{name} root {} contains a non-normal path component ({other:?}) — \
+                     traversal, prefix, and embedded-root components can never form \
+                     write authority",
+                    candidate.display()
+                ));
+            }
+        }
     }
-    let canonical_ancestor = canonical_allowed_root(name, &probe)?;
-    let remainder = path
-        .strip_prefix(&probe)
-        .map_err(|_| format!("{name} root {} escapes its ancestor", path.display()))?;
-    Ok(canonical_ancestor.join(remainder))
+    let validated = if candidate.exists() {
+        canonical_allowed_root(name, candidate)?
+    } else {
+        if !allow_missing {
+            return Err(format!(
+                "{name} root {} does not exist",
+                candidate.display()
+            ));
+        }
+        let mut probe = candidate.to_path_buf();
+        while !probe.exists() {
+            probe = probe
+                .parent()
+                .ok_or_else(|| {
+                    format!(
+                        "{name} root {} has no existing ancestor",
+                        candidate.display()
+                    )
+                })?
+                .to_path_buf();
+        }
+        let canonical_ancestor = canonical_allowed_root(name, &probe)?;
+        let remainder = candidate
+            .strip_prefix(&probe)
+            .map_err(|_| format!("{name} root {} escapes its ancestor", candidate.display()))?;
+        // Proven above: every candidate component after the leading root is
+        // Normal, so the missing suffix is too — re-checked defensively.
+        if remainder
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "{name} root {} has a non-normal missing-suffix component",
+                candidate.display()
+            ));
+        }
+        canonical_ancestor.join(remainder)
+    };
+    if !validated.starts_with(&boundary) {
+        return Err(format!(
+            "{name} root {} resolves to {} — not contained beneath the approved \
+             boundary {}",
+            candidate.display(),
+            validated.display(),
+            boundary.display()
+        ));
+    }
+    if strict_child && validated == boundary {
+        return Err(format!(
+            "{name} root {} must be strictly below the boundary {}",
+            candidate.display(),
+            boundary.display()
+        ));
+    }
+    if validated == Path::new("/") {
+        return Err(format!(
+            "{name} root {} resolves to `/` — `/` can never be write authority",
+            candidate.display()
+        ));
+    }
+    if validated.starts_with(PRIVILEGED_PREFIX) {
+        return Err(format!(
+            "{name} root {} resolves under {PRIVILEGED_PREFIX} — denylisted",
+            candidate.display()
+        ));
+    }
+    Ok(validated)
 }
 
 /// A directory that passed [`verify_user_channel`]. Callers re-check dev/inode
@@ -732,6 +812,31 @@ pub fn ensure_hearth_channel_dir(
             "{} is under {PRIVILEGED_PREFIX} — never written by Hearth",
             dir.display()
         )));
+    }
+    // B5-1: the requested dir must be the Hearth root plus NORMAL components
+    // only — `..`/`.`/embedded roots are rejected BEFORE any ancestor walk
+    // or `create_dir_all`, which would otherwise resolve traversal
+    // components during creation and mutate outside the root.
+    match dir.strip_prefix(hearth_root) {
+        Ok(suffix) => {
+            if suffix
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(reject(format!(
+                    "{} contains a non-normal path component below the Hearth root — \
+                     traversal can never name a channel dir",
+                    dir.display()
+                )));
+            }
+        }
+        Err(_) => {
+            return Err(reject(format!(
+                "{} is outside the Hearth root {}",
+                dir.display(),
+                hearth_root.display()
+            )));
+        }
     }
 
     // Deepest existing ancestor, with every component from the Hearth root
@@ -1725,5 +1830,180 @@ echo "Scan for additional .ini files in: {normal}"
             ensure_hearth_channel_dir(&hearth_root, &ancestor.join("8.4/conf.d")).unwrap_err();
         assert!(err.reason.contains("group/other-writable"), "got: {err}");
         assert!(!ancestor.join("8.4").exists());
+    }
+
+    #[test]
+    fn missing_suffix_traversal_never_forms_isolated_authority() {
+        // B5-1/B5-3: a candidate root carrying `..` (missing or partially
+        // existing) must be rejected by the constructor — never stored raw,
+        // never lexically escaping, zero partial creation.
+        let (_tmp, base) = canon_tmp();
+        let rt = base.join("rt");
+        std::fs::create_dir_all(rt.join("a")).unwrap();
+
+        for evil in [
+            rt.join("missing/../../outside"),
+            rt.join("missing/../../../outside"),
+            rt.join("a/../../outside"),
+            rt.join("missing/.."),
+        ] {
+            match ProviderRoots::isolated(&rt, evil.clone(), rt.join("herd"), rt.join("homebrew")) {
+                Err(e) => assert!(e.contains("component"), "typed rejection, got: {e}"),
+                Ok(r) => panic!(
+                    "traversal-bearing hearth root {} accepted, stored as {}",
+                    evil.display(),
+                    r.hearth.display()
+                ),
+            }
+            assert!(!base.join("outside").exists(), "zero partial creation");
+            assert!(!rt.join("missing").exists(), "zero partial creation");
+        }
+    }
+
+    #[test]
+    fn isolated_roots_store_validated_normalized_paths_only() {
+        // B5-3: stored provider/config roots are validated normalized forms —
+        // no raw input retention, no traversal components, strict children of
+        // the canonical isolated boundary.
+        let (_tmp, base) = canon_tmp();
+        let rt = base.join("rt");
+        std::fs::create_dir_all(&rt).unwrap();
+        let roots = ProviderRoots::isolated(
+            &rt,
+            rt.join("hearth cfg"),
+            rt.join("herd"),
+            rt.join("homebrew"),
+        )
+        .unwrap();
+        for stored in [&roots.hearth, &roots.herd, &roots.homebrew] {
+            assert!(stored.starts_with(&rt), "contained: {}", stored.display());
+            assert!(
+                stored.components().all(|c| !matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )),
+                "normalized: {}",
+                stored.display()
+            );
+        }
+        assert_eq!(roots.hearth, rt.join("hearth cfg"));
+
+        // The runtime root itself may never double as a provider root.
+        let err = ProviderRoots::isolated(&rt, rt.clone(), rt.join("herd"), rt.join("homebrew"))
+            .unwrap_err();
+        assert!(err.contains("strictly below"), "got: {err}");
+    }
+
+    #[test]
+    fn symlink_ancestor_escape_is_rejected_for_missing_isolated_roots() {
+        // B5-1: a missing root whose deepest existing ancestor is a symlink
+        // out of the boundary must be rejected at construction.
+        let (_tmp, base) = canon_tmp();
+        let rt = base.join("rt");
+        std::fs::create_dir_all(&rt).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, rt.join("link")).unwrap();
+        let err = ProviderRoots::isolated(
+            &rt,
+            rt.join("link/hearth"),
+            rt.join("herd"),
+            rt.join("homebrew"),
+        )
+        .unwrap_err();
+        assert!(err.contains("not contained"), "got: {err}");
+    }
+
+    #[test]
+    fn non_directory_or_missing_isolated_runtime_root_is_rejected() {
+        let (_tmp, base) = canon_tmp();
+        let file = base.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(
+            ProviderRoots::isolated(&file, file.join("h"), file.join("he"), file.join("hb"))
+                .is_err()
+        );
+        let missing = base.join("nope");
+        assert!(
+            ProviderRoots::isolated(
+                &missing,
+                missing.join("h"),
+                missing.join("he"),
+                missing.join("hb")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn production_config_override_cannot_enlarge_authority() {
+        // B5-2 locked root model: production Hearth config authority is the
+        // fixed HOME-derived default. A present HEARTH_CONFIG_DIR without
+        // typed isolated mode may never select another authority root.
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+
+        let (_tmp, base) = canon_tmp();
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let fixed_default = home.join("Library/Application Support/hearth");
+
+        // Absolute override outside HOME entirely.
+        let outside = base.join("evil");
+        std::fs::create_dir_all(&outside).unwrap();
+        guard.set("HEARTH_CONFIG_DIR", &outside);
+        match ProviderRoots::detect_with_home(Some(home.clone())) {
+            Err(e) => assert!(e.contains("HEARTH_CONFIG_DIR"), "typed error, got: {e}"),
+            Ok(r) => panic!(
+                "override outside HOME accepted into authority: {:?}",
+                r.allowed_prefixes()
+            ),
+        }
+
+        // Alternate root elsewhere under HOME.
+        let elsewhere = home.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        guard.set("HEARTH_CONFIG_DIR", &elsewhere);
+        assert!(
+            ProviderRoots::detect_with_home(Some(home.clone())).is_err(),
+            "alternate config root under HOME must be rejected"
+        );
+
+        // `..`-bearing override.
+        guard.set("HEARTH_CONFIG_DIR", home.join("Library/../evil2"));
+        assert!(ProviderRoots::detect_with_home(Some(home.clone())).is_err());
+
+        // Exact fixed default (missing is fine) — accepted and authoritative.
+        guard.set("HEARTH_CONFIG_DIR", &fixed_default);
+        let roots = ProviderRoots::detect_with_home(Some(home.clone())).unwrap();
+        assert_eq!(roots.hearth, fixed_default);
+        assert!(roots.allowed_prefixes().contains(&fixed_default));
+
+        // Absent override — same fixed default, same authority.
+        guard.remove("HEARTH_CONFIG_DIR");
+        let roots = ProviderRoots::detect_with_home(Some(home)).unwrap();
+        assert_eq!(roots.hearth, fixed_default);
+        drop(guard);
+    }
+
+    #[test]
+    fn ensure_hearth_channel_dir_rejects_non_normal_components_zero_creation() {
+        // B5-1: traversal components in the requested channel dir are
+        // rejected BEFORE any filesystem mutation.
+        let (_tmp, base) = canon_tmp();
+        let hearth_root = base.join("hearth");
+        std::fs::create_dir_all(&hearth_root).unwrap();
+        let evil = hearth_root.join("php/../../escape/conf.d");
+        let err = ensure_hearth_channel_dir(&hearth_root, &evil).unwrap_err();
+        assert!(err.reason.contains("component"), "got: {err}");
+        assert!(!base.join("escape").exists(), "zero out-of-root creation");
+        assert!(!hearth_root.join("php").exists(), "zero partial creation");
     }
 }

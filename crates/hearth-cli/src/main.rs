@@ -750,10 +750,13 @@ async fn run_php_exec(
 ) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
 
-    let config_dir = hearth_lib::validated_config_dir()
-        .map_err(|e| anyhow::anyhow!("runtime-path configuration invalid: {e}"))?;
+    // One validated runtime-mode/root snapshot per operation (B5-2/B5-4):
+    // config root and write authority come from the same construction.
+    let provider_roots = hearth_lib::php::targets::ProviderRoots::detect()
+        .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?;
+    let config_dir = provider_roots.hearth.clone();
     let config_path = config_dir.join("config.toml");
-    let config = hearth_lib::config::HearthConfig::load()?;
+    let config = hearth_lib::config::HearthConfig::load_from(&config_path)?;
     let version = version.unwrap_or_else(|| config.default_php.clone());
 
     // Reconcile first — same engine as the daemon; the journaled manifest
@@ -762,8 +765,7 @@ async fn run_php_exec(
         std::sync::Arc::new(tokio::sync::Mutex::new(config)),
         config_path,
         config_dir.clone(),
-        hearth_lib::php::targets::ProviderRoots::detect()
-            .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?,
+        provider_roots,
         std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
         std::time::Duration::from_secs(5),
     );
@@ -806,14 +808,19 @@ async fn run_install() -> anyhow::Result<()> {
 
     // 2. Create config directory
     println!("\n[2/3] Creating config directory...");
-    let config_dir = hearth_lib::validated_config_dir()
-        .map_err(|e| anyhow::anyhow!("runtime-path configuration invalid: {e}"))?;
+    // One validated runtime-mode/root snapshot for the whole install
+    // (B5-2/B5-4): config root and write authority come from the same
+    // construction; a root failure aborts before any directory creation.
+    let provider_roots = hearth_lib::php::targets::ProviderRoots::detect()
+        .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?;
+    let config_dir = provider_roots.hearth.clone();
+    let config_path = config_dir.join("config.toml");
     std::fs::create_dir_all(&config_dir)?;
     // Load-and-preserve: re-running `hearth install` must keep existing
-    // php_ini, added_packages, and port settings. `load()` returns defaults
-    // only when no config exists, and errors (rather than clobbering) on a
-    // corrupt file.
-    let mut config = hearth_lib::config::HearthConfig::load()?;
+    // php_ini, added_packages, and port settings. `load_from()` returns
+    // defaults only when no config exists, and errors (rather than
+    // clobbering) on a corrupt file.
+    let mut config = hearth_lib::config::HearthConfig::load_from(&config_path)?;
     // Resolve composer.phar up-front so `hearth add` can shell out via the site's PHP
     // (avoids the brew composer wrapper, which uses the system PHP — scratchpad 796 B3).
     config.composer_phar = hearth_lib::add::composer::resolve_composer_phar();
@@ -824,7 +831,7 @@ async fn run_install() -> anyhow::Result<()> {
             "  Warning: composer.phar not found on host. `hearth add` will probe at request time."
         );
     }
-    config.save()?;
+    config.save_to(&config_path)?;
     println!("  Config saved to {}", config_dir.display());
 
     // One-shot daemon-free php-config reconcile (plan 5560 §2.3 install hook):
@@ -832,12 +839,11 @@ async fn run_install() -> anyhow::Result<()> {
     // preserved php_ini settings.
     let engine = hearth_lib::php::engine::PhpConfigEngine::new(
         std::sync::Arc::new(tokio::sync::Mutex::new(
-            hearth_lib::config::HearthConfig::load()?,
+            hearth_lib::config::HearthConfig::load_from(&config_path)?,
         )),
-        config_dir.join("config.toml"),
+        config_path.clone(),
         config_dir.clone(),
-        hearth_lib::php::targets::ProviderRoots::detect()
-            .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?,
+        provider_roots,
         std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
         std::time::Duration::from_secs(5),
     );

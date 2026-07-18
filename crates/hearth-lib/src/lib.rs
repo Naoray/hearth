@@ -24,8 +24,15 @@ use std::path::PathBuf;
 /// variable overrides it explicitly and deterministically: the daemon, CLI,
 /// MCP server, socket path, run/log/data dirs, config.toml (and therefore
 /// every configurable port), `php exec`, and the smoke harness all derive
-/// their paths from this one function, so tests and smoke runs can isolate
-/// completely without touching real user state.
+/// their paths from this one function.
+///
+/// This is the RAW derivation seam only — it performs no validation. Every
+/// process entrypoint gates on [`validated_config_dir`] first (B5-2: one
+/// runtime-mode decision), so no entrypoint ever loads from a path that
+/// root construction would reject: in production a present override is
+/// accepted only when it is exactly the fixed HOME-derived default, and in
+/// typed isolated mode (`HEARTH_ISOLATED_ROOT`) it must validate beneath
+/// the isolated boundary.
 pub fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("HEARTH_CONFIG_DIR")
         && !dir.is_empty()
@@ -39,26 +46,15 @@ pub fn config_dir() -> PathBuf {
 
 /// Typed runtime-path loader for process entrypoints (daemon boot, CLI
 /// commands that construct an engine). Fails closed on an invalid override
-/// instead of silently falling back: an empty or relative
-/// `HEARTH_CONFIG_DIR` is a configuration error, never a default.
+/// instead of silently falling back.
+///
+/// B5-2: this is the SAME runtime-mode decision as
+/// [`php::targets::ProviderRoots::detect`] — the returned path is the
+/// validated Hearth config root from provider-root construction itself, so
+/// entrypoints and write-authority construction can never disagree about
+/// the config location or the runtime mode.
 pub fn validated_config_dir() -> Result<PathBuf, String> {
-    match std::env::var_os("HEARTH_CONFIG_DIR") {
-        None => Ok(config_dir()),
-        Some(dir) if dir.is_empty() => Err(
-            "HEARTH_CONFIG_DIR is set but empty — unset it or point it at an absolute directory"
-                .to_string(),
-        ),
-        Some(dir) => {
-            let path = PathBuf::from(dir);
-            if !path.is_absolute() {
-                return Err(format!(
-                    "HEARTH_CONFIG_DIR must be an absolute path, got {}",
-                    path.display()
-                ));
-            }
-            Ok(path)
-        }
-    }
+    php::targets::ProviderRoots::detect().map(|roots| roots.hearth.clone())
 }
 
 /// Default runtime directory for PID files and socket
@@ -84,24 +80,45 @@ mod tests {
     #[test]
     fn hearth_config_dir_env_overrides_every_derived_path() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let override_dir = tmp.path().join("isolated hearth");
+        let base = tmp.path().canonicalize().unwrap();
+        let override_dir = base.join("isolated hearth");
 
-        let guard = crate::test_env::EnvGuard::capture(["HEARTH_CONFIG_DIR"]);
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_CONFIG_DIR",
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+        ]);
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
         guard.set("HEARTH_CONFIG_DIR", &override_dir);
+
+        // Raw derivation seam: every derived path follows the override.
+        guard.remove("HEARTH_ISOLATED_ROOT");
         let injected_config = config_dir();
         let injected_socket = crate::socket::socket_path();
         let injected_run = run_dir();
         let injected_log = log_dir();
         let injected_data = data_dir();
-        let validated = validated_config_dir();
-        drop(guard);
-
         assert_eq!(injected_config, override_dir);
         assert_eq!(injected_socket, override_dir.join("hearth.sock"));
         assert_eq!(injected_run, override_dir.join("run"));
         assert_eq!(injected_log, override_dir.join("log"));
         assert_eq!(injected_data, override_dir.join("data"));
-        assert_eq!(validated.unwrap(), override_dir);
+
+        // B5-2: WITHOUT typed isolated mode, a non-default override is a
+        // typed entrypoint error — never an alternate production authority.
+        let production = validated_config_dir();
+        assert!(
+            production.unwrap_err().contains("HEARTH_CONFIG_DIR"),
+            "non-default production override must fail closed"
+        );
+
+        // WITH typed isolated mode the same override validates beneath the
+        // isolated boundary and is returned in normalized form.
+        guard.set("HEARTH_ISOLATED_ROOT", &base);
+        assert_eq!(validated_config_dir().unwrap(), override_dir);
+        drop(guard);
 
         // Without the override, none of the derived paths point into the
         // injected root (no silent fallback the other way either).
@@ -110,10 +127,19 @@ mod tests {
         assert!(default_config.ends_with("hearth"));
     }
 
-    /// Typed loader fails closed on invalid overrides (B2-6).
+    /// Typed loader fails closed on invalid overrides (B2-6), through the
+    /// SAME runtime-mode decision as provider-root construction (B5-2).
     #[test]
     fn validated_config_dir_rejects_empty_and_relative_overrides() {
-        let guard = crate::test_env::EnvGuard::capture(["HEARTH_CONFIG_DIR"]);
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_CONFIG_DIR",
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_HERD_ROOT");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
 
         guard.set("HEARTH_CONFIG_DIR", "");
         let empty = validated_config_dir();

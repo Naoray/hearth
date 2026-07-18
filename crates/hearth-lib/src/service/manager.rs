@@ -61,10 +61,17 @@ pub fn vendor_path_for(package: &str) -> String {
 /// reconciliation failure) skips every PHP process registration — FPM and
 /// Horizon/Reverb workers — so no PHP launches with unreconciled channel
 /// state; non-PHP services and status access stay available.
+///
+/// B5-4: `roots` is the caller's already-validated `ProviderRoots` snapshot
+/// (the same value the PHP engine holds). This function performs NO root
+/// detection of its own — a root-construction failure must propagate at the
+/// entrypoint before any PHP/FPM/worker registration, never degrade into a
+/// warning plus a partial service list.
 pub fn default_services(
     config: &HearthConfig,
     config_dir: &std::path::Path,
     php_launches_enabled: bool,
+    roots: &crate::php::targets::ProviderRoots,
 ) -> Vec<ManagedService> {
     let mut services = Vec::new();
 
@@ -180,19 +187,13 @@ pub fn default_services(
     // Supervised AddedPackage entries (Horizon, Reverb). Boot-time prune already ran
     // before this is called (see daemon main.rs), so every entry here has a vendor dir.
     if php_launches_enabled {
-        // detect() can fail closed on invalid override env; legacy version
-        // inference is then unavailable but explicit-version workers still
-        // get their env.
-        let roots = crate::php::targets::ProviderRoots::detect()
-            .map_err(|e| warn!(error = %e, "provider-root detection failed"))
-            .ok();
         for pkg in &config.added_packages {
             let kind = match pkg.package.as_str() {
                 "horizon" => ServiceKind::Horizon,
                 "reverb" => ServiceKind::Reverb,
                 _ => continue, // telescope/pulse are install-only
             };
-            services.push(worker_service(kind, pkg, config_dir, roots.as_ref()));
+            services.push(worker_service(kind, pkg, config_dir, roots));
         }
     } else if !config.added_packages.is_empty() {
         warn!("php launches disabled (hard php-config failure) — workers not registered");
@@ -243,7 +244,7 @@ pub fn worker_service(
     kind: ServiceKind,
     pkg: &AddedPackage,
     config_dir: &std::path::Path,
-    roots: Option<&crate::php::targets::ProviderRoots>,
+    roots: &crate::php::targets::ProviderRoots,
 ) -> ManagedService {
     let svc = ManagedService::with_cwd_and_site(
         kind,
@@ -255,7 +256,7 @@ pub fn worker_service(
     let version = pkg
         .php_version
         .clone()
-        .or_else(|| roots.and_then(|roots| infer_worker_version(&pkg.command, roots)));
+        .or_else(|| infer_worker_version(&pkg.command, roots));
     match version {
         Some(version) => svc.with_env(vec![crate::php::scan_dir_env(config_dir, &version)]),
         None => {
@@ -302,7 +303,7 @@ mod tests {
         std::fs::write(&bin_path, "fake").unwrap();
 
         let config = HearthConfig::default();
-        let services = default_services(&config, tmp.path(), true);
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(kinds.contains(&ServiceKind::Mailpit));
@@ -312,7 +313,7 @@ mod tests {
     fn default_services_excludes_mailpit_when_binary_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = HearthConfig::default();
-        let services = default_services(&config, tmp.path(), true);
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(!kinds.contains(&ServiceKind::Mailpit));
@@ -340,7 +341,7 @@ mod tests {
             postgres_port: free_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path(), true);
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(
             kinds.contains(&ServiceKind::Postgresql),
@@ -371,7 +372,7 @@ mod tests {
             mysql_port: free_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path(), true);
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(kinds.contains(&ServiceKind::Mysql), "got: {kinds:?}");
     }
@@ -388,7 +389,7 @@ mod tests {
             mysql_port: busy_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path(), true);
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         drop(listener);
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
@@ -408,7 +409,7 @@ mod tests {
             redis_port: free_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path(), true);
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(kinds.contains(&ServiceKind::Redis), "got: {kinds:?}");
     }
@@ -424,7 +425,7 @@ mod tests {
             redis_port: busy_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path(), true);
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         drop(listener);
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
@@ -444,7 +445,7 @@ mod tests {
             postgres_port: busy_port,
             ..HearthConfig::default()
         };
-        let services = default_services(&config, tmp.path(), true);
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         drop(listener);
 
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
@@ -520,7 +521,7 @@ mod tests {
             installed_at: chrono::Utc::now(),
         });
 
-        let services = default_services(&config, tmp.path(), true);
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         let horizon = services
             .iter()
             .find(|s| s.kind == ServiceKind::Horizon)
@@ -543,7 +544,7 @@ mod tests {
             installed_at: chrono::Utc::now(),
         });
 
-        let services = default_services(&config, tmp.path(), true);
+        let services = default_services(&config, tmp.path(), true, &test_roots(tmp.path()));
         assert!(services.iter().all(|s| s.kind != ServiceKind::Horizon));
         assert!(services.iter().all(|s| s.kind != ServiceKind::Reverb));
     }
@@ -570,7 +571,7 @@ mod tests {
             installed_at: chrono::Utc::now(),
         });
 
-        let services = default_services(&config, tmp.path(), false);
+        let services = default_services(&config, tmp.path(), false, &test_roots(tmp.path()));
         let kinds: Vec<ServiceKind> = services.iter().map(|s| s.kind).collect();
         assert!(!kinds.contains(&ServiceKind::PhpFpm), "got: {kinds:?}");
         assert!(!kinds.contains(&ServiceKind::Horizon), "got: {kinds:?}");
@@ -655,12 +656,8 @@ mod tests {
             php_version: Some("8.3".to_string()),
             installed_at: chrono::Utc::now(),
         };
-        let svc = worker_service(
-            ServiceKind::Horizon,
-            &pkg,
-            tmp.path(),
-            Some(&test_roots(tmp.path())),
-        );
+        let roots = test_roots(tmp.path());
+        let svc = worker_service(ServiceKind::Horizon, &pkg, tmp.path(), &roots);
         assert_eq!(
             svc.env(),
             &[(
@@ -692,7 +689,7 @@ mod tests {
             installed_at: chrono::Utc::now(),
         };
         // Canonical match → version inferred → env granted.
-        let svc = worker_service(ServiceKind::Horizon, &pkg, &base, Some(&roots));
+        let svc = worker_service(ServiceKind::Horizon, &pkg, &base, &roots);
         assert_eq!(
             svc.env(),
             &[(
@@ -703,10 +700,64 @@ mod tests {
 
         // No canonical match → unguaranteed: NO env, never a guess.
         pkg.command = base.join("somewhere-else/php").display().to_string();
-        let svc = worker_service(ServiceKind::Horizon, &pkg, &base, Some(&roots));
+        let svc = worker_service(ServiceKind::Horizon, &pkg, &base, &roots);
         assert!(
             svc.env().is_empty(),
             "unmatched legacy command must not get env credit"
         );
+    }
+
+    #[test]
+    fn root_failure_can_never_register_php_workers() {
+        // B5-4 (red reproduced live at 224621f: a lone HEARTH_HERD_ROOT made
+        // the internal detect() fail, and default_services still registered
+        // the Horizon worker behind a warning). Post-fix: default_services
+        // performs NO root detection of its own — the entrypoint's
+        // `ProviderRoots::detect()?` propagates the typed error BEFORE any
+        // registration, and service construction consumes only the passed
+        // validated snapshot, immune to poisoned root env.
+        let guard = crate::test_env::EnvGuard::capture([
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_CONFIG_DIR",
+        ]);
+        guard.remove("HEARTH_ISOLATED_ROOT");
+        guard.remove("HEARTH_CONFIG_DIR");
+        guard.remove("HEARTH_HOMEBREW_ROOT");
+        // A lone discovery override makes ProviderRoots::detect() fail closed.
+        guard.set("HEARTH_HERD_ROOT", "/tmp/lone-override");
+        assert!(
+            crate::php::targets::ProviderRoots::detect().is_err(),
+            "the entrypoint gate is a typed error — never a warning"
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = HearthConfig::default();
+        config.added_packages.push(AddedPackage {
+            package: "horizon".to_string(),
+            site_path: tmp.path().to_path_buf(),
+            site_name: "shopfront".to_string(),
+            command: "/php".to_string(),
+            args: vec!["artisan".to_string(), "horizon".to_string()],
+            php_version: Some("8.3".to_string()),
+            installed_at: chrono::Utc::now(),
+        });
+        // With an explicit validated snapshot the worker registers with its
+        // Belt-E env — proof no second (env-driven) detection remains.
+        let roots = test_roots(tmp.path());
+        let services = default_services(&config, tmp.path(), true, &roots);
+        let worker = services
+            .iter()
+            .find(|s| s.kind == crate::service::ServiceKind::Horizon)
+            .expect("explicit snapshot registers the worker regardless of ambient env");
+        assert_eq!(
+            worker.env(),
+            &[(
+                "PHP_INI_SCAN_DIR".to_string(),
+                format!(":{}", tmp.path().join("php/8.3/conf.d").display()),
+            )]
+        );
+        drop(guard);
     }
 }

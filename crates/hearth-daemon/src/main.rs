@@ -58,15 +58,21 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Hearth daemon starting...");
 
-    // Load config
-    let mut config = HearthConfig::load().context("Failed to load config")?;
+    // One validated runtime-mode/root snapshot for the whole boot (B5-2/
+    // B5-4): the mode decision, config root, and write authority all come
+    // from a single ProviderRoots construction. A root-construction failure
+    // aborts boot here — before any config load or service registration.
+    let provider_roots = ProviderRoots::detect()
+        .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?;
+    let config_dir = provider_roots.hearth.clone();
+    let config_path = config_dir.join("config.toml");
+
+    // Load config from the validated path.
+    let mut config = HearthConfig::load_from(&config_path).context("Failed to load config")?;
 
     // Ensure directories exist before any engine registration. DB engines
     // expect `run/` and `data/` to be present on first start; pre-creating
     // them once per daemon boot keeps the wrapper scripts simple.
-    let config_dir = hearth_lib::validated_config_dir()
-        .map_err(|e| anyhow::anyhow!("runtime-path configuration invalid: {e}"))?;
-    let config_path = config_dir.join("config.toml");
     std::fs::create_dir_all(hearth_lib::run_dir())?;
     std::fs::create_dir_all(hearth_lib::log_dir())?;
     std::fs::create_dir_all(hearth_lib::data_dir())?;
@@ -96,8 +102,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&config),
         config_path.clone(),
         config_dir.clone(),
-        ProviderRoots::detect()
-            .map_err(|e| anyhow::anyhow!("provider-root configuration invalid: {e}"))?,
+        provider_roots.clone(),
         Arc::new(|| hearth_lib::service::manager::is_herd_running()),
         std::time::Duration::from_secs(5),
     ));
@@ -117,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
     let mut supervisor = ServiceSupervisor::new();
     {
         let cfg = config.lock().await;
-        for svc in default_services(&cfg, &config_dir, php_launches_enabled) {
+        for svc in default_services(&cfg, &config_dir, php_launches_enabled, &provider_roots) {
             supervisor.register(svc);
         }
     }
@@ -655,7 +660,13 @@ async fn process_request(
                 default_php: default_php_clone,
                 ..HearthConfig::default()
             };
-            let config_dir = hearth_lib::config_dir();
+            // B5-2: derive from the boot-validated snapshot (config_path),
+            // never a second raw config_dir() read.
+            let config_dir = state
+                .config_path
+                .parent()
+                .expect("config.toml path always has a parent directory")
+                .to_path_buf();
             let ctx_resolution = {
                 let sm = state.site_manager.lock().await;
                 let explicit: Option<&std::path::Path> = if site_path.is_empty() {
@@ -787,7 +798,7 @@ async fn process_request(
                         kind,
                         &pkg,
                         &config_dir,
-                        Some(state.php_engine.provider_roots()),
+                        state.php_engine.provider_roots(),
                     );
                     sup.register(svc);
                     if let Err(e) = sup.start_service(kind) {
