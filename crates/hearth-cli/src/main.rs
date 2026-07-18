@@ -160,12 +160,34 @@ enum PhpCommands {
     },
     /// List installed PHP versions
     List,
-    /// Set a php.ini config value (e.g., `hearth php config memory_limit 512M`)
+    /// Manage PHP INI configuration (e.g., `hearth php config memory_limit 512M`,
+    /// `hearth php config --global memory_limit 1G`, `hearth php config --status`)
     Config {
         /// INI key (e.g., memory_limit, upload_max_filesize)
-        key: String,
+        key: Option<String>,
         /// Value to set
-        value: String,
+        value: Option<String>,
+        /// Target the global store applied to every PHP version
+        #[arg(long)]
+        global: bool,
+        /// Target one version's override table (e.g., --php 8.3)
+        #[arg(long)]
+        php: Option<String>,
+        /// Show configured (and materialized) values instead of setting
+        #[arg(long)]
+        show: bool,
+        /// Remove a directive from the selected scope
+        #[arg(long)]
+        unset: bool,
+        /// Per-target coverage/status table
+        #[arg(long)]
+        status: bool,
+        /// Force journal recovery + reconcile of channel files
+        #[arg(long)]
+        sync: bool,
+        /// Remove every Hearth-written channel file
+        #[arg(long)]
+        unmanage: bool,
     },
     /// Run a PHP command with Hearth's scan-dir env at the final launch
     /// boundary (e.g. `hearth php exec -- artisan test`). Covers launchers
@@ -242,11 +264,29 @@ async fn main() -> anyhow::Result<()> {
         Commands::Php { command } => match command {
             PhpCommands::Use { version } => DaemonRequest::PhpSwitch { version },
             PhpCommands::List => DaemonRequest::PhpList,
-            PhpCommands::Config { key, value } => DaemonRequest::PhpConfig {
-                version: "active".to_string(), // daemon resolves to current version
+            PhpCommands::Config {
                 key,
                 value,
-            },
+                global,
+                php,
+                show,
+                unset,
+                status,
+                sync,
+                unmanage,
+            } => {
+                // Client-side validation of the whole flag/action matrix
+                // BEFORE any daemon I/O.
+                match build_php_config_action(
+                    key, value, global, php, show, unset, status, sync, unmanage,
+                ) {
+                    Ok(action) => DaemonRequest::PhpConfigV2 { action },
+                    Err(msg) => {
+                        eprintln!("Error: {msg}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             PhpCommands::Exec { php, args } => {
                 return run_php_exec(php, args).await;
             }
@@ -296,9 +336,220 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let response = send_to_daemon(request).await?;
+    if let DaemonResponse::PhpConfigReport(outcome) = &response {
+        // Pure renderer decides text + exit class; only main applies the exit.
+        let (out, err, exit) = render_php_config_report(outcome);
+        print!("{out}");
+        eprint!("{err}");
+        if exit == ExitClass::Failure {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     print_response(response);
 
     Ok(())
+}
+
+/// Build the typed php-config action from the CLI flag matrix, or an
+/// actionable error. Exactly one action; `--global` ⊻ `--php`; scope flags
+/// only for Set/Unset/Show (plan 5560 §2.5).
+#[allow(clippy::too_many_arguments)]
+fn build_php_config_action(
+    key: Option<String>,
+    value: Option<String>,
+    global: bool,
+    php: Option<String>,
+    show: bool,
+    unset: bool,
+    status: bool,
+    sync: bool,
+    unmanage: bool,
+) -> Result<hearth_lib::socket::PhpConfigAction, String> {
+    use hearth_lib::socket::{PhpConfigAction, PhpScope};
+
+    let action_flags = [show, unset, status, sync, unmanage]
+        .iter()
+        .filter(|f| **f)
+        .count();
+    if action_flags > 1 {
+        return Err(
+            "pass at most one of --show, --unset, --status, --sync, --unmanage".to_string(),
+        );
+    }
+    if global && php.is_some() {
+        return Err("--global and --php are mutually exclusive".to_string());
+    }
+    let scope = if global {
+        PhpScope::Global
+    } else if let Some(version) = php.clone() {
+        PhpScope::Version { version }
+    } else {
+        PhpScope::Active
+    };
+
+    if status || sync || unmanage {
+        let name = if status {
+            "--status"
+        } else if sync {
+            "--sync"
+        } else {
+            "--unmanage"
+        };
+        if key.is_some() || value.is_some() {
+            return Err(format!("{name} takes no key or value"));
+        }
+        if global || php.is_some() {
+            return Err(format!("{name} takes no --global/--php scope"));
+        }
+        return Ok(if status {
+            PhpConfigAction::Status
+        } else if sync {
+            PhpConfigAction::Sync
+        } else {
+            PhpConfigAction::Unmanage
+        });
+    }
+
+    if show {
+        if value.is_some() {
+            return Err("--show takes an optional key but no value".to_string());
+        }
+        return Ok(PhpConfigAction::Show { key });
+    }
+
+    if unset {
+        if value.is_some() {
+            return Err("--unset removes a directive; it takes no value".to_string());
+        }
+        let key = key.ok_or_else(|| "--unset requires a key".to_string())?;
+        return Ok(PhpConfigAction::Unset { scope, key });
+    }
+
+    // Implicit Set: both key and value required.
+    match (key, value) {
+        (Some(key), Some(value)) => Ok(PhpConfigAction::Set { scope, key, value }),
+        _ => Err(
+            "provide <key> <value> to set, or one of --show/--status/--sync/--unmanage"
+                .to_string(),
+        ),
+    }
+}
+
+/// Exit classification for a php-config report. Nonzero iff persistence
+/// failed (arrives as a daemon Error), a channel file was Refused/Failed, or
+/// a REGISTERED php-fpm restart failed. NotRegistered / LaunchBlocked /
+/// unmanaged-only cells render loudly but exit 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitClass {
+    Success,
+    Failure,
+}
+
+/// Pure renderer: `(stdout, stderr, exit class)`. No process exit here.
+fn render_php_config_report(
+    outcome: &hearth_lib::socket::PhpConfigOutcome,
+) -> (String, String, ExitClass) {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let mut err = String::new();
+    let mut exit = ExitClass::Success;
+
+    if outcome.persisted == Some(true) {
+        out.push_str("Configuration persisted.\n");
+    }
+
+    for file in &outcome.files {
+        match &file.result {
+            FileWriteResult::Written => {
+                let _ = writeln!(out, "written   {}", file.path);
+            }
+            FileWriteResult::Unchanged => {
+                let _ = writeln!(out, "unchanged {}", file.path);
+            }
+            FileWriteResult::Deleted => {
+                let _ = writeln!(out, "deleted   {}", file.path);
+            }
+            FileWriteResult::Refused { reason } => {
+                exit = ExitClass::Failure;
+                let _ = writeln!(err, "refused   {} — {reason}", file.path);
+            }
+            FileWriteResult::Failed { error } => {
+                exit = ExitClass::Failure;
+                let _ = writeln!(err, "failed    {} — {error}", file.path);
+            }
+        }
+    }
+
+    if !outcome.rows.is_empty() {
+        let _ = writeln!(
+            out,
+            "{:<9} {:<7} {:<4} {:<10} {:<48} {}",
+            "PROVIDER", "VERSION", "SAPI", "CONTEXT", "CHANNEL", "COVERAGE"
+        );
+        for row in &outcome.rows {
+            let channel = row.channel.as_deref().unwrap_or("—");
+            let mut line = format!(
+                "{:<9} {:<7} {:<4} {:<10} {:<48} {}",
+                row.provider, row.version, row.sapi, row.context, channel, row.coverage
+            );
+            if let Some(configured) = &row.configured {
+                let _ = write!(line, "  configured={configured}");
+                match &row.observed {
+                    Some(observed) => {
+                        let _ = write!(line, " observed={observed} ({})", row.observed_state);
+                    }
+                    None => {
+                        let _ = write!(line, " observed=n/a");
+                    }
+                }
+            }
+            let _ = writeln!(out, "{line}");
+            if row.coverage.starts_with("UNMANAGED: privileged-dir") {
+                let _ = writeln!(
+                    out,
+                    "  ↳ remediation: root-owned, version-blind; never written by Hearth. \
+                     Use `hearth php exec -- <cmd>` for env-clearing launchers, or a \
+                     Hearth/Homebrew PHP build."
+                );
+            }
+            if row.coverage.contains("channel blocked") {
+                let _ = writeln!(
+                    out,
+                    "  ↳ remediation: remove or rename the file, then run \
+                     `hearth php config --sync`."
+                );
+            }
+        }
+        // Scope footer — states the guarantee boundary, never universal.
+        let _ = writeln!(
+            out,
+            "Coverage: Hearth guarantees Hearth-launched processes (env-honoring binaries) \
+             and verified user-owned, version-exclusive channels. UNMANAGED/LAUNCH-BLOCKED \
+             cells are outside that guarantee."
+        );
+    }
+
+    match &outcome.fpm {
+        FpmRestartOutcome::Restarted => out.push_str("php-fpm restarted\n"),
+        FpmRestartOutcome::NotRegistered { herd_hint: true } => {
+            out.push_str("php-fpm not restarted: not registered (Herd manages PHP-FPM)\n")
+        }
+        FpmRestartOutcome::NotRegistered { herd_hint: false } => {
+            out.push_str("php-fpm not restarted: not registered\n")
+        }
+        FpmRestartOutcome::LaunchBlocked { reason } => {
+            let _ = writeln!(out, "php-fpm not restarted: LAUNCH-BLOCKED ({reason})");
+        }
+        FpmRestartOutcome::Failed { message } => {
+            exit = ExitClass::Failure;
+            let _ = writeln!(err, "Error: php-fpm restart failed: {message}");
+        }
+        FpmRestartOutcome::NotAttempted => {}
+    }
+
+    (out, err, exit)
 }
 
 async fn send_to_daemon(request: DaemonRequest) -> anyhow::Result<DaemonResponse> {
@@ -390,45 +641,12 @@ fn print_response(response: DaemonResponse) {
             std::process::exit(1);
         }
         DaemonResponse::PhpConfigReport(outcome) => {
-            // Interim rendering — Task 7 replaces this with the pure
-            // renderer + ExitClass surface.
-            if outcome.persisted == Some(true) {
-                println!("Configuration persisted.");
-            }
-            for file in &outcome.files {
-                match &file.result {
-                    FileWriteResult::Refused { reason } => {
-                        eprintln!("refused: {} — {reason}", file.path)
-                    }
-                    FileWriteResult::Failed { error } => {
-                        eprintln!("failed: {} — {error}", file.path)
-                    }
-                    other => println!("{}: {other:?}", file.path),
-                }
-            }
-            for row in &outcome.rows {
-                println!(
-                    "{:<9} {:<5} {:<4} {:<10} {}",
-                    row.provider, row.version, row.sapi, row.context, row.coverage
-                );
-            }
-            match &outcome.fpm {
-                FpmRestartOutcome::Restarted => println!("php-fpm restarted"),
-                FpmRestartOutcome::NotRegistered { herd_hint: true } => {
-                    println!("php-fpm not restarted: not registered (Herd manages PHP-FPM)")
-                }
-                FpmRestartOutcome::NotRegistered { herd_hint: false } => {
-                    println!("php-fpm not restarted: not registered")
-                }
-                FpmRestartOutcome::LaunchBlocked { reason } => {
-                    println!("php-fpm not restarted: launch-blocked ({reason})")
-                }
-                FpmRestartOutcome::Failed { message } => {
-                    eprintln!("Error: php-fpm restart failed: {message}");
-                    std::process::exit(1);
-                }
-                FpmRestartOutcome::NotAttempted => {}
-            }
+            // main() handles php-config reports (incl. exit class) before
+            // reaching print_response; this arm keeps the match exhaustive
+            // for indirect callers and just prints without applying an exit.
+            let (out, err, _exit) = render_php_config_report(&outcome);
+            print!("{out}");
+            eprint!("{err}");
         }
         DaemonResponse::Pong => println!("Daemon is running"),
     }
@@ -1072,4 +1290,251 @@ async fn run_mcp_bridge(mcp_url: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hearth_lib::socket::{
+        FileOutcome, PhpConfigAction, PhpConfigOutcome, PhpScope, PhpTargetRow,
+    };
+
+    fn build(
+        key: Option<&str>,
+        value: Option<&str>,
+        global: bool,
+        php: Option<&str>,
+        show: bool,
+        unset: bool,
+        status: bool,
+        sync: bool,
+        unmanage: bool,
+    ) -> Result<PhpConfigAction, String> {
+        build_php_config_action(
+            key.map(String::from),
+            value.map(String::from),
+            global,
+            php.map(String::from),
+            show,
+            unset,
+            status,
+            sync,
+            unmanage,
+        )
+    }
+
+    #[test]
+    fn flag_matrix_rejects_invalid_combinations() {
+        // More than one action flag.
+        assert!(build(Some("k"), None, false, None, true, true, false, false, false).is_err());
+        assert!(build(None, None, false, None, false, false, true, true, false).is_err());
+        // --global with --php.
+        assert!(build(Some("k"), Some("v"), true, Some("8.3"), false, false, false, false, false)
+            .is_err());
+        // Status/Sync/Unmanage take no key/value/scope.
+        assert!(build(Some("k"), None, false, None, false, false, true, false, false).is_err());
+        assert!(build(None, Some("v"), false, None, false, false, false, true, false).is_err());
+        assert!(build(None, None, true, None, false, false, false, false, true).is_err());
+        assert!(build(None, None, false, Some("8.3"), false, false, true, false, false).is_err());
+        // --show forbids a value.
+        assert!(build(Some("k"), Some("v"), false, None, true, false, false, false, false)
+            .is_err());
+        // --unset requires a key, forbids a value.
+        assert!(build(None, None, false, None, false, true, false, false, false).is_err());
+        assert!(build(Some("k"), Some("v"), false, None, false, true, false, false, false)
+            .is_err());
+        // Implicit Set needs both key and value.
+        assert!(build(Some("k"), None, false, None, false, false, false, false, false).is_err());
+        assert!(build(None, None, false, None, false, false, false, false, false).is_err());
+    }
+
+    #[test]
+    fn flag_matrix_builds_expected_actions() {
+        // Bare invocation keeps Active-version behavior.
+        assert_eq!(
+            build(Some("memory_limit"), Some("1G"), false, None, false, false, false, false, false),
+            Ok(PhpConfigAction::Set {
+                scope: PhpScope::Active,
+                key: "memory_limit".to_string(),
+                value: "1G".to_string(),
+            })
+        );
+        assert_eq!(
+            build(Some("k"), Some("v"), true, None, false, false, false, false, false),
+            Ok(PhpConfigAction::Set {
+                scope: PhpScope::Global,
+                key: "k".to_string(),
+                value: "v".to_string(),
+            })
+        );
+        assert_eq!(
+            build(Some("k"), Some("v"), false, Some("8.3"), false, false, false, false, false),
+            Ok(PhpConfigAction::Set {
+                scope: PhpScope::Version { version: "8.3".to_string() },
+                key: "k".to_string(),
+                value: "v".to_string(),
+            })
+        );
+        assert_eq!(
+            build(Some("k"), None, true, None, false, true, false, false, false),
+            Ok(PhpConfigAction::Unset {
+                scope: PhpScope::Global,
+                key: "k".to_string(),
+            })
+        );
+        assert_eq!(
+            build(None, None, false, None, true, false, false, false, false),
+            Ok(PhpConfigAction::Show { key: None })
+        );
+        assert_eq!(
+            build(Some("k"), None, false, None, true, false, false, false, false),
+            Ok(PhpConfigAction::Show { key: Some("k".to_string()) })
+        );
+        assert_eq!(
+            build(None, None, false, None, false, false, true, false, false),
+            Ok(PhpConfigAction::Status)
+        );
+        assert_eq!(
+            build(None, None, false, None, false, false, false, true, false),
+            Ok(PhpConfigAction::Sync)
+        );
+        assert_eq!(
+            build(None, None, false, None, false, false, false, false, true),
+            Ok(PhpConfigAction::Unmanage)
+        );
+    }
+
+    fn row(coverage: &str) -> PhpTargetRow {
+        PhpTargetRow {
+            provider: "herd".to_string(),
+            version: "8.4".to_string(),
+            sapi: "cli".to_string(),
+            context: "sanitized".to_string(),
+            channel: Some("/usr/local/etc/php/conf.d".to_string()),
+            coverage: coverage.to_string(),
+            configured: None,
+            observed: None,
+            observed_state: "n/a".to_string(),
+        }
+    }
+
+    fn outcome_with_rows(rows: Vec<PhpTargetRow>) -> PhpConfigOutcome {
+        PhpConfigOutcome {
+            persisted: None,
+            rows,
+            files: vec![],
+            fpm: FpmRestartOutcome::NotAttempted,
+        }
+    }
+
+    #[test]
+    fn render_unmanaged_row_with_remediation_and_footer_no_universal_claim() {
+        let outcome = outcome_with_rows(vec![row("UNMANAGED: privileged-dir")]);
+        let (out, err, exit) = render_php_config_report(&outcome);
+        assert!(out.contains("UNMANAGED: privileged-dir"), "got: {out}");
+        assert!(out.contains("remediation"), "got: {out}");
+        assert!(out.contains("hearth php exec"), "got: {out}");
+        assert!(out.contains("Coverage: Hearth guarantees"), "got: {out}");
+        assert!(out.contains("outside that guarantee"), "got: {out}");
+        assert!(
+            !out.to_lowercase().contains("universal"),
+            "must never claim universal coverage: {out}"
+        );
+        assert!(err.is_empty());
+        // Unmanaged-only cells exit zero.
+        assert_eq!(exit, ExitClass::Success);
+    }
+
+    #[test]
+    fn render_launch_blocked_row_cites_followup_todo() {
+        let outcome = outcome_with_rows(vec![row(
+            "LAUNCH-BLOCKED: missing fpm config — see todo #2343",
+        )]);
+        let (out, _err, exit) = render_php_config_report(&outcome);
+        assert!(out.contains("LAUNCH-BLOCKED"), "got: {out}");
+        assert!(out.contains("#2343"), "got: {out}");
+        assert_eq!(exit, ExitClass::Success);
+    }
+
+    #[test]
+    fn render_degraded_channel_blocked_row() {
+        let outcome = outcome_with_rows(vec![row(
+            "managed* — channel blocked: /opt/homebrew/etc/php/8.5/conf.d/zz-hearth.ini",
+        )]);
+        let (out, _err, _exit) = render_php_config_report(&outcome);
+        assert!(out.contains("channel blocked"), "got: {out}");
+        assert!(out.contains("--sync"), "got: {out}");
+    }
+
+    #[test]
+    fn render_four_state_observation_labels() {
+        let mut r = row("managed (channel+env)");
+        r.configured = Some("1G".to_string());
+        r.observed = Some("1G".to_string());
+        r.observed_state = "materialized".to_string();
+        let (out, _err, _exit) = render_php_config_report(&outcome_with_rows(vec![r]));
+        assert!(out.contains("configured=1G"), "got: {out}");
+        assert!(out.contains("observed=1G (materialized)"), "got: {out}");
+
+        let mut r = row("managed (channel; env ignored)");
+        r.configured = Some("1G".to_string());
+        let (out, _err, _exit) = render_php_config_report(&outcome_with_rows(vec![r]));
+        assert!(out.contains("observed=n/a"), "got: {out}");
+    }
+
+    #[test]
+    fn exit_class_rules() {
+        // Refused channel file → nonzero.
+        let refused = PhpConfigOutcome {
+            persisted: Some(true),
+            rows: vec![],
+            files: vec![FileOutcome {
+                path: "/x/zz-hearth.ini".to_string(),
+                result: FileWriteResult::Refused { reason: "untracked".to_string() },
+            }],
+            fpm: FpmRestartOutcome::NotAttempted,
+        };
+        assert_eq!(render_php_config_report(&refused).2, ExitClass::Failure);
+
+        // Failed channel file → nonzero.
+        let failed = PhpConfigOutcome {
+            persisted: Some(true),
+            rows: vec![],
+            files: vec![FileOutcome {
+                path: "/x/zz-hearth.ini".to_string(),
+                result: FileWriteResult::Failed { error: "io".to_string() },
+            }],
+            fpm: FpmRestartOutcome::NotAttempted,
+        };
+        assert_eq!(render_php_config_report(&failed).2, ExitClass::Failure);
+
+        // Registered restart failure → nonzero.
+        let fpm_failed = PhpConfigOutcome {
+            persisted: Some(true),
+            rows: vec![],
+            files: vec![],
+            fpm: FpmRestartOutcome::Failed { message: "boom".to_string() },
+        };
+        assert_eq!(render_php_config_report(&fpm_failed).2, ExitClass::Failure);
+
+        // NotRegistered / LaunchBlocked are informational → zero.
+        for fpm in [
+            FpmRestartOutcome::NotRegistered { herd_hint: true },
+            FpmRestartOutcome::NotRegistered { herd_hint: false },
+            FpmRestartOutcome::LaunchBlocked { reason: "missing fpm config — see todo #2343".to_string() },
+            FpmRestartOutcome::Restarted,
+            FpmRestartOutcome::NotAttempted,
+        ] {
+            let ok = PhpConfigOutcome {
+                persisted: Some(true),
+                rows: vec![],
+                files: vec![FileOutcome {
+                    path: "/x/zz-hearth.ini".to_string(),
+                    result: FileWriteResult::Written,
+                }],
+                fpm,
+            };
+            assert_eq!(render_php_config_report(&ok).2, ExitClass::Success);
+        }
+    }
 }

@@ -22,7 +22,7 @@ hearth-daemon (always-on, owns all processes via process groups)
 | Module | Purpose |
 |--------|---------|
 | `config.rs` | `HearthConfig` with TOML persistence, `#[serde(default)]` for migration safety |
-| `mcp.rs` | `HearthMcpServer` with 11 MCP tools via rmcp `#[tool_router]` |
+| `mcp.rs` | `HearthMcpServer` with 12 MCP tools via rmcp `#[tool_router]` |
 | `service/supervisor.rs` | Process group supervisor with circuit breaker + per-engine `ShutdownStrategy` |
 | `service/manager.rs` | Default service registration (nginx, php-fpm, dnsmasq, mailpit, db engines) |
 | `mailpit.rs` | Binary resolution chain (Hearth cache → system PATH) |
@@ -79,7 +79,7 @@ The daemon serves an MCP (Model Context Protocol) server on `127.0.0.1:9900` via
 
 For IDEs that only support stdio transport, use the bridge: `hearth mcp` (reads JSON-RPC from stdin, POSTs to the HTTP endpoint).
 
-### MCP Tools (11)
+### MCP Tools (12)
 
 | Tool | Description |
 |------|-------------|
@@ -90,7 +90,8 @@ For IDEs that only support stdio transport, use the bridge: `hearth mcp` (reads 
 | `hearth_site_link` | Link a directory through the active Valet/Herd backend |
 | `hearth_site_unlink` | Unlink a site |
 | `hearth_service_restart` | Restart one or all services |
-| `hearth_php_config` | Set php.ini value + restart FPM |
+| `hearth_php_config` | Set a PHP INI value (active version, `global`, or explicit `version` scope) via the shared engine; conditional FPM restart |
+| `hearth_php_config_status` | Per-target PHP config coverage table (managed/UNMANAGED/LAUNCH-BLOCKED) |
 | `hearth_db_start` | Start a DB engine (postgres/redis/mysql) |
 | `hearth_db_stop` | Stop a DB engine |
 | `hearth_db_status` | Per-engine status with port/data_dir/conflict info |

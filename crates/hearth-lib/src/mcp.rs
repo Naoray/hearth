@@ -57,6 +57,13 @@ pub struct PhpConfigParams {
     pub key: String,
     /// The value to set (e.g., "512M")
     pub value: String,
+    /// Apply globally to every PHP version (mutually exclusive with `version`)
+    #[serde(default)]
+    pub global: Option<bool>,
+    /// Apply to one version's override table (e.g., "8.3"); omit for the
+    /// active version
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -400,8 +407,18 @@ impl HearthMcpServer {
         &self,
         Parameters(params): Parameters<PhpConfigParams>,
     ) -> Result<String, String> {
+        if params.global == Some(true) && params.version.is_some() {
+            return Err("`global` and `version` are mutually exclusive".to_string());
+        }
+        let scope = if params.global == Some(true) {
+            PhpScope::Global
+        } else if let Some(version) = params.version.clone() {
+            PhpScope::Version { version }
+        } else {
+            PhpScope::Active
+        };
         let action = PhpConfigAction::Set {
-            scope: PhpScope::Active,
+            scope,
             key: params.key.clone(),
             value: params.value.clone(),
         };
@@ -430,6 +447,37 @@ impl HearthMcpServer {
             "Set {}={} (persisted). {fpm_note}.",
             params.key, params.value
         ))
+    }
+
+    /// Per-target PHP configuration coverage table.
+    #[tool(
+        name = "hearth_php_config_status",
+        description = "Report per-target PHP configuration coverage (provider/version/sapi/context) with truthful managed/UNMANAGED/LAUNCH-BLOCKED labels"
+    )]
+    async fn hearth_php_config_status(&self) -> Result<String, String> {
+        let outcome = self.engine.apply(PhpConfigAction::Status).await?;
+        if outcome.rows.is_empty() {
+            return Ok("No PHP targets discovered.".to_string());
+        }
+        let mut lines = Vec::with_capacity(outcome.rows.len() + 1);
+        for row in &outcome.rows {
+            lines.push(format!(
+                "{} {} {} [{}] {} — {}",
+                row.provider,
+                row.version,
+                row.sapi,
+                row.context,
+                row.channel.as_deref().unwrap_or("—"),
+                row.coverage,
+            ));
+        }
+        lines.push(
+            "Coverage: Hearth guarantees Hearth-launched processes (env-honoring binaries) \
+             and verified user-owned, version-exclusive channels. UNMANAGED/LAUNCH-BLOCKED \
+             cells are outside that guarantee."
+                .to_string(),
+        );
+        Ok(lines.join("\n"))
     }
 }
 
@@ -638,8 +686,8 @@ mod tests {
         let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
         assert_eq!(
             tools.len(),
-            11,
-            "Expected 11 tools, got {}: {:?}",
+            12,
+            "Expected 12 tools, got {}: {:?}",
             tools.len(),
             names
         );
@@ -652,6 +700,7 @@ mod tests {
             "hearth_site_unlink",
             "hearth_service_restart",
             "hearth_php_config",
+            "hearth_php_config_status",
             "hearth_db_start",
             "hearth_db_stop",
             "hearth_db_status",
