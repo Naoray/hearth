@@ -1363,7 +1363,7 @@ mod tests {
         let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
 
         barriers::reset();
-        let failpoint = barriers::fail_sync_of(&manifest_dir);
+        let _failpoint = barriers::fail_sync_of(&manifest_dir);
         let report = reconcile(
             &simple_ini("8.4", "memory_limit", "2G"),
             &[verified_target(
