@@ -399,12 +399,23 @@ pub fn reconcile(
     }
 
     // Drop stale entries: not produced by any current group AND file gone.
+    // A non-durable prune is reported as a typed failure; the stale entries
+    // survive on disk and the next reconcile retries the prune.
     let before = manifest.files.len();
     manifest
         .files
         .retain(|e| produced.contains(&e.path) || e.path.exists());
-    if manifest.files.len() != before {
-        let _ = manifest.save(manifest_path);
+    if manifest.files.len() != before
+        && let Err(e) = manifest.save(manifest_path)
+    {
+        report.files.push(FileAction {
+            path: manifest_path.to_path_buf(),
+            php_version: String::new(),
+            channel: String::new(),
+            outcome: WriteOutcome::Failed {
+                error: format!("stale manifest entries could not be pruned durably: {e}"),
+            },
+        });
     }
 
     report
@@ -496,10 +507,15 @@ fn write_channel_file(
             manifest.files[idx].expected_old_sha256 = None;
             manifest.files[idx].desired_sha256 = None;
             manifest.files[idx].last_outcome = LastOutcome::Refused;
-            let _ = manifest.save(manifest_path);
-            return Some(WriteOutcome::Refused {
-                reason: format!("channel blocked: {rejection}"),
-            });
+            let mut reason = format!("channel blocked: {rejection}");
+            // The refusal stays primary, but a failure to durably record it
+            // must not be discarded.
+            if let Err(e) = manifest.save(manifest_path) {
+                reason = format!(
+                    "{reason}; additionally, recording this refusal in the manifest failed: {e}"
+                );
+            }
+            return Some(WriteOutcome::Refused { reason });
         }
     };
 
@@ -547,9 +563,16 @@ fn finalize_failure(
     file_path: &Path,
     error: String,
 ) -> Option<WriteOutcome> {
+    let mut error = error;
     if let Some(idx) = manifest.entry_index(file_path) {
         manifest.files[idx].last_outcome = LastOutcome::Failed;
-        let _ = manifest.save(manifest_path);
+        // The original failure stays primary, but a failure to durably
+        // record it must not be discarded.
+        if let Err(e) = manifest.save(manifest_path) {
+            error = format!(
+                "{error}; additionally, recording this failure in the manifest failed: {e}"
+            );
+        }
     }
     Some(WriteOutcome::Failed { error })
 }
@@ -566,10 +589,19 @@ fn delete_channel_file(
     let actual = match file_sha256(file_path) {
         Some(sha) => sha,
         None => {
-            // Nothing on disk; drop any leftover entry.
+            // Nothing on disk; drop any leftover entry — but ownership is
+            // released only if that cleanup is durable.
             if let Some(idx) = manifest.entry_index(file_path) {
-                manifest.files.remove(idx);
-                let _ = manifest.save(manifest_path);
+                let entry = manifest.files.remove(idx);
+                if let Err(e) = manifest.save(manifest_path) {
+                    manifest.files.insert(idx, entry);
+                    return Some(WriteOutcome::Failed {
+                        error: format!(
+                            "could not durably release ownership of missing {}: {e}",
+                            file_path.display()
+                        ),
+                    });
+                }
             }
             return None;
         }
@@ -611,9 +643,17 @@ fn delete_channel_file(
     if let Err(e) = removal {
         return finalize_failure(manifest, manifest_path, file_path, e.to_string());
     }
+    // `Deleted` is reported only after the ownership drop is durable. On
+    // failure the entry is restored in memory to mirror the durable pending
+    // journal on disk; recovery converges from either state.
     let idx = manifest.entry_index(file_path).unwrap();
-    manifest.files.remove(idx);
-    let _ = manifest.save(manifest_path);
+    let entry = manifest.files.remove(idx);
+    if let Err(e) = manifest.save(manifest_path) {
+        manifest.files.insert(idx, entry);
+        return Some(WriteOutcome::Failed {
+            error: format!("channel file removed but manifest finalization failed: {e}"),
+        });
+    }
     Some(WriteOutcome::Deleted)
 }
 
@@ -1323,7 +1363,7 @@ mod tests {
         let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
 
         barriers::reset();
-        barriers::fail_sync_of(&manifest_dir);
+        let failpoint = barriers::fail_sync_of(&manifest_dir);
         let report = reconcile(
             &simple_ini("8.4", "memory_limit", "2G"),
             &[verified_target(
@@ -1365,7 +1405,7 @@ mod tests {
         let ini = simple_ini("8.4", "memory_limit", "2G");
 
         barriers::reset();
-        barriers::fail_sync_of(&dir);
+        let failpoint = barriers::fail_sync_of(&dir);
         let report = reconcile(
             &ini,
             &[verified_target(
@@ -1377,7 +1417,7 @@ mod tests {
             &manifest_path,
             &roots,
         );
-        barriers::reset();
+        drop(failpoint);
 
         let file = dir.join(CHANNEL_FILE_NAME);
         assert!(
@@ -1465,14 +1505,14 @@ mod tests {
         assert!(file.exists());
 
         barriers::reset();
-        barriers::fail_sync_of(&dir);
+        let failpoint = barriers::fail_sync_of(&dir);
         let report = reconcile(
             &PhpIniSettings::default(),
             std::slice::from_ref(&target),
             &manifest_path,
             &roots,
         );
-        barriers::reset();
+        drop(failpoint);
 
         assert!(
             matches!(outcome_for(&report, &file), WriteOutcome::Failed { .. }),
@@ -1513,9 +1553,9 @@ mod tests {
         let file = dir.join(CHANNEL_FILE_NAME);
 
         barriers::reset();
-        barriers::fail_sync_of(&dir);
+        let failpoint = barriers::fail_sync_of(&dir);
         let actions = unmanage(&manifest_path).unwrap();
-        barriers::reset();
+        drop(failpoint);
 
         assert!(
             actions
@@ -1543,10 +1583,10 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
 
         barriers::reset();
-        barriers::fail_sync_of(&config_dir);
+        let failpoint = barriers::fail_sync_of(&config_dir);
         let mut config = crate::config::HearthConfig::default();
         let result = migrate_legacy_inis(&mut config, &config_dir.join("config.toml"), &php_dir);
-        barriers::reset();
+        drop(failpoint);
 
         assert!(result.is_err(), "config barrier failure must propagate");
         assert!(
@@ -1579,6 +1619,376 @@ mod tests {
         assert!(
             config_sync < backup_rename && backup_rename < source_sync,
             "required order: config dir sync → legacy rename → source dir sync; got {events:?}"
+        );
+    }
+
+    // ---- round-3: manifest-save failure propagation ----
+
+    #[test]
+    fn final_manifest_sync_failure_after_channel_write_reports_failed() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
+        let target = verified_target(PhpProvider::Hearth, "8.4", PhpSapi::Cli, &dir);
+
+        reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            std::slice::from_ref(&target),
+            &manifest_path,
+            &roots,
+        );
+
+        // Attempt 1 = pending journal save (passes); attempt 2 = finalization.
+        let updated = simple_ini("8.4", "memory_limit", "4G");
+        let failpoint = barriers::fail_nth_sync_of(&manifest_dir, 2);
+        let report = reconcile(
+            &updated,
+            std::slice::from_ref(&target),
+            &manifest_path,
+            &roots,
+        );
+        drop(failpoint);
+
+        let file = dir.join(CHANNEL_FILE_NAME);
+        match outcome_for(&report, &file) {
+            WriteOutcome::Failed { error } => {
+                assert!(
+                    error.contains("finalization"),
+                    "must carry the persistence error: {error}"
+                );
+            }
+            other => panic!("finalization failure must never report success: {other:?}"),
+        }
+        // After a failed barrier the disk may expose EITHER the durable
+        // pending journal (crash before rename) or the already-renamed final
+        // manifest (rename landed, sync failed) — both must converge.
+        let disk_state = Manifest::load(&manifest_path).unwrap().files[0].state;
+        assert!(
+            matches!(disk_state, EntryState::Pending | EntryState::Applied),
+            "unexpected disk state {disk_state:?}"
+        );
+
+        // Clean retry converges from whichever state disk exposes.
+        let report = reconcile(
+            &updated,
+            std::slice::from_ref(&target),
+            &manifest_path,
+            &roots,
+        );
+        assert!(
+            matches!(outcome_for(&report, &file), WriteOutcome::Unchanged),
+            "retry must converge: {report:?}"
+        );
+        assert_eq!(
+            Manifest::load(&manifest_path).unwrap().files[0].state,
+            EntryState::Applied
+        );
+    }
+
+    #[test]
+    fn final_manifest_sync_failure_after_delete_reports_failed_not_deleted() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
+        let target = verified_target(PhpProvider::Hearth, "8.4", PhpSapi::Cli, &dir);
+
+        reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            std::slice::from_ref(&target),
+            &manifest_path,
+            &roots,
+        );
+        let file = dir.join(CHANNEL_FILE_NAME);
+
+        // Attempt 1 = pending delete journal (passes); attempt 2 = ownership drop.
+        let failpoint = barriers::fail_nth_sync_of(&manifest_dir, 2);
+        let report = reconcile(
+            &PhpIniSettings::default(),
+            std::slice::from_ref(&target),
+            &manifest_path,
+            &roots,
+        );
+        drop(failpoint);
+
+        assert!(
+            matches!(outcome_for(&report, &file), WriteOutcome::Failed { .. }),
+            "a non-durable ownership drop must never report Deleted: {report:?}"
+        );
+        // Disk may expose the pending journal (rename not landed) or the
+        // final ownerless manifest (rename landed, sync failed).
+        let disk = Manifest::load(&manifest_path).unwrap();
+        assert!(
+            disk.files.is_empty() || disk.files[0].state == EntryState::Pending,
+            "unexpected disk state: {disk:?}"
+        );
+
+        // Clean retry converges whether disk exposes pending or final state.
+        let report = reconcile(
+            &PhpIniSettings::default(),
+            std::slice::from_ref(&target),
+            &manifest_path,
+            &roots,
+        );
+        assert!(report.files.is_empty(), "{report:?}");
+        assert!(Manifest::load(&manifest_path).unwrap().files.is_empty());
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn stale_prune_sync_failure_appears_in_report() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
+
+        reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            &[verified_target(
+                PhpProvider::Hearth,
+                "8.4",
+                PhpSapi::Cli,
+                &dir,
+            )],
+            &manifest_path,
+            &roots,
+        );
+        std::fs::remove_file(dir.join(CHANNEL_FILE_NAME)).unwrap();
+
+        let failpoint = barriers::fail_sync_of(&manifest_dir);
+        let report = reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            &[],
+            &manifest_path,
+            &roots,
+        );
+        drop(failpoint);
+
+        assert!(
+            report.files.iter().any(
+                |f| matches!(&f.outcome, WriteOutcome::Failed { error } if error.contains("stale"))
+            ),
+            "a non-durable stale prune must be reported, not silent: {report:?}"
+        );
+
+        // Retry removes the stale entry durably.
+        let report = reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            &[],
+            &manifest_path,
+            &roots,
+        );
+        assert!(report.files.is_empty(), "{report:?}");
+        assert!(Manifest::load(&manifest_path).unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn missing_file_cleanup_sync_failure_appears_in_report() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
+        let target = verified_target(PhpProvider::Hearth, "8.4", PhpSapi::Cli, &dir);
+
+        reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            std::slice::from_ref(&target),
+            &manifest_path,
+            &roots,
+        );
+        let file = dir.join(CHANNEL_FILE_NAME);
+        std::fs::remove_file(&file).unwrap();
+
+        // Delete flow, file already gone: ownership cleanup save fails.
+        let failpoint = barriers::fail_sync_of(&manifest_dir);
+        let report = reconcile(
+            &PhpIniSettings::default(),
+            std::slice::from_ref(&target),
+            &manifest_path,
+            &roots,
+        );
+        drop(failpoint);
+
+        assert!(
+            matches!(outcome_for(&report, &file), WriteOutcome::Failed { .. }),
+            "non-durable missing-file cleanup must be reported: {report:?}"
+        );
+
+        // Clean retry converges from whichever state disk exposes.
+        let report = reconcile(
+            &PhpIniSettings::default(),
+            std::slice::from_ref(&target),
+            &manifest_path,
+            &roots,
+        );
+        assert!(report.files.is_empty(), "{report:?}");
+        assert!(Manifest::load(&manifest_path).unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn refused_state_save_error_included_in_reason() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = roots.herd.join("config/php/84");
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
+
+        // Group-writable → verify_user_channel refuses after the journal save.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o775);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        // Attempt 1 = pending journal (passes); attempt 2 = refusal recording.
+        let failpoint = barriers::fail_nth_sync_of(&manifest_dir, 2);
+        let report = reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            &[verified_target(
+                PhpProvider::Herd,
+                "8.4",
+                PhpSapi::Cli,
+                &dir,
+            )],
+            &manifest_path,
+            &roots,
+        );
+        drop(failpoint);
+
+        let file = dir.join(CHANNEL_FILE_NAME);
+        match outcome_for(&report, &file) {
+            WriteOutcome::Refused { reason } => {
+                assert!(reason.contains("channel blocked"), "{reason}");
+                assert!(
+                    reason.contains("additionally"),
+                    "the failed state-recording save must not be lost: {reason}"
+                );
+            }
+            other => panic!("expected Refused with appended save error, got {other:?}"),
+        }
+
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+    }
+
+    #[test]
+    fn failed_state_save_error_included_in_reason() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
+
+        // Channel barrier fails, then recording that failure also fails.
+        let channel_fp = barriers::fail_sync_of(&dir);
+        let manifest_fp = barriers::fail_nth_sync_of(&manifest_dir, 2);
+        let report = reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            &[verified_target(
+                PhpProvider::Hearth,
+                "8.4",
+                PhpSapi::Cli,
+                &dir,
+            )],
+            &manifest_path,
+            &roots,
+        );
+        drop(channel_fp);
+        drop(manifest_fp);
+
+        let file = dir.join(CHANNEL_FILE_NAME);
+        match outcome_for(&report, &file) {
+            WriteOutcome::Failed { error } => {
+                assert!(
+                    error.contains("additionally"),
+                    "secondary persistence failure must be included: {error}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unmanage_finalization_error_propagates() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
+
+        reconcile(
+            &simple_ini("8.4", "memory_limit", "2G"),
+            &[verified_target(
+                PhpProvider::Hearth,
+                "8.4",
+                PhpSapi::Cli,
+                &dir,
+            )],
+            &manifest_path,
+            &roots,
+        );
+
+        let failpoint = barriers::fail_sync_of(&manifest_dir);
+        let result = unmanage(&manifest_path);
+        drop(failpoint);
+        assert!(
+            result.is_err(),
+            "final manifest sync failure must propagate"
+        );
+
+        // Clean retry converges (files already durably removed).
+        assert!(unmanage(&manifest_path).is_ok());
+        assert!(Manifest::load(&manifest_path).unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn recovery_finalization_error_propagates() {
+        let (_tmp, base) = canon_tmp();
+        let dir = base.join("channel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(CHANNEL_FILE_NAME);
+        let desired_content = "; managed by hearth\nmemory_limit=2G\n";
+        std::fs::write(&file, desired_content).unwrap();
+        let desired_sha = sha256_hex(desired_content.as_bytes());
+
+        let manifest_path = base.join("manifest.toml");
+        let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
+        pending_manifest(&manifest_path, &file, None, Some(&desired_sha));
+
+        let failpoint = barriers::fail_sync_of(&manifest_dir);
+        let result = recover_pending(&manifest_path);
+        drop(failpoint);
+        assert!(
+            result.is_err(),
+            "recovery finalization save failure must propagate"
+        );
+
+        // Clean retry converges: disk exposes pending (rename not landed —
+        // recovery finalizes) or applied (rename landed — nothing pending).
+        let actions = recover_pending(&manifest_path).unwrap();
+        assert!(
+            actions.is_empty() || matches!(actions[0].outcome, RecoveryOutcome::Finalized),
+            "{actions:?}"
+        );
+        let manifest = Manifest::load(&manifest_path).unwrap();
+        assert_eq!(manifest.files[0].state, EntryState::Applied);
+    }
+
+    #[test]
+    fn no_ignored_manifest_save_results_in_source() {
+        let source = include_str!("reconcile.rs");
+        // Constructed at runtime so this test's own source never matches.
+        let ignored = format!("let _ = {}.save", "manifest");
+        assert!(
+            !source.contains(&ignored),
+            "every Manifest::save result must be handled — found an ignored one"
         );
     }
 

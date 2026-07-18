@@ -696,10 +696,10 @@ installed_at = "2026-05-20T12:00:00Z"
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
         crate::fsync::test_hooks::reset();
-        crate::fsync::test_hooks::fail_sync_of(&dir);
+        let failpoint = crate::fsync::test_hooks::fail_sync_of(&dir);
 
         let result = HearthConfig::default().save_to(&dir.join("config.toml"));
-        crate::fsync::test_hooks::reset();
+        drop(failpoint);
         assert!(
             result.is_err(),
             "directory-sync failure must be reported, not swallowed"
