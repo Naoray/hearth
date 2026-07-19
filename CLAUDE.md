@@ -35,6 +35,7 @@ hearth-daemon (always-on, owns all processes via process groups)
 | `php/reconcile.rs` | Manifest+journal channel-file reconciliation: atomic writes, exact-hash ownership, crash recovery, legacy INI migration, `applied_at_unix_ms` materialization stamps |
 | `php/fpm.rs` | Generated private Unix-listener FPM conf + probe, typed ownership state, strict separate manifest, syntax matrix, recovery/unmanage transaction |
 | `php/ini_guard.rs` | INI key/value validation (denylist, length, injection safety) — the single choke point before persistence and probes |
+| `fastcgi.rs` | Dependency-free strict FastCGI RESPONDER v1 client with bounded framing, CGI parsing, clean-EOF enforcement, and fail-closed protocol validation |
 | `site.rs` | Multi-home site enumeration (reads from both Valet and Herd config dirs) |
 | `valet.rs` | Herd-aware site CLI wrapper (Valet fallback; link, unlink, park, secure, unsecure) |
 | `socket.rs` | `DaemonRequest`/`DaemonResponse` protocol types |
@@ -96,7 +97,7 @@ For IDEs that only support stdio transport, use the bridge: `hearth mcp` (reads 
 | `hearth_site_unlink` | Unlink a site |
 | `hearth_service_restart` | Restart one or all services |
 | `hearth_php_config` | Set a PHP INI value (active version, `global`, or explicit `version` scope) via the shared engine; conditional FPM restart |
-| `hearth_php_config_status` | Per-target PHP config coverage table (managed/UNMANAGED/LAUNCH-BLOCKED); optional `key` adds configured + launch-probed values |
+| `hearth_php_config_status` | Per-target PHP config coverage table (managed/UNMANAGED/LAUNCH-BLOCKED); optional `key` adds configured + launch-probed values, with `live-observed` reserved for fully evidence-gated running FPM workers |
 | `hearth_db_start` | Start a DB engine (postgres/redis/mysql) |
 | `hearth_db_stop` | Stop a DB engine |
 | `hearth_db_status` | Per-engine status with port/data_dir/conflict info |
@@ -124,5 +125,17 @@ PHP INI store (canonical source for `hearth php config`):
 - Hearth FPM launch artifacts: `fpm/php-fpm.conf`, `fpm/hearth-probe.php`, and
   the separate exact-hash `fpm/manifest.toml`; listener `run/php-fpm.sock`.
   A foreign conf without that manifest remains user-managed and byte-stable.
-  Live FPM-worker observation is not yet available and lands with PR-2 of todo #2343;
-  ambient FPM is never executed or written for.
+
+The exact observation vocabulary is `configured`, `materialized`,
+`launch-probed`, and `live-observed`. For FPM, `live-observed` is available
+only for keyed Show/Status when external ownership is proven `Unowned`, the
+registered service is Running with Hearth-owned launch provenance, current
+conf/probe hashes match that launch, the conf was applied no later than the
+launch, the same current-user-owned Unix socket survives the request, the
+strict FastCGI/CGI/JSON response has the exact key and fresh nonce with clean
+EOF, the launch generation remains unchanged, and the responder PID belongs
+to the supervised process group. A file parse can never mint `live-observed`;
+user-managed or ambient FPM, stale config (`pending restart`), and any
+ownership/generation/hash/socket/protocol/PID miss preserve the lesser label
+and keep the command successful. After a daemon version mismatch, run
+`hearth daemon stop && hearth daemon start`.

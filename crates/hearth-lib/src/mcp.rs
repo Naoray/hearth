@@ -435,7 +435,7 @@ impl HearthMcpServer {
     /// Per-target PHP configuration coverage table, optionally keyed.
     #[tool(
         name = "hearth_php_config_status",
-        description = "Report per-target PHP configuration coverage (provider/version/sapi/context) with truthful managed/UNMANAGED/LAUNCH-BLOCKED labels; pass `key` to include each target's configured and launch-probed value"
+        description = "Report per-target PHP configuration coverage (provider/version/sapi/context) with truthful managed/UNMANAGED/LAUNCH-BLOCKED labels; pass `key` to include each target's configured and launch-probed value, with live-observed reserved for fully evidence-gated running FPM workers"
     )]
     async fn hearth_php_config_status(
         &self,

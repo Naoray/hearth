@@ -10,6 +10,8 @@ use super::reconcile::{
 use super::targets::{ensure_hearth_channel_dir, verify_user_channel};
 
 const SUN_PATH_BYTES: usize = 104;
+static LIVE_PROBE_NONCE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 pub const FPM_CONF_HEADER_V1: &str = "; managed by hearth — do not edit. `hearth php config --sync` regenerates this file.\n; hearth-owned: fpm-conf v1\n\n";
 
@@ -399,6 +401,118 @@ pub fn conf_state(config_dir: &Path) -> FpmConfState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveProbeReply {
+    pub value: Option<String>,
+    pub worker_pid: i32,
+}
+
+pub async fn probe_live_effective(
+    config_dir: &Path,
+    key: &str,
+    expected_conf_sha256: &str,
+    expected_probe_sha256: &str,
+    timeout: Duration,
+) -> Result<LiveProbeReply, String> {
+    super::ini_guard::validate_key(key)
+        .map_err(|_| "live FPM probe key rejected by INI safety policy".to_string())?;
+
+    let (conf_sha256, probe_sha256, listen) = match conf_state(config_dir) {
+        FpmConfState::HearthOwned {
+            conf_sha256,
+            probe_sha256,
+            listen,
+            ..
+        } => (conf_sha256, probe_sha256, listen),
+        FpmConfState::UserManaged { .. } => {
+            return Err(
+                "live FPM probe refused: current config is user-managed, not Hearth-owned"
+                    .to_string(),
+            );
+        }
+        FpmConfState::Blocked { reason } => {
+            return Err(format!(
+                "live FPM probe refused: current Hearth-owned config is unavailable: {reason}"
+            ));
+        }
+    };
+    if conf_sha256 != expected_conf_sha256 || probe_sha256 != expected_probe_sha256 {
+        return Err(
+            "live FPM probe refused: current config/probe hashes do not match launch provenance"
+                .to_string(),
+        );
+    }
+
+    let script = probe_script_path(config_dir)
+        .to_str()
+        .ok_or_else(|| "live FPM probe script path is not valid UTF-8".to_string())?
+        .to_string();
+    let nonce = fresh_probe_nonce()?;
+    let params = vec![
+        ("SCRIPT_FILENAME".to_string(), script),
+        ("REQUEST_METHOD".to_string(), "GET".to_string()),
+        ("SERVER_PROTOCOL".to_string(), "HTTP/1.1".to_string()),
+        ("GATEWAY_INTERFACE".to_string(), "CGI/1.1".to_string()),
+        ("QUERY_STRING".to_string(), String::new()),
+        ("HEARTH_PROBE_KEY".to_string(), key.to_string()),
+        ("HEARTH_PROBE_NONCE".to_string(), nonce.clone()),
+    ];
+    let response = crate::fastcgi::request(&listen, &params, timeout).await?;
+    let envelope: LiveProbeEnvelope = serde_json::from_slice(&response.body)
+        .map_err(|error| format!("live FPM probe rejected malformed JSON: {error}"))?;
+    if envelope.hearth_probe != 1 {
+        return Err(format!(
+            "live FPM probe rejected marker {} instead of 1",
+            envelope.hearth_probe
+        ));
+    }
+    if envelope.nonce != nonce {
+        return Err("live FPM probe rejected mismatched nonce echo".to_string());
+    }
+    if envelope.key != key {
+        return Err("live FPM probe rejected mismatched key echo".to_string());
+    }
+    let worker_pid = i32::try_from(envelope.pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| "live FPM probe rejected invalid worker PID".to_string())?;
+    let value = match (envelope.available, envelope.value) {
+        (true, serde_json::Value::String(value)) => Some(value),
+        (false, serde_json::Value::Null) => None,
+        (true, _) => {
+            return Err(
+                "live FPM probe rejected available response without a string value".to_string(),
+            );
+        }
+        (false, _) => {
+            return Err(
+                "live FPM probe rejected unavailable response with a non-null value".to_string(),
+            );
+        }
+    };
+
+    Ok(LiveProbeReply { value, worker_pid })
+}
+
+#[derive(serde::Deserialize)]
+struct LiveProbeEnvelope {
+    hearth_probe: u8,
+    nonce: String,
+    key: String,
+    pid: i64,
+    available: bool,
+    value: serde_json::Value,
+}
+
+fn fresh_probe_nonce() -> Result<String, String> {
+    let counter = LIVE_PROBE_NONCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("live FPM probe could not create nonce: {error}"))?
+        .as_nanos();
+    Ok(format!("{}-{counter}-{nanos}", std::process::id()))
+}
+
 /// Durable application time for the exact Hearth-owned FPM config, available
 /// only through the same strict manifest/root/hash validation as conf state.
 pub fn conf_applied_at_unix_ms(config_dir: &Path) -> Option<u64> {
@@ -770,6 +884,446 @@ mod tests {
         let config_dir = base.join("hearth");
         std::fs::create_dir(&config_dir).unwrap();
         (tmp, base, config_dir)
+    }
+
+    fn live_probe_fixture() -> (tempfile::TempDir, PathBuf, String, String) {
+        let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let config_dir = base.join("hearth");
+        std::fs::create_dir(&config_dir).unwrap();
+        let state = materialize(&config_dir, &base).state;
+        let FpmConfState::HearthOwned {
+            conf_sha256,
+            probe_sha256,
+            ..
+        } = state
+        else {
+            panic!("fixture did not materialize Hearth-owned FPM artifacts: {state:?}");
+        };
+        (tmp, config_dir, conf_sha256, probe_sha256)
+    }
+
+    fn fcgi_response_record(record_type: u8, content: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![
+            1,
+            record_type,
+            0,
+            1,
+            (content.len() >> 8) as u8,
+            content.len() as u8,
+            0,
+            0,
+        ];
+        bytes.extend_from_slice(content);
+        bytes
+    }
+
+    fn read_fcgi_length(bytes: &[u8], offset: &mut usize) -> usize {
+        let first = bytes[*offset];
+        if first & 0x80 == 0 {
+            *offset += 1;
+            return first as usize;
+        }
+        let value = u32::from_be_bytes(bytes[*offset..*offset + 4].try_into().unwrap());
+        *offset += 4;
+        (value & 0x7fff_ffff) as usize
+    }
+
+    async fn read_fcgi_request_params(
+        stream: &mut tokio::net::UnixStream,
+    ) -> std::collections::BTreeMap<String, String> {
+        use tokio::io::AsyncReadExt;
+
+        let mut encoded = Vec::new();
+        let mut saw_begin = false;
+        let mut saw_params_end = false;
+        loop {
+            let mut header = [0_u8; 8];
+            stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0], 1);
+            assert_eq!(u16::from_be_bytes([header[2], header[3]]), 1);
+            let content_len = u16::from_be_bytes([header[4], header[5]]) as usize;
+            let padding_len = header[6] as usize;
+            let mut content = vec![0_u8; content_len];
+            stream.read_exact(&mut content).await.unwrap();
+            let mut padding = vec![0_u8; padding_len];
+            stream.read_exact(&mut padding).await.unwrap();
+            match header[1] {
+                1 => {
+                    assert!(!saw_begin);
+                    assert_eq!(content, [0, 1, 0, 0, 0, 0, 0, 0]);
+                    saw_begin = true;
+                }
+                4 if content.is_empty() => saw_params_end = true,
+                4 => {
+                    assert!(!saw_params_end);
+                    encoded.extend_from_slice(&content);
+                }
+                5 => {
+                    assert!(content.is_empty());
+                    assert!(saw_begin && saw_params_end);
+                    break;
+                }
+                other => panic!("unexpected outbound FastCGI record type {other}"),
+            }
+        }
+
+        let mut params = std::collections::BTreeMap::new();
+        let mut offset = 0;
+        while offset < encoded.len() {
+            let name_len = read_fcgi_length(&encoded, &mut offset);
+            let value_len = read_fcgi_length(&encoded, &mut offset);
+            let name = std::str::from_utf8(&encoded[offset..offset + name_len])
+                .unwrap()
+                .to_string();
+            offset += name_len;
+            let value = std::str::from_utf8(&encoded[offset..offset + value_len])
+                .unwrap()
+                .to_string();
+            offset += value_len;
+            assert!(params.insert(name, value).is_none());
+        }
+        params
+    }
+
+    fn spawn_probe_raw_server(
+        config_dir: &Path,
+        body: impl FnOnce(&std::collections::BTreeMap<String, String>) -> Vec<u8> + Send + 'static,
+    ) -> tokio::task::JoinHandle<std::collections::BTreeMap<String, String>> {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixListener;
+
+        let listener = UnixListener::bind(socket_path(config_dir)).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let params = read_fcgi_request_params(&mut stream).await;
+            let json = body(&params);
+            let mut response = fcgi_response_record(6, b"Content-Type: text/plain\r\n\r\n");
+            response.extend(fcgi_response_record(6, &json));
+            response.extend(fcgi_response_record(6, b""));
+            response.extend(fcgi_response_record(3, &[0; 8]));
+            stream.write_all(&response).await.unwrap();
+            stream.shutdown().await.unwrap();
+            params
+        })
+    }
+
+    fn spawn_probe_server(
+        config_dir: &Path,
+        body: impl FnOnce(&std::collections::BTreeMap<String, String>) -> serde_json::Value
+        + Send
+        + 'static,
+    ) -> tokio::task::JoinHandle<std::collections::BTreeMap<String, String>> {
+        spawn_probe_raw_server(config_dir, move |params| {
+            serde_json::to_vec(&body(params)).unwrap()
+        })
+    }
+
+    #[tokio::test]
+    async fn live_probe_round_trips_value_with_nonce_key_and_pid() {
+        let (_tmp, config_dir, conf_sha256, probe_sha256) = live_probe_fixture();
+        let server = spawn_probe_server(&config_dir, |params| {
+            serde_json::json!({
+                "hearth_probe": 1,
+                "nonce": params["HEARTH_PROBE_NONCE"],
+                "key": params["HEARTH_PROBE_KEY"],
+                "pid": 4242,
+                "available": true,
+                "value": "256M",
+            })
+        });
+
+        let reply = probe_live_effective(
+            &config_dir,
+            "memory_limit",
+            &conf_sha256,
+            &probe_sha256,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let params = server.await.unwrap();
+
+        assert_eq!(reply.value.as_deref(), Some("256M"));
+        assert_eq!(reply.worker_pid, 4242);
+        assert_eq!(params.len(), 7);
+        assert_eq!(
+            params["SCRIPT_FILENAME"],
+            probe_script_path(&config_dir).to_string_lossy()
+        );
+        assert_eq!(params["REQUEST_METHOD"], "GET");
+        assert_eq!(params["SERVER_PROTOCOL"], "HTTP/1.1");
+        assert_eq!(params["GATEWAY_INTERFACE"], "CGI/1.1");
+        assert_eq!(params["QUERY_STRING"], "");
+        assert_eq!(params["HEARTH_PROBE_KEY"], "memory_limit");
+        assert!(!params["HEARTH_PROBE_NONCE"].is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_probe_rejects_wrong_nonce_or_key_echo() {
+        for wrong_nonce in [true, false] {
+            let (_tmp, config_dir, conf_sha256, probe_sha256) = live_probe_fixture();
+            let server = spawn_probe_server(&config_dir, move |params| {
+                serde_json::json!({
+                    "hearth_probe": 1,
+                    "nonce": if wrong_nonce { "wrong" } else { &params["HEARTH_PROBE_NONCE"] },
+                    "key": if wrong_nonce { &params["HEARTH_PROBE_KEY"] } else { "wrong" },
+                    "pid": 4242,
+                    "available": true,
+                    "value": "256M",
+                })
+            });
+            let error = probe_live_effective(
+                &config_dir,
+                "memory_limit",
+                &conf_sha256,
+                &probe_sha256,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+            server.await.unwrap();
+            assert!(
+                error.contains(if wrong_nonce {
+                    "nonce echo"
+                } else {
+                    "key echo"
+                }),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_probe_refuses_hash_mismatch_zero_connect() {
+        use tokio::net::UnixListener;
+
+        let (_tmp, config_dir, conf_sha256, probe_sha256) = live_probe_fixture();
+        for (expected_conf, expected_probe) in [
+            ("wrong", probe_sha256.as_str()),
+            (conf_sha256.as_str(), "wrong"),
+        ] {
+            let listener = UnixListener::bind(socket_path(&config_dir)).unwrap();
+            let error = probe_live_effective(
+                &config_dir,
+                "memory_limit",
+                expected_conf,
+                expected_probe,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("launch provenance"), "{error}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(40), listener.accept())
+                    .await
+                    .is_err(),
+                "hash mismatch connected to the probe socket"
+            );
+            drop(listener);
+            std::fs::remove_file(socket_path(&config_dir)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_probe_refuses_user_managed_or_tampered_script_zero_connect() {
+        use tokio::net::UnixListener;
+
+        let (_tmp, config_dir, conf_sha256, probe_sha256) = live_probe_fixture();
+        std::fs::write(probe_script_path(&config_dir), b"tampered").unwrap();
+        let listener = UnixListener::bind(socket_path(&config_dir)).unwrap();
+        let error = probe_live_effective(
+            &config_dir,
+            "memory_limit",
+            &conf_sha256,
+            &probe_sha256,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("modified outside Hearth"), "{error}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(listener);
+        std::fs::remove_file(socket_path(&config_dir)).unwrap();
+
+        let (tmp, config_dir, _, _) = live_probe_fixture();
+        let base = tmp.path().canonicalize().unwrap();
+        unmanage_fpm(&config_dir, &base).unwrap();
+        std::fs::write(conf_path(&config_dir), b"; user managed").unwrap();
+        let listener = UnixListener::bind(socket_path(&config_dir)).unwrap();
+        let error = probe_live_effective(
+            &config_dir,
+            "memory_limit",
+            "unused",
+            "unused",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("user-managed"), "{error}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn live_probe_invalid_key_is_zero_io() {
+        use tokio::net::UnixListener;
+
+        let (_tmp, config_dir, conf_sha256, probe_sha256) = live_probe_fixture();
+        let listener = UnixListener::bind(socket_path(&config_dir)).unwrap();
+        let error = probe_live_effective(
+            &config_dir,
+            "memory_limit\nINJECTED=1",
+            &conf_sha256,
+            &probe_sha256,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("key rejected"), "{error}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener.accept())
+                .await
+                .is_err(),
+            "invalid key reached socket I/O"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_probe_distinguishes_empty_value_from_unavailable() {
+        for available in [true, false] {
+            let (_tmp, config_dir, conf_sha256, probe_sha256) = live_probe_fixture();
+            let server = spawn_probe_server(&config_dir, move |params| {
+                serde_json::json!({
+                    "hearth_probe": 1,
+                    "nonce": params["HEARTH_PROBE_NONCE"],
+                    "key": params["HEARTH_PROBE_KEY"],
+                    "pid": 4242,
+                    "available": available,
+                    "value": if available { serde_json::Value::String(String::new()) } else { serde_json::Value::Null },
+                })
+            });
+            let reply = probe_live_effective(
+                &config_dir,
+                "memory_limit",
+                &conf_sha256,
+                &probe_sha256,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            if available {
+                assert_eq!(reply.value.as_deref(), Some(""));
+            } else {
+                assert_eq!(reply.value, None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_probe_rejects_malformed_json_or_missing_pid() {
+        let (_tmp, config_dir, conf_sha256, probe_sha256) = live_probe_fixture();
+        let malformed = spawn_probe_raw_server(&config_dir, |_| b"{".to_vec());
+        let error = probe_live_effective(
+            &config_dir,
+            "memory_limit",
+            &conf_sha256,
+            &probe_sha256,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        malformed.await.unwrap();
+        assert!(error.contains("malformed JSON"), "{error}");
+
+        let (_tmp, config_dir, conf_sha256, probe_sha256) = live_probe_fixture();
+        let missing_pid = spawn_probe_server(&config_dir, |params| {
+            serde_json::json!({
+                "hearth_probe": 1,
+                "nonce": params["HEARTH_PROBE_NONCE"],
+                "key": params["HEARTH_PROBE_KEY"],
+                "available": true,
+                "value": "256M",
+            })
+        });
+        let error = probe_live_effective(
+            &config_dir,
+            "memory_limit",
+            &conf_sha256,
+            &probe_sha256,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        missing_pid.await.unwrap();
+        assert!(error.contains("malformed JSON"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn live_probe_rejects_wrong_marker_or_invalid_pid() {
+        for (marker, pid, expected) in [(0, 4242, "marker"), (1, 0, "worker PID")] {
+            let (_tmp, config_dir, conf_sha256, probe_sha256) = live_probe_fixture();
+            let server = spawn_probe_server(&config_dir, move |params| {
+                serde_json::json!({
+                    "hearth_probe": marker,
+                    "nonce": params["HEARTH_PROBE_NONCE"],
+                    "key": params["HEARTH_PROBE_KEY"],
+                    "pid": pid,
+                    "available": true,
+                    "value": "256M",
+                })
+            });
+            let error = probe_live_effective(
+                &config_dir,
+                "memory_limit",
+                &conf_sha256,
+                &probe_sha256,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+            server.await.unwrap();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn live_probe_rejects_inconsistent_availability_and_value() {
+        for (available, value) in [
+            (true, serde_json::Value::Null),
+            (false, serde_json::Value::String("256M".to_string())),
+        ] {
+            let (_tmp, config_dir, conf_sha256, probe_sha256) = live_probe_fixture();
+            let server = spawn_probe_server(&config_dir, move |params| {
+                serde_json::json!({
+                    "hearth_probe": 1,
+                    "nonce": params["HEARTH_PROBE_NONCE"],
+                    "key": params["HEARTH_PROBE_KEY"],
+                    "pid": 4242,
+                    "available": available,
+                    "value": value,
+                })
+            });
+            let error = probe_live_effective(
+                &config_dir,
+                "memory_limit",
+                &conf_sha256,
+                &probe_sha256,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+            server.await.unwrap();
+            assert!(error.contains("live FPM probe rejected"), "{error}");
+        }
     }
 
     fn assert_private_dir(path: &Path) {
@@ -2863,10 +3417,15 @@ mod tests {
             .unwrap();
         let config_dir = tmp.path().canonicalize().unwrap();
         assert!(config_dir.starts_with(&proof_root));
-        assert!(matches!(
-            materialize(&config_dir, &config_dir).state,
-            FpmConfState::HearthOwned { .. }
-        ));
+        let state = materialize(&config_dir, &config_dir).state;
+        let FpmConfState::HearthOwned {
+            conf_sha256,
+            probe_sha256,
+            ..
+        } = state
+        else {
+            panic!("real FPM proof did not materialize Hearth-owned artifacts: {state:?}");
+        };
         let conf = conf_path(&config_dir);
         assert_eq!(
             fpm_syntax_matrix(&set.candidates, &conf, std::time::Duration::from_secs(10)),
@@ -2905,6 +3464,10 @@ mod tests {
             .env(key, value)
             .stdout(std::process::Stdio::null());
         let log_path = config_dir.join("log/php-fpm.log");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let run = run_process_group_guarded(
             &mut command,
             Duration::from_secs(5),
@@ -2922,9 +3485,30 @@ mod tests {
                 if mode != 0o600 {
                     return Err(format!("listener mode is {mode:04o}, expected 0600"));
                 }
-                UnixStream::connect(&socket)
-                    .map(|_| ())
-                    .map_err(|error| format!("listener connect failed: {error}"))
+                let reply = runtime.block_on(probe_live_effective(
+                    &config_dir,
+                    "memory_limit",
+                    &conf_sha256,
+                    &probe_sha256,
+                    Duration::from_secs(5),
+                ))?;
+                let value = reply
+                    .value
+                    .ok_or_else(|| "real FPM reported memory_limit unavailable".to_string())?;
+                if value.is_empty() {
+                    return Err("real FPM returned an empty memory_limit".to_string());
+                }
+                if reply.worker_pid <= 0 {
+                    return Err(format!(
+                        "real FPM returned invalid worker PID {}",
+                        reply.worker_pid
+                    ));
+                }
+                eprintln!(
+                    "real FPM live probe: memory_limit={value}, worker_pid={}",
+                    reply.worker_pid
+                );
+                Ok(())
             },
         )
         .unwrap_or_else(|error| panic!("real php-fpm group launch failed: {error}"));

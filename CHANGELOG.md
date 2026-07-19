@@ -17,20 +17,32 @@ All notable changes to Hearth will be documented in this file.
   separate exact-hash `fpm/manifest.toml`. Typed Hearth-owned/user-managed/blocked states,
   guarded dead-socket cleanup, all-installed-candidate syntax/start proof, and
   generation-aware `pending restart` reporting keep ownership truthful.
-- **Launch-probed observation**: `--show [key]` and `--status [key]` report
+- **Effective-value observation**: `--show [key]` and `--status [key]` report
   per-target observed values by executing each CLI binary under its exact
   launch environments (`-r 'echo ini_get(...)'`) and Hearth's supervised FPM
   via `php-fpm -i` under the exact service env; a keyless `--status` stays
   the pure coverage table. FPM binaries are never executed for
-  classification — ambient (Herd/Homebrew) FPM is structurally unprobed. Four-state vocabulary
-  (`configured` / `materialized` / `launch-probed` / `live-observed`), a
-  truthful `pending restart` marker (manifest materialization timestamp vs
-  the supervisor's own FPM spawn time), and `[not running]` for a
-  registered-but-stopped FPM. Probe failures render `n/a` and never fail
-  the command. Live FPM-worker observation is not yet available and lands with
-  PR-2 of todo #2343; ambient (non-Hearth-launched) FPM remains an unverified
-  row that Hearth never writes for or executes. No universal coverage is
-  claimed anywhere.
+  classification — ambient (Herd/Homebrew) FPM is structurally unprobed.
+  Keyed Show/Status can now upgrade the launched row from `launch-probed` to
+  `live-observed` after the complete launch-provenance and responder-identity
+  gate succeeds.
+
+The exact observation vocabulary is `configured`, `materialized`,
+`launch-probed`, and `live-observed`. For FPM, `live-observed` is available
+only for keyed Show/Status when external ownership is proven `Unowned`, the
+registered service is Running with Hearth-owned launch provenance, current
+conf/probe hashes match that launch, the conf was applied no later than the
+launch, the same current-user-owned Unix socket survives the request, the
+strict FastCGI/CGI/JSON response has the exact key and fresh nonce with clean
+EOF, the launch generation remains unchanged, and the responder PID belongs
+to the supervised process group. A file parse can never mint `live-observed`;
+user-managed or ambient FPM, stale config (`pending restart`), and any
+ownership/generation/hash/socket/protocol/PID miss preserve the lesser label
+and keep the command successful. After a daemon version mismatch, run
+`hearth daemon stop && hearth daemon start`.
+
+The `pending restart` marker remains independent of observation, registered
+but stopped FPM remains `[not running]`, and no universal coverage is claimed.
 
 ### Changed
 - `hearth php use` never touches PHP-FPM while Herd owns it: the switch
