@@ -422,6 +422,102 @@ pub fn conf_applied_at_unix_ms(config_dir: &Path) -> Option<u64> {
         .and_then(|entry| entry.applied_at_unix_ms)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum MatrixOutcome {
+    Skip,
+    AllAccepted,
+    Rejected {
+        failures: Vec<(super::resolver::FpmCandidate, String)>,
+    },
+}
+
+#[allow(dead_code)]
+fn syntax_check(
+    candidate: &super::resolver::FpmCandidate,
+    conf: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(&candidate.canonical)
+        .arg("-t")
+        .arg(format!("--fpm-config={}", conf.display()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not start syntax check: {error}"))?;
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let reader = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stderr.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let room = 4096_usize.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buffer[..read.min(room)]);
+                }
+            }
+        }
+        kept
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(format!("syntax check wait failed: {error}"));
+            }
+        }
+    };
+    let stderr = String::from_utf8_lossy(&reader.join().unwrap_or_default()).into_owned();
+    match status {
+        None => Err(format!("syntax check timed out after {timeout:?}")),
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(format!("syntax check exited {status}: {stderr}")
+            .chars()
+            .take(4096)
+            .collect()),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn fpm_syntax_matrix(
+    candidates: &[super::resolver::FpmCandidate],
+    conf: &Path,
+    per_check_timeout: Duration,
+) -> MatrixOutcome {
+    if candidates.is_empty() {
+        return MatrixOutcome::Skip;
+    }
+    let failures = candidates
+        .iter()
+        .filter_map(|candidate| {
+            syntax_check(candidate, conf, per_check_timeout)
+                .err()
+                .map(|reason| (candidate.clone(), reason))
+        })
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        MatrixOutcome::AllAccepted
+    } else {
+        MatrixOutcome::Rejected { failures }
+    }
+}
+
 fn materialize_with_options(
     config_dir: &Path,
     hearth_root: &Path,
@@ -1262,5 +1358,212 @@ mod tests {
             std::fs::read(fpm_manifest_path(&config_dir)).unwrap(),
             manifest_before
         );
+    }
+
+    fn matrix_candidate(
+        path: &Path,
+        version: &'static str,
+        tier: crate::php::resolver::FpmTier,
+        script: &str,
+    ) -> crate::php::resolver::FpmCandidate {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::php::resolver::FpmCandidate {
+            version,
+            tier,
+            path: path.to_path_buf(),
+            canonical: path.canonicalize().unwrap(),
+        }
+    }
+
+    #[test]
+    fn matrix_fails_when_any_installed_candidate_rejects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let accept = matrix_candidate(
+            &tmp.path().join("hearth/php-fpm"),
+            "8.4",
+            crate::php::resolver::FpmTier::Hearth,
+            "#!/bin/sh\nexit 0\n",
+        );
+        let reject = matrix_candidate(
+            &tmp.path().join("homebrew/php-fpm"),
+            "8.4",
+            crate::php::resolver::FpmTier::Homebrew,
+            "#!/bin/sh\necho incompatible >&2\nexit 1\n",
+        );
+        let outcome = fpm_syntax_matrix(
+            &[accept, reject.clone()],
+            &tmp.path().join("php-fpm.conf"),
+            std::time::Duration::from_secs(5),
+        );
+        match outcome {
+            MatrixOutcome::Rejected { failures } => {
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].0, reject);
+                assert!(failures[0].1.contains("incompatible"));
+            }
+            other => panic!("expected lower-tier rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matrix_skips_only_on_zero_candidates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            fpm_syntax_matrix(
+                &[],
+                &tmp.path().join("php-fpm.conf"),
+                std::time::Duration::from_secs(5),
+            ),
+            MatrixOutcome::Skip
+        );
+        let accept = matrix_candidate(
+            &tmp.path().join("php-fpm"),
+            "8.4",
+            crate::php::resolver::FpmTier::Hearth,
+            "#!/bin/sh\nexit 0\n",
+        );
+        assert_eq!(
+            fpm_syntax_matrix(
+                &[accept],
+                &tmp.path().join("php-fpm.conf"),
+                std::time::Duration::from_secs(5),
+            ),
+            MatrixOutcome::AllAccepted
+        );
+    }
+
+    #[test]
+    fn real_fpm_starts_and_serves_the_generated_config() {
+        use command_group::CommandGroup;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let _env = crate::test_env::EnvGuard::capture([
+            "HEARTH_CONFIG_DIR",
+            "HEARTH_ISOLATED_ROOT",
+            "HEARTH_HERD_ROOT",
+            "HEARTH_HOMEBREW_ROOT",
+        ]);
+        let roots = crate::php::targets::ProviderRoots::detect().unwrap();
+        let set = crate::php::resolver::all_phpfpm_candidates(&roots);
+        for rejected in &set.rejected {
+            eprintln!(
+                "php-fpm candidate rejected: {} {:?} {}: {}",
+                rejected.version,
+                rejected.tier,
+                rejected.path.display(),
+                rejected.reason
+            );
+        }
+        if set.candidates.is_empty() {
+            eprintln!("SKIP: no real php-fpm on this machine");
+            return;
+        }
+
+        let tmp = tempfile::Builder::new()
+            .prefix("hearth fpm proof")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let config_dir = tmp.path().canonicalize().unwrap();
+        assert!(matches!(
+            materialize(&config_dir, &config_dir).state,
+            FpmConfState::HearthOwned { .. }
+        ));
+        let conf = conf_path(&config_dir);
+        assert_eq!(
+            fpm_syntax_matrix(&set.candidates, &conf, std::time::Duration::from_secs(10)),
+            MatrixOutcome::AllAccepted
+        );
+
+        let version = crate::php::SUPPORTED_VERSIONS
+            .iter()
+            .rev()
+            .find(|version| {
+                set.candidates
+                    .iter()
+                    .any(|candidate| candidate.version == **version)
+            })
+            .unwrap();
+        let same_version: Vec<_> = set
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.version == *version)
+            .collect();
+        let resolver_pick = crate::php::resolver::resolve_phpfpm_binary(version, &roots.hearth);
+        let mapped = resolver_pick.as_ref().and_then(|path| {
+            let metadata = std::fs::metadata(path).ok()?;
+            same_version
+                .iter()
+                .find(|candidate| {
+                    std::fs::metadata(&candidate.canonical).is_ok_and(|candidate_metadata| {
+                        candidate_metadata.dev() == metadata.dev()
+                            && candidate_metadata.ino() == metadata.ino()
+                    })
+                })
+                .copied()
+        });
+        if resolver_pick.is_some() && mapped.is_none() {
+            eprintln!(
+                "resolver mismatch for PHP {version}: pick {:?} failed verified candidate mapping; \
+                 falling back by tier",
+                resolver_pick
+            );
+        }
+        let candidate = mapped.unwrap_or(same_version[0]);
+
+        let socket = socket_path(&config_dir);
+        drop(UnixListener::bind(&socket).unwrap());
+        let (key, value) = crate::php::scan_dir_env(&config_dir, version);
+        let mut command = std::process::Command::new(&candidate.canonical);
+        command
+            .arg("--nodaemonize")
+            .arg(format!("--fpm-config={}", conf.display()))
+            .env(key, value)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.group_spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if UnixStream::connect(&socket).is_ok() {
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!(
+                    "real php-fpm {} {:?} exited before readiness: {status}; log: {}",
+                    candidate.version,
+                    candidate.tier,
+                    std::fs::read_to_string(config_dir.join("log/php-fpm.log"))
+                        .unwrap_or_default()
+                        .chars()
+                        .take(4096)
+                        .collect::<String>()
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real php-fpm readiness timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let metadata = std::fs::symlink_metadata(&socket).unwrap();
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert!(UnixStream::connect(&socket).is_ok());
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(child.id() as i32)),
+            nix::sys::signal::Signal::SIGQUIT,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if child.try_wait().unwrap().is_none() {
+            let _ = child.kill();
+        }
+        child.wait().unwrap();
     }
 }

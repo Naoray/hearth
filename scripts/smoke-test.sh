@@ -144,6 +144,7 @@ on_exit() {
     info "EXIT: verifying real user state (always, before cleanup; original status=$status)..."
     verify_real_state
     [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null && wait "$DAEMON_PID" 2>/dev/null
+    chmod 755 "$HEARTH_CONFIG_DIR/fpm" 2>/dev/null || true
     rm -rf "$SMOKE_ROOT" 2>/dev/null
     # Orphan check: nothing referencing the disposable root may survive.
     if pgrep -f "$SMOKE_ROOT" >/dev/null 2>&1; then
@@ -243,8 +244,6 @@ for v in 8.3 8.4; do
     make_fake_php "$v" "$HEARTH_CONFIG_DIR/php/$v/php"
     make_fake_php "$v" "$HEARTH_CONFIG_DIR/php/$v/php-fpm"
 done
-mkdir -p "$HEARTH_CONFIG_DIR/fpm"
-echo "; smoke fpm config" > "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf"
 
 # ── Build ────────────────────────────────────────────────────────
 info "Building workspace..."
@@ -340,6 +339,13 @@ boot_daemon() {
 # ── SH. Simulated Herd ownership: boot skip + `php use` takes no FPM ─
 info "SH: simulated Herd ownership — boot skip and ownership-free php use..."
 boot_daemon 1
+if [ -f "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf" ] \
+    && [ -f "$HEARTH_CONFIG_DIR/fpm/hearth-probe.php" ] \
+    && [ -f "$HEARTH_CONFIG_DIR/fpm/manifest.toml" ]; then
+    pass "SH: fresh boot generated FPM conf, probe, and manifest without a stub"
+else
+    fail "SH: fresh boot did not materialize the complete FPM artifact set"
+fi
 if grep -q "Herd detected — skipping" "$SMOKE_ROOT/daemon.log"; then
     pass "SH: boot skipped nginx/php-fpm/dnsmasq under simulated Herd"
 else
@@ -580,22 +586,27 @@ else
     fail "S9: leftover channel files"
 fi
 
-# ── S9b. Missing FPM config on a FRESH boot: unconditional gate ──
-# stop → remove config → fresh Herd-absent daemon: no stale registration
-# can mask the failure, and the LAUNCH-BLOCKED assertions are deterministic
-# on every host (C1-4, review 5650).
-info "S9b: conf-missing fresh boot — unconditional LAUNCH-BLOCKED + set exit 0..."
+# ── S9b. Fully unmanaged + unwritable FPM dir ─────────────────────
+info "S9b: fully unmanaged read-only FPM dir — LAUNCH-BLOCKED + recovery..."
+if [ ! -e "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf" ] \
+    && [ ! -e "$HEARTH_CONFIG_DIR/fpm/hearth-probe.php" ] \
+    && [ ! -e "$HEARTH_CONFIG_DIR/fpm/manifest.toml" ]; then
+    pass "S9b: unmanage removed conf, probe, and manifest as one set"
+else
+    fail "S9b: FPM artifacts survived unmanage"
+fi
 stop_daemon
-mv "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf" "$SMOKE_ROOT/php-fpm.conf.bak"
+chmod 555 "$HEARTH_CONFIG_DIR/fpm"
 boot_daemon 0
 if $CLI status 2>&1 | grep -q "php-fpm"; then
-    fail "S9b: FPM must not register at boot without its config"
+    fail "S9b: FPM must not register while generation is blocked"
 else
-    pass "S9b: no stale FPM registration to mask the missing config"
+    pass "S9b: blocked generation leaves FPM unregistered"
 fi
 OUTPUT=$($CLI php config --status 2>&1)
-if echo "$OUTPUT" | grep -q "LAUNCH-BLOCKED" && echo "$OUTPUT" | grep -q "#2343"; then
-    pass "S9b: --status renders the LAUNCH-BLOCKED row citing todo #2343 (unconditional)"
+if echo "$OUTPUT" | grep -q "LAUNCH-BLOCKED" \
+    && echo "$OUTPUT" | grep -q 'hearth php config --sync'; then
+    pass "S9b: --status renders LAUNCH-BLOCKED with sync remediation"
 else
     fail "S9b: expected LAUNCH-BLOCKED row, got: $OUTPUT"
 fi
@@ -612,8 +623,53 @@ else
     fail "S9b: exit=$STATUS output: $OUTPUT"
 fi
 $CLI php config --global --unset memory_limit >/dev/null 2>&1
+stop_daemon
+chmod 755 "$HEARTH_CONFIG_DIR/fpm"
+boot_daemon 0
+if [ -f "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf" ] \
+    && [ -f "$HEARTH_CONFIG_DIR/fpm/hearth-probe.php" ] \
+    && [ -f "$HEARTH_CONFIG_DIR/fpm/manifest.toml" ] \
+    && $CLI status 2>&1 | grep -q "php-fpm"; then
+    pass "S9b: writable fresh boot regenerates and registers FPM"
+else
+    fail "S9b: regeneration/registration did not recover"
+fi
+
+# ── S9c. Foreign config is a byte-stable user-managed escape hatch ─
+info "S9c: user-managed FPM config remains foreign across boot + unmanage..."
 $CLI php config --unmanage >/dev/null 2>&1
-mv "$SMOKE_ROOT/php-fpm.conf.bak" "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf"
+stop_daemon
+if [ ! -e "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf" ] \
+    && [ ! -e "$HEARTH_CONFIG_DIR/fpm/hearth-probe.php" ] \
+    && [ ! -e "$HEARTH_CONFIG_DIR/fpm/manifest.toml" ]; then
+    pass "S9c: starting from fully unmanaged FPM state"
+else
+    fail "S9c: expected fully unmanaged FPM state"
+fi
+printf '; foreign user-managed fpm config\n' > "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf"
+FOREIGN_FPM_SHA="$(shasum -a 256 "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf" | cut -d' ' -f1)"
+boot_daemon 0
+OUTPUT=$($CLI php config --status 2>&1)
+if $CLI status 2>&1 | grep -q "php-fpm" \
+    && echo "$OUTPUT" | grep -q "user-managed fpm config"; then
+    pass "S9c: foreign config registers with truthful user-managed coverage"
+else
+    fail "S9c: user-managed registration/status mismatch: $OUTPUT"
+fi
+if [ ! -e "$HEARTH_CONFIG_DIR/fpm/hearth-probe.php" ] \
+    && [ ! -e "$HEARTH_CONFIG_DIR/fpm/manifest.toml" ]; then
+    pass "S9c: boot created no probe or ownership manifest beside foreign conf"
+else
+    fail "S9c: boot mixed Hearth artifacts with a foreign conf"
+fi
+$CLI php config --unmanage >/dev/null 2>&1
+if [ "$(shasum -a 256 "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf" | cut -d' ' -f1)" = "$FOREIGN_FPM_SHA" ] \
+    && [ ! -e "$HEARTH_CONFIG_DIR/fpm/hearth-probe.php" ] \
+    && [ ! -e "$HEARTH_CONFIG_DIR/fpm/manifest.toml" ]; then
+    pass "S9c: unmanage preserved foreign bytes and created no owned artifacts"
+else
+    fail "S9c: foreign config changed or owned artifacts appeared"
+fi
 
 # ── S10. No privileged paths in any scenario output ──────────────
 info "S10: no privileged-path writes..."
@@ -621,6 +677,33 @@ if $CLI php config --status 2>&1 | grep -q "usr/local.*Written"; then
     fail "S10: privileged path appears as written"
 else
     pass "S10: no privileged writes reported"
+fi
+
+DOCS_AGREE=1
+for doc in README.md CHANGELOG.md CLAUDE.md; do
+    grep -q "fpm/php-fpm.conf" "$doc" || DOCS_AGREE=0
+    grep -q "fpm/manifest.toml" "$doc" || DOCS_AGREE=0
+    grep -q "PR-2 of todo #2343" "$doc" || DOCS_AGREE=0
+done
+if [ "$DOCS_AGREE" -eq 1 ]; then
+    pass "S10: README/CHANGELOG/CLAUDE agree on FPM artifacts and PR-2 deferral"
+else
+    fail "S10: FPM documentation surfaces disagree"
+fi
+
+# ── S11. Every installed real FPM candidate syntax + serve proof ─
+info "S11: identity-verified all-candidate real FPM proof..."
+REAL_FPM_OUTPUT=$(env -u HEARTH_CONFIG_DIR -u HEARTH_ISOLATED_ROOT \
+    -u HEARTH_HERD_ROOT -u HEARTH_HOMEBREW_ROOT \
+    cargo test -p hearth-lib real_fpm_starts_and_serves_the_generated_config \
+    -- --test-threads=1 --nocapture 2>&1)
+REAL_FPM_STATUS=$?
+if [ "$REAL_FPM_STATUS" -eq 0 ] && echo "$REAL_FPM_OUTPUT" | grep -q "SKIP: no real php-fpm"; then
+    pass "S11: SKIP recorded — no identity-verified real php-fpm candidates"
+elif [ "$REAL_FPM_STATUS" -eq 0 ]; then
+    pass "S11: every verified candidate accepted; selected FPM served the Unix socket"
+else
+    fail "S11: installed candidate matrix/start proof failed: $(echo "$REAL_FPM_OUTPUT" | tail -8 | tr '\n' ' ')"
 fi
 
 echo ""

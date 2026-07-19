@@ -33,6 +33,7 @@ hearth-daemon (always-on, owns all processes via process groups)
 | `php/targets.rs` | Provider-explicit target discovery, scan-dir/env-honor probing, channel verification/classification, launch-probed effective-value probes (`-r` CLI / `-i` FPM) |
 | `php/engine.rs` | `PhpConfigEngine`: op-locked Set/Unset/Show/Status/Sync/Unmanage, row building with truthful coverage labels, launch-probe fill, conditional FPM restart |
 | `php/reconcile.rs` | Manifest+journal channel-file reconciliation: atomic writes, exact-hash ownership, crash recovery, legacy INI migration, `applied_at_unix_ms` materialization stamps |
+| `php/fpm.rs` | Generated private Unix-listener FPM conf + probe, typed ownership state, strict separate manifest, syntax matrix, recovery/unmanage transaction |
 | `php/ini_guard.rs` | INI key/value validation (denylist, length, injection safety) — the single choke point before persistence and probes |
 | `site.rs` | Multi-home site enumeration (reads from both Valet and Herd config dirs) |
 | `valet.rs` | Herd-aware site CLI wrapper (Valet fallback; link, unlink, park, secure, unsecure) |
@@ -120,3 +121,8 @@ PHP INI store (canonical source for `hearth php config`):
   tracked exact-hash in `php/manifest.toml`; older binaries read this config
   but their next `config.save()` drops `[php_ini]` (downgrade is
   write-destructive — back up config.toml first)
+- Hearth FPM launch artifacts: `fpm/php-fpm.conf`, `fpm/hearth-probe.php`, and
+  the separate exact-hash `fpm/manifest.toml`; listener `run/php-fpm.sock`.
+  A foreign conf without that manifest remains user-managed and byte-stable.
+  Live FPM-worker observation is not yet available and lands with PR-2 of todo #2343;
+  ambient FPM is never executed or written for.

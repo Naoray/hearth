@@ -295,10 +295,19 @@ impl PhpConfigEngine {
 
     /// Journal recovery → guarded legacy migration → reconcile.
     async fn sync_locked(&self) -> Result<PhpConfigOutcome, String> {
+        self.sync_locked_mode(true).await
+    }
+
+    async fn sync_locked_mode(
+        &self,
+        materialize_static_fpm: bool,
+    ) -> Result<PhpConfigOutcome, String> {
         reconcile::recover_pending(&self.manifest_path())
             .map_err(|e| format!("journal recovery failed: {e}"))?;
-        fpm::recover_pending_fpm(&self.config_dir)
-            .map_err(|e| format!("FPM journal recovery failed: {e}"))?;
+        if materialize_static_fpm {
+            fpm::recover_pending_fpm(&self.config_dir)
+                .map_err(|e| format!("FPM journal recovery failed: {e}"))?;
+        }
 
         let (snapshot, default_php) = {
             let mut cfg = self.config.lock().await;
@@ -333,22 +342,24 @@ impl PhpConfigEngine {
             })
             .collect();
         files.extend(creation_failures);
-        let fpm_report = fpm::materialize(&self.config_dir, &self.provider_roots.hearth);
-        if !matches!(fpm_report.state, FpmConfState::UserManaged { .. }) {
-            files.extend([
-                FileOutcome {
-                    path: fpm::conf_path(&self.config_dir)
-                        .to_string_lossy()
-                        .to_string(),
-                    result: wire_result(&fpm_report.conf),
-                },
-                FileOutcome {
-                    path: fpm::probe_script_path(&self.config_dir)
-                        .to_string_lossy()
-                        .to_string(),
-                    result: wire_result(&fpm_report.probe),
-                },
-            ]);
+        if materialize_static_fpm {
+            let fpm_report = fpm::materialize(&self.config_dir, &self.provider_roots.hearth);
+            if !matches!(fpm_report.state, FpmConfState::UserManaged { .. }) {
+                files.extend([
+                    FileOutcome {
+                        path: fpm::conf_path(&self.config_dir)
+                            .to_string_lossy()
+                            .to_string(),
+                        result: wire_result(&fpm_report.conf),
+                    },
+                    FileOutcome {
+                        path: fpm::probe_script_path(&self.config_dir)
+                            .to_string_lossy()
+                            .to_string(),
+                        result: wire_result(&fpm_report.probe),
+                    },
+                ]);
+            }
         }
         let rows = self.build_rows(&snapshot, &default_php, &targets, None, &file_states);
 
@@ -964,7 +975,7 @@ impl PhpConfigEngine {
         // Reconcile for the new active version, hard-gated: a Refused/Failed
         // channel aborts the FPM restart (config release above keeps lock
         // order; op lock stays held for the whole transaction).
-        require_reconciled(self.sync_locked().await)
+        require_reconciled(self.sync_locked_mode(false).await)
             .map_err(|e| format!("switched default_php to {version} (persisted), but: {e}"))?;
 
         // C6-2 (review 5650 r7): the ENTIRE FPM replacement is one
@@ -1936,7 +1947,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switch_generates_missing_conf_and_restarts_fpm() {
+    async fn switch_to_launch_blocked_version_removes_stale_fpm() {
         let fx = fixture(false);
         write_fake_fpm_pair(&fx, "8.3");
         write_fake_fpm_pair(&fx, "8.4");
@@ -1950,25 +1961,28 @@ mod tests {
             .register(crate::service::manager::hearth_fpm_service("8.3", &fx.config_dir).unwrap())
             .unwrap();
 
-        // The switch's hard-gated sync generates the missing static config.
+        // Static FPM generation is reserved for boot/explicit Sync.
         std::fs::remove_file(fx.config_dir.join("fpm/php-fpm.conf")).unwrap();
         let message = switch_php_version(&supervisor, &fx.engine, "8.4")
             .await
             .unwrap();
-        assert!(message.contains("php-fpm restarted"), "got: {message}");
+        assert!(message.contains("php-fpm not registered"), "got: {message}");
+        assert!(
+            message.contains("run `hearth php config --sync`"),
+            "got: {message}"
+        );
         assert!(
             supervisor
                 .lock()
                 .await
                 .service(ServiceKind::PhpFpm)
-                .is_some(),
-            "generated config keeps FPM registered"
+                .is_none(),
+            "stale registration must be removed"
         );
         assert!(matches!(
             fx.engine.fpm_conf_state(),
-            FpmConfState::HearthOwned { .. }
+            FpmConfState::Blocked { .. }
         ));
-        let _ = supervisor.lock().await.stop_service(ServiceKind::PhpFpm);
     }
 
     #[tokio::test]

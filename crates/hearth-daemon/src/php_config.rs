@@ -61,8 +61,15 @@ async fn annotate_fpm_runtime(state: &Arc<DaemonState>, outcome: &mut PhpConfigO
         })
     };
     let Some((service_state, started_at, supervised_binary)) = snapshot else {
-        // Unregistered FPM keeps its truthful static row (LAUNCH-BLOCKED /
-        // herd-owned); there is no run state to report.
+        let row = &mut outcome.rows[pos];
+        if row.coverage.starts_with("supervised") {
+            row.run_state = Some("not registered".to_string());
+            row.coverage.push_str(&format!(
+                "; restart the daemon (`hearth daemon stop && hearth daemon start`) or run \
+                 `hearth php use {}` to register FPM",
+                row.version
+            ));
+        }
         return;
     };
     let row = &mut outcome.rows[pos];
@@ -986,15 +993,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn annotate_leaves_unregistered_fpm_row_untouched() {
+    async fn annotate_marks_unregistered_supervised_fpm_with_remediation() {
         let (_tmp, _config_path, state) = state_fixture();
         let default_php = state.config.lock().await.default_php.clone();
         let mut outcome = outcome_with(vec![launched_row(&default_php)]);
         annotate_fpm_runtime(&state, &mut outcome).await;
         let row = &outcome.rows[0];
-        assert_eq!(
-            row.run_state, None,
-            "unregistered FPM keeps its static truthful row"
+        assert_eq!(row.run_state.as_deref(), Some("not registered"));
+        assert!(
+            row.coverage
+                .contains("hearth daemon stop && hearth daemon start")
+        );
+        assert!(
+            row.coverage
+                .contains(&format!("hearth php use {default_php}"))
         );
         assert!(!row.pending_restart);
     }

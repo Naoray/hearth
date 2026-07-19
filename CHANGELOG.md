@@ -12,6 +12,11 @@ All notable changes to Hearth will be documented in this file.
   and guarded migration of the legacy per-version Hearth `php.ini` files.
   New actions: `--global`, `--php <V>`, `--show`, `--status`, `--unset`,
   `--sync`, `--unmanage`, plus the `hearth php exec` launch shim.
+- **Hearth-owned PHP-FPM configuration**: install, daemon boot, and explicit
+  Sync atomically generate `fpm/php-fpm.conf`, `fpm/hearth-probe.php`, and the
+  separate exact-hash `fpm/manifest.toml`. Typed Hearth-owned/user-managed/blocked states,
+  guarded dead-socket cleanup, all-installed-candidate syntax/start proof, and
+  generation-aware `pending restart` reporting keep ownership truthful.
 - **Launch-probed observation**: `--show [key]` and `--status [key]` report
   per-target observed values by executing each CLI binary under its exact
   launch environments (`-r 'echo ini_get(...)'`) and Hearth's supervised FPM
@@ -22,9 +27,10 @@ All notable changes to Hearth will be documented in this file.
   truthful `pending restart` marker (manifest materialization timestamp vs
   the supervisor's own FPM spawn time), and `[not running]` for a
   registered-but-stopped FPM. Probe failures render `n/a` and never fail
-  the command. Live FPM-worker observation is deferred to todo #2343;
-  ambient (non-Hearth-launched) FPM remains an unverified row that Hearth
-  never writes for. No universal coverage is claimed anywhere.
+  the command. Live FPM-worker observation is not yet available and lands with
+  PR-2 of todo #2343; ambient (non-Hearth-launched) FPM remains an unverified
+  row that Hearth never writes for or executes. No universal coverage is
+  claimed anywhere.
 
 ### Changed
 - `hearth php use` never touches PHP-FPM while Herd owns it: the switch
