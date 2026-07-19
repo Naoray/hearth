@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::reconcile::{
-    ArtifactDirVerifier, DirIdentity, EntryState, FileAction, FinalizeMode, Manifest,
+    ArtifactDirVerifier, DirIdentity, EntryState, FileAction, FinalizeMode, LastOutcome, Manifest,
     ManifestEntry, OwnedArtifactSpec, WriteOutcome, manifest_set_transaction, sha256_hex,
 };
 use super::targets::{ensure_hearth_channel_dir, verify_user_channel};
@@ -397,6 +397,29 @@ pub fn conf_state(config_dir: &Path) -> FpmConfState {
         Ok(manifest) => state_from_manifest(config_dir, manifest),
         Err(reason) => FpmConfState::Blocked { reason },
     }
+}
+
+/// Durable application time for the exact Hearth-owned FPM config, available
+/// only through the same strict manifest/root/hash validation as conf state.
+pub fn conf_applied_at_unix_ms(config_dir: &Path) -> Option<u64> {
+    let manifest = load_fpm_manifest_strict(config_dir).ok()??;
+    if !matches!(
+        state_from_manifest(config_dir, Some(manifest.clone())),
+        FpmConfState::HearthOwned { .. }
+    ) {
+        return None;
+    }
+    manifest
+        .files
+        .iter()
+        .find(|entry| {
+            entry.path == conf_path(config_dir)
+                && entry.php_version == "-"
+                && entry.channel == "fpm-conf"
+                && entry.state == EntryState::Applied
+                && matches!(entry.last_outcome, LastOutcome::Written)
+        })
+        .and_then(|entry| entry.applied_at_unix_ms)
 }
 
 fn materialize_with_options(

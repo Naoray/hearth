@@ -112,6 +112,52 @@ fn channel_applied_at_ms(
     version: &str,
     supervised_binary: &std::path::Path,
 ) -> Option<u64> {
+    let ini = ini_channel_applied_at_ms(state, version, supervised_binary);
+    let fpm = supervised_fpm_identity_valid(state, version, supervised_binary)
+        .then(|| hearth_lib::php::fpm::conf_applied_at_unix_ms(state.php_engine.config_dir()))
+        .flatten();
+    ini.max(fpm)
+}
+
+/// Static FPM timestamps get exactly the same canonical provider/version/FPM
+/// executable gate as INI-channel timestamps. Containment alone never grants
+/// pending-restart authority.
+fn supervised_fpm_identity_valid(
+    state: &Arc<DaemonState>,
+    version: &str,
+    supervised_binary: &std::path::Path,
+) -> bool {
+    use hearth_lib::php::targets::{PhpProvider, PhpSapi};
+
+    let roots = state.php_engine.provider_roots();
+    let Some(canonical_binary) = supervised_binary.canonicalize().ok() else {
+        return false;
+    };
+    let mut matched = Vec::new();
+    for (provider, root) in [
+        (PhpProvider::Hearth, &roots.hearth),
+        (PhpProvider::Herd, &roots.herd),
+        (PhpProvider::Homebrew, &roots.homebrew),
+    ] {
+        let Ok(canonical_root) = root.canonicalize() else {
+            continue;
+        };
+        if canonical_root.parent().is_some() && canonical_binary.starts_with(&canonical_root) {
+            matched.push(provider);
+        }
+    }
+    if matched.len() != 1 {
+        return false;
+    }
+    hearth_lib::php::targets::verify_binary_identity(matched[0], version, PhpSapi::Fpm, roots)
+        .is_ok_and(|expected| expected == canonical_binary)
+}
+
+fn ini_channel_applied_at_ms(
+    state: &Arc<DaemonState>,
+    version: &str,
+    supervised_binary: &std::path::Path,
+) -> Option<u64> {
     use hearth_lib::php::reconcile::{EntryState, LastOutcome};
     use hearth_lib::php::targets::{PhpProvider, expected_channel_dir};
 
@@ -968,6 +1014,121 @@ mod tests {
         let content = b"; managed by hearth\nmemory_limit=1G\n";
         std::fs::write(dir.join(CHANNEL_FILE_NAME), content).unwrap();
         hearth_lib::php::reconcile::sha256_hex(content)
+    }
+
+    async fn start_owned_fpm(state: &Arc<DaemonState>) -> String {
+        let version = state.config.lock().await.default_php.clone();
+        let config_dir = state.php_engine.config_dir();
+        assert!(matches!(
+            hearth_lib::php::fpm::materialize(config_dir, config_dir).state,
+            hearth_lib::php::fpm::FpmConfState::HearthOwned { .. }
+        ));
+        write_spawnable(&config_dir.join("php").join(&version).join("php-fpm"));
+        let service = hearth_lib::service::manager::hearth_fpm_service(&version, config_dir)
+            .expect("owned FPM service");
+        let mut supervisor = state.supervisor.lock().await;
+        supervisor.register(service).unwrap();
+        supervisor.start_service(ServiceKind::PhpFpm).unwrap();
+        version
+    }
+
+    async fn stop_fpm(state: &Arc<DaemonState>) {
+        state
+            .supervisor
+            .lock()
+            .await
+            .stop_service(ServiceKind::PhpFpm)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn regenerated_conf_marks_running_fpm_pending_restart() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = start_owned_fpm(&state).await;
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        hearth_lib::php::fpm::unmanage_fpm(state.php_engine.config_dir()).unwrap();
+        assert!(matches!(
+            hearth_lib::php::fpm::materialize(
+                state.php_engine.config_dir(),
+                state.php_engine.config_dir(),
+            )
+            .state,
+            hearth_lib::php::fpm::FpmConfState::HearthOwned { .. }
+        ));
+
+        let mut outcome = outcome_with(vec![launched_row(&version)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        assert!(outcome.rows[0].pending_restart);
+        stop_fpm(&state).await;
+    }
+
+    #[tokio::test]
+    async fn pending_restart_ignores_user_managed_conf() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = state.config.lock().await.default_php.clone();
+        let config_dir = state.php_engine.config_dir();
+        let conf = hearth_lib::php::fpm::conf_path(config_dir);
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "; user managed\n").unwrap();
+        write_spawnable(&config_dir.join("php").join(&version).join("php-fpm"));
+        let service = hearth_lib::service::manager::hearth_fpm_service(&version, config_dir)
+            .expect("user-managed config is launchable");
+        {
+            let mut supervisor = state.supervisor.lock().await;
+            supervisor.register(service).unwrap();
+            supervisor.start_service(ServiceKind::PhpFpm).unwrap();
+        }
+
+        let mut outcome = outcome_with(vec![launched_row(&version)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        assert!(!outcome.rows[0].pending_restart);
+        stop_fpm(&state).await;
+    }
+
+    #[tokio::test]
+    async fn pending_restart_visible_when_observation_na() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = start_owned_fpm(&state).await;
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        hearth_lib::php::fpm::unmanage_fpm(state.php_engine.config_dir()).unwrap();
+        hearth_lib::php::fpm::materialize(
+            state.php_engine.config_dir(),
+            state.php_engine.config_dir(),
+        );
+
+        let mut row = launched_row(&version);
+        row.observed = None;
+        row.observed_state = "n/a".to_string();
+        let mut outcome = outcome_with(vec![row]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        assert_eq!(outcome.rows[0].observed_state, "n/a");
+        assert!(outcome.rows[0].pending_restart);
+        stop_fpm(&state).await;
+    }
+
+    #[tokio::test]
+    async fn pending_restart_refuses_forged_fpm_manifest() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = start_owned_fpm(&state).await;
+        let path = hearth_lib::php::fpm::fpm_manifest_path(state.php_engine.config_dir());
+        let mut manifest = Manifest::load(&path).unwrap();
+        let conf = hearth_lib::php::fpm::conf_path(state.php_engine.config_dir());
+        let entry = manifest
+            .files
+            .iter_mut()
+            .find(|entry| entry.path == conf)
+            .unwrap();
+        entry.sha256 = "00".repeat(32);
+        entry.applied_at_unix_ms = Some(i64::MAX as u64);
+        manifest.save(&path).unwrap();
+
+        let mut outcome = outcome_with(vec![launched_row(&version)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        assert!(
+            !outcome.rows[0].pending_restart,
+            "a forged manifest cannot create pending-restart authority"
+        );
+        stop_fpm(&state).await;
     }
 
     // ---- C2-3 (review 5650 r2): exact-entry + root-bounded identity ----
