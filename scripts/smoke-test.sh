@@ -684,11 +684,16 @@ printf '; foreign user-managed fpm config\n' > "$HEARTH_CONFIG_DIR/fpm/php-fpm.c
 FOREIGN_FPM_SHA="$(shasum -a 256 "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf" | cut -d' ' -f1)"
 boot_daemon 0
 OUTPUT=$($CLI php config --status 2>&1)
-if $CLI status 2>&1 | grep -q "php-fpm" \
-    && echo "$OUTPUT" | grep -q "user-managed fpm config"; then
+S9C_SERVICE_STATUS=$($CLI status 2>&1)
+S9C_EXPECTED_COVERAGE="supervised (user-managed fpm config — live observation requires Hearth-generated config; remove/rename it and run --sync to adopt) [not running]"
+# Capture the complete status before matching: with pipefail, piping the CLI
+# into grep -q can turn an early php-fpm match into SIGPIPE when later rows are
+# rendered in HashMap order.
+if [[ "$S9C_SERVICE_STATUS" == *"php-fpm"* ]] \
+    && [[ "$OUTPUT" == *"$S9C_EXPECTED_COVERAGE"* ]]; then
     pass "S9c: foreign config registers with truthful user-managed coverage"
 else
-    fail "S9c: user-managed registration/status mismatch: $OUTPUT"
+    fail "S9c: user-managed registration/status mismatch: service=[$S9C_SERVICE_STATUS] config=[$OUTPUT]"
 fi
 if [ ! -e "$HEARTH_CONFIG_DIR/fpm/hearth-probe.php" ] \
     && [ ! -e "$HEARTH_CONFIG_DIR/fpm/manifest.toml" ]; then
