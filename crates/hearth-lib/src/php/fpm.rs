@@ -1494,74 +1494,109 @@ mod tests {
 
     const GROUP_DIAGNOSTIC_BYTES: usize = 4096;
 
+    #[derive(Default)]
+    struct GroupTestFaults {
+        graceful_signal_error: bool,
+        graceful_poll_error: bool,
+    }
+
+    enum GroupPollOutcome {
+        Absent,
+        LeaderExited,
+        TimedOut,
+    }
+
     struct GuardedGroupChild {
         child: command_group::GroupChild,
         pgid: i32,
-        stderr_reader: Option<std::thread::JoinHandle<Vec<u8>>>,
+        stderr: tempfile::NamedTempFile,
         status: Option<std::process::ExitStatus>,
+        faults: GroupTestFaults,
         cleaned: bool,
     }
 
     impl GuardedGroupChild {
         fn spawn(command: &mut std::process::Command) -> Result<Self, String> {
-            use command_group::CommandGroup;
-            use std::io::Read;
+            Self::spawn_after_owned(command, GroupTestFaults::default(), |_| Ok(()))
+        }
 
-            command.stderr(std::process::Stdio::piped());
-            let mut child = command
+        fn spawn_with_faults(
+            command: &mut std::process::Command,
+            faults: GroupTestFaults,
+        ) -> Result<Self, String> {
+            Self::spawn_after_owned(command, faults, |_| Ok(()))
+        }
+
+        fn spawn_after_owned(
+            command: &mut std::process::Command,
+            faults: GroupTestFaults,
+            after_owned: impl FnOnce(i32) -> Result<(), String>,
+        ) -> Result<Self, String> {
+            use command_group::CommandGroup;
+
+            let stderr = tempfile::NamedTempFile::new()
+                .map_err(|error| format!("stderr capture creation failed: {error}"))?;
+            let stderr_writer = stderr
+                .reopen()
+                .map_err(|error| format!("stderr capture reopen failed: {error}"))?;
+            command.stderr(std::process::Stdio::from(stderr_writer));
+            let child = command
                 .group_spawn()
                 .map_err(|error| format!("process-group spawn failed: {error}"))?;
-            let pgid = child.id() as i32;
-            let observed = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pgid)))
-                .map_err(|error| format!("could not validate launched PGID {pgid}: {error}"))?;
-            if observed.as_raw() != pgid {
-                let _ = child.kill();
-                let _ = child.wait();
+            // Ownership is installed immediately after group_spawn. Every
+            // fallible post-spawn step below therefore runs behind Drop.
+            let owned = Self {
+                pgid: child.id() as i32,
+                child,
+                stderr,
+                status: None,
+                faults,
+                cleaned: false,
+            };
+            after_owned(owned.pgid)?;
+            let observed = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(owned.pgid)))
+                .map_err(|error| {
+                    format!("could not validate launched PGID {}: {error}", owned.pgid)
+                })?;
+            if observed.as_raw() != owned.pgid {
                 return Err(format!(
-                    "launched leader {pgid} belongs to unexpected PGID {}",
+                    "launched leader {} belongs to unexpected PGID {}",
+                    owned.pgid,
                     observed.as_raw()
                 ));
             }
-            let mut stderr = child
-                .inner()
-                .stderr
-                .take()
-                .ok_or_else(|| "launched process did not expose piped stderr".to_string())?;
-            let stderr_reader = std::thread::spawn(move || {
-                let mut tail = std::collections::VecDeque::with_capacity(GROUP_DIAGNOSTIC_BYTES);
-                let mut buffer = [0_u8; 1024];
-                loop {
-                    match stderr.read(&mut buffer) {
-                        Ok(0) | Err(_) => break,
-                        Ok(read) => {
-                            for byte in &buffer[..read] {
-                                if tail.len() == GROUP_DIAGNOSTIC_BYTES {
-                                    tail.pop_front();
-                                }
-                                tail.push_back(*byte);
-                            }
-                        }
-                    }
-                }
-                tail.into_iter().collect()
-            });
-            Ok(Self {
-                child,
-                pgid,
-                stderr_reader: Some(stderr_reader),
-                status: None,
-                cleaned: false,
-            })
+            Ok(owned)
         }
 
-        fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
-            if self.status.is_none() {
-                self.status = self
-                    .child
-                    .try_wait()
-                    .map_err(|error| format!("leader wait failed: {error}"))?;
+        fn observe_leader_exit(&self) -> Result<Option<String>, String> {
+            let mut info: nix::libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                nix::libc::waitid(
+                    nix::libc::P_PID,
+                    self.pgid as nix::libc::id_t,
+                    &mut info,
+                    nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                return Err(format!(
+                    "leader status observation failed: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
-            Ok(self.status)
+            let pid = unsafe { info.si_pid() };
+            if pid == 0 {
+                return Ok(None);
+            }
+            let status = unsafe { info.si_status() };
+            let summary = match info.si_code {
+                nix::libc::CLD_EXITED => format!("exit status: {status}"),
+                nix::libc::CLD_KILLED | nix::libc::CLD_DUMPED => {
+                    format!("signal: {status}")
+                }
+                code => format!("waitid code {code}, status {status}"),
+            };
+            Ok(Some(summary))
         }
 
         fn group_exists(&self) -> Result<bool, String> {
@@ -1579,6 +1614,12 @@ mod tests {
         fn signal_group(&self, signal: nix::sys::signal::Signal) -> Result<(), String> {
             match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-self.pgid), signal) {
                 Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+                Err(nix::errno::Errno::EPERM) if self.observe_leader_exit()?.is_some() => {
+                    // macOS reports EPERM for a group represented only by an
+                    // exited, unreaped leader. Keep that identity witness and
+                    // require the exact post-reap absence proof below.
+                    Ok(())
+                }
                 Err(error) => Err(format!(
                     "could not send {signal:?} to validated PGID {}: {error}",
                     self.pgid
@@ -1586,15 +1627,23 @@ mod tests {
             }
         }
 
-        fn poll_group_exit(&mut self, timeout: Duration) -> Result<bool, String> {
+        fn poll_group_exit(&self, timeout: Duration) -> Result<GroupPollOutcome, String> {
             let deadline = std::time::Instant::now() + timeout;
             loop {
-                let _ = self.try_wait()?;
-                if !self.group_exists()? {
-                    return Ok(true);
+                match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-self.pgid), None) {
+                    Err(nix::errno::Errno::ESRCH) => return Ok(GroupPollOutcome::Absent),
+                    Ok(()) | Err(nix::errno::Errno::EPERM)
+                        if self.observe_leader_exit()?.is_some() =>
+                    {
+                        return Ok(GroupPollOutcome::LeaderExited);
+                    }
+                    Ok(()) => {}
+                    Err(error) => {
+                        return Err(format!("could not inspect PGID {}: {error}", self.pgid));
+                    }
                 }
                 if std::time::Instant::now() >= deadline {
-                    return Ok(false);
+                    return Ok(GroupPollOutcome::TimedOut);
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -1608,41 +1657,74 @@ mod tests {
             if self.cleaned {
                 return Ok(());
             }
-            self.signal_group(nix::sys::signal::Signal::SIGQUIT)?;
-            if !self.poll_group_exit(graceful_timeout)? {
-                self.signal_group(nix::sys::signal::Signal::SIGKILL)?;
-                if !self.poll_group_exit(force_timeout)? {
-                    return Err(format!(
-                        "validated PGID {} survived SIGQUIT and SIGKILL",
+            let mut errors = Vec::new();
+            let graceful_signal = if self.faults.graceful_signal_error {
+                Err("injected graceful signal error".to_string())
+            } else {
+                self.signal_group(nix::sys::signal::Signal::SIGQUIT)
+            };
+            if let Err(error) = &graceful_signal {
+                errors.push(error.clone());
+            }
+            let graceful_poll = if self.faults.graceful_poll_error {
+                Err("injected graceful poll error".to_string())
+            } else {
+                self.poll_group_exit(graceful_timeout)
+            };
+            let graceful_absent = match graceful_poll {
+                Ok(GroupPollOutcome::Absent) => true,
+                Ok(GroupPollOutcome::LeaderExited | GroupPollOutcome::TimedOut) => false,
+                Err(error) => {
+                    errors.push(error);
+                    false
+                }
+            };
+            if graceful_signal.is_err() || !graceful_absent {
+                if let Err(error) = self.signal_group(nix::sys::signal::Signal::SIGKILL) {
+                    errors.push(error);
+                }
+                match self.poll_group_exit(force_timeout) {
+                    Ok(GroupPollOutcome::Absent | GroupPollOutcome::LeaderExited) => {}
+                    Ok(GroupPollOutcome::TimedOut) => errors.push(format!(
+                        "validated PGID {} survived bounded SIGKILL polling",
                         self.pgid
-                    ));
+                    )),
+                    Err(error) => errors.push(error),
                 }
             }
-            if self.status.is_none() {
-                self.status = Some(
-                    self.child
-                        .wait()
-                        .map_err(|error| format!("leader reap failed: {error}"))?,
-                );
+            match self.child.try_wait() {
+                Ok(Some(status)) => self.status = Some(status),
+                Ok(None) => {
+                    errors.push("leader was not reapable after bounded teardown".to_string())
+                }
+                Err(error) => errors.push(format!("leader reap failed: {error}")),
             }
-            if self.group_exists()? {
-                return Err(format!("validated PGID {} survived teardown", self.pgid));
+            let absent_after_reap = match self.group_exists() {
+                Ok(false) => true,
+                Ok(true) => {
+                    errors.push(format!("validated PGID {} survived teardown", self.pgid));
+                    false
+                }
+                Err(error) => {
+                    errors.push(error);
+                    false
+                }
+            };
+            if absent_after_reap && self.status.is_some() {
+                self.cleaned = true;
             }
-            self.cleaned = true;
-            Ok(())
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
         }
 
-        fn diagnostics(&mut self) -> String {
-            let stderr = self
-                .stderr_reader
-                .take()
-                .and_then(|reader| reader.join().ok())
-                .unwrap_or_default();
+        fn diagnostics(&self) -> String {
+            let stderr = bounded_file_tail(self.stderr.path());
             format!(
                 "leader status: {:?}; stderr tail ({} bytes max): {}",
-                self.status,
-                GROUP_DIAGNOSTIC_BYTES,
-                String::from_utf8_lossy(&stderr)
+                self.status, GROUP_DIAGNOSTIC_BYTES, stderr
             )
         }
     }
@@ -1650,9 +1732,6 @@ mod tests {
     impl Drop for GuardedGroupChild {
         fn drop(&mut self) {
             let _ = self.shutdown(Duration::from_millis(250), Duration::from_secs(2));
-            if let Some(reader) = self.stderr_reader.take() {
-                let _ = reader.join();
-            }
         }
     }
 
@@ -1691,7 +1770,7 @@ mod tests {
                 if ready()? {
                     break;
                 }
-                if let Some(status) = group.try_wait()? {
+                if let Some(status) = group.observe_leader_exit()? {
                     return Err(format!("leader exited before readiness: {status}"));
                 }
                 if std::time::Instant::now() >= deadline {
@@ -1783,8 +1862,90 @@ mod tests {
     }
 
     #[test]
+    fn real_fpm_group_cleanup_is_exhaustive_for_spawn_faults_and_drop() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        let holding_stderr = || {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.arg("-c").arg(
+                "trap '' QUIT; (trap '' QUIT; while :; do sleep 1; done) & \
+                 printf 'DESCENDANT-RETAINS-STDERR\\n' >&2; while :; do sleep 1; done",
+            );
+            command
+        };
+
+        let post_spawn_pgid = Arc::new(AtomicI32::new(0));
+        let recorded_pgid = Arc::clone(&post_spawn_pgid);
+        let mut post_spawn = holding_stderr();
+        let started = std::time::Instant::now();
+        let post_spawn_error = match GuardedGroupChild::spawn_after_owned(
+            &mut post_spawn,
+            GroupTestFaults::default(),
+            move |pgid| {
+                recorded_pgid.store(pgid, Ordering::SeqCst);
+                Err("injected immediate post-spawn failure".to_string())
+            },
+        ) {
+            Ok(_) => panic!("post-spawn fault unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let pgid = post_spawn_pgid.load(Ordering::SeqCst);
+        assert!(post_spawn_error.contains("immediate post-spawn failure"));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(
+            !GuardedGroupChild::group_exists_for_test(pgid).unwrap(),
+            "post-spawn-fault PGID {pgid} survived"
+        );
+
+        for faults in [
+            GroupTestFaults {
+                graceful_signal_error: true,
+                ..GroupTestFaults::default()
+            },
+            GroupTestFaults {
+                graceful_poll_error: true,
+                ..GroupTestFaults::default()
+            },
+        ] {
+            let mut command = holding_stderr();
+            let mut group = GuardedGroupChild::spawn_with_faults(&mut command, faults).unwrap();
+            let pgid = group.pgid;
+            let started = std::time::Instant::now();
+            let error = group
+                .shutdown(Duration::from_millis(75), Duration::from_secs(2))
+                .unwrap_err();
+            let diagnostics = group.diagnostics();
+            assert!(error.contains("injected graceful"), "{error}");
+            assert!(diagnostics.len() <= GROUP_DIAGNOSTIC_BYTES + 256);
+            assert!(started.elapsed() < Duration::from_secs(4));
+            assert!(
+                !GuardedGroupChild::group_exists_for_test(pgid).unwrap(),
+                "fault-injected PGID {pgid} survived"
+            );
+        }
+
+        let panic_pgid = Arc::new(AtomicI32::new(0));
+        let recorded_pgid = Arc::clone(&panic_pgid);
+        let started = std::time::Instant::now();
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut command = holding_stderr();
+            let group = GuardedGroupChild::spawn(&mut command).unwrap();
+            recorded_pgid.store(group.pgid, Ordering::SeqCst);
+            panic!("injected panic with owned process group");
+        }));
+        assert!(panic_result.is_err());
+        let pgid = panic_pgid.load(Ordering::SeqCst);
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(
+            !GuardedGroupChild::group_exists_for_test(pgid).unwrap(),
+            "panic/Drop PGID {pgid} survived"
+        );
+    }
+
+    #[test]
     fn real_fpm_starts_and_serves_the_generated_config() {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
         use std::os::unix::net::{UnixListener, UnixStream};
 
         let _env = crate::test_env::EnvGuard::capture([
@@ -1792,7 +1953,14 @@ mod tests {
             "HEARTH_ISOLATED_ROOT",
             "HEARTH_HERD_ROOT",
             "HEARTH_HOMEBREW_ROOT",
+            "HEARTH_REAL_FPM_PROOF_ROOT",
         ]);
+        let proof_root = std::env::var_os("HEARTH_REAL_FPM_PROOF_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/private/tmp"));
+        std::fs::create_dir_all(&proof_root).unwrap();
+        let proof_root = proof_root.canonicalize().unwrap();
+        eprintln!("HEARTH_REAL_FPM_PROOF_ROOT={}", proof_root.display());
         let roots = crate::php::targets::ProviderRoots::detect().unwrap();
         let set = crate::php::resolver::all_phpfpm_candidates(&roots);
         for rejected in &set.rejected {
@@ -1811,9 +1979,10 @@ mod tests {
 
         let tmp = tempfile::Builder::new()
             .prefix("hearth fpm proof")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(&proof_root)
             .unwrap();
         let config_dir = tmp.path().canonicalize().unwrap();
+        assert!(config_dir.starts_with(&proof_root));
         assert!(matches!(
             materialize(&config_dir, &config_dir).state,
             FpmConfState::HearthOwned { .. }
@@ -1833,32 +2002,18 @@ mod tests {
                     .any(|candidate| candidate.version == **version)
             })
             .unwrap();
-        let same_version: Vec<_> = set
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.version == *version)
-            .collect();
         let resolver_pick = crate::php::resolver::resolve_phpfpm_binary(version, &roots.hearth);
-        let mapped = resolver_pick.as_ref().and_then(|path| {
-            let metadata = std::fs::metadata(path).ok()?;
-            same_version
-                .iter()
-                .find(|candidate| {
-                    std::fs::metadata(&candidate.canonical).is_ok_and(|candidate_metadata| {
-                        candidate_metadata.dev() == metadata.dev()
-                            && candidate_metadata.ino() == metadata.ino()
-                    })
-                })
-                .copied()
-        });
-        if resolver_pick.is_some() && mapped.is_none() {
-            eprintln!(
-                "resolver mismatch for PHP {version}: pick {:?} failed verified candidate mapping; \
-                 falling back by tier",
-                resolver_pick
-            );
+        let choice = crate::php::resolver::choose_phpfpm_serve_candidate(
+            version,
+            resolver_pick.as_deref(),
+            &roots,
+            &set.candidates,
+        )
+        .expect("selected version has an identity-verified serve candidate");
+        if let Some(mismatch) = &choice.resolver_mismatch {
+            eprintln!("{mismatch}");
         }
-        let candidate = mapped.unwrap_or(same_version[0]);
+        let candidate = choice.candidate;
 
         let socket = socket_path(&config_dir);
         drop(UnixListener::bind(&socket).unwrap());

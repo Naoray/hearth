@@ -219,6 +219,103 @@ pub fn all_phpfpm_candidates(roots: &super::targets::ProviderRoots) -> FpmCandid
     set
 }
 
+#[derive(Debug)]
+pub(crate) struct FpmServeChoice<'a> {
+    pub candidate: &'a FpmCandidate,
+    pub resolver_mismatch: Option<String>,
+}
+
+/// Choose the real-proof serve candidate without allowing the exists-only
+/// production resolver to recover an identity-rejected provider alias.
+pub(crate) fn choose_phpfpm_serve_candidate<'a>(
+    version: &str,
+    resolver_pick: Option<&std::path::Path>,
+    roots: &super::targets::ProviderRoots,
+    candidates: &'a [FpmCandidate],
+) -> Option<FpmServeChoice<'a>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let fallback = candidates
+        .iter()
+        .filter(|candidate| candidate.version == version)
+        .min_by_key(|candidate| candidate.tier)?;
+    let Some(resolver_pick) = resolver_pick else {
+        return Some(FpmServeChoice {
+            candidate: fallback,
+            resolver_mismatch: None,
+        });
+    };
+    let mismatch = |reason: String| {
+        Some(FpmServeChoice {
+            candidate: fallback,
+            resolver_mismatch: Some(bounded_candidate_reason(format!(
+                "resolver pick {} for PHP {version} failed verified provider mapping: {reason}; \
+                 falling back to {:?} {}",
+                resolver_pick.display(),
+                fallback.tier,
+                fallback.canonical.display()
+            ))),
+        })
+    };
+
+    let Some((tier, provider)) = [FpmTier::Hearth, FpmTier::Herd, FpmTier::Homebrew]
+        .into_iter()
+        .find_map(|tier| {
+            let provider = tier_provider(tier);
+            let expected = super::targets::expected_binary_path(
+                provider,
+                version,
+                super::targets::PhpSapi::Fpm,
+                roots,
+            );
+            (expected == resolver_pick).then_some((tier, provider))
+        })
+    else {
+        return mismatch("path is not an expected provider layout".to_string());
+    };
+    let verified = match super::targets::verify_binary_identity(
+        provider,
+        version,
+        super::targets::PhpSapi::Fpm,
+        roots,
+    ) {
+        Ok(verified) => verified,
+        Err(error) => return mismatch(format!("{tier:?} identity verification failed: {error}")),
+    };
+    let verified_metadata = match std::fs::metadata(&verified) {
+        Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
+            metadata
+        }
+        Ok(_) => {
+            return mismatch(format!(
+                "{tier:?} identity-verified target is not an executable regular file"
+            ));
+        }
+        Err(error) => return mismatch(format!("{tier:?} metadata failed: {error}")),
+    };
+    let mapped = candidates.iter().find(|candidate| {
+        if candidate.version != version {
+            return false;
+        }
+        if candidate.canonical == verified {
+            return true;
+        }
+        std::fs::metadata(&candidate.canonical).is_ok_and(|candidate_metadata| {
+            candidate_metadata.dev() == verified_metadata.dev()
+                && candidate_metadata.ino() == verified_metadata.ino()
+        })
+    });
+    match mapped {
+        Some(candidate) => Some(FpmServeChoice {
+            candidate,
+            resolver_mismatch: None,
+        }),
+        None => mismatch(format!(
+            "{tier:?} verified identity is absent from the enumerated version set"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,9 +464,11 @@ mod tests {
             let pick = resolve_phpfpm_binary("8.4", &fx.roots.hearth).unwrap();
             let canonical = pick.canonicalize().unwrap();
             let set = all_phpfpm_candidates(&fx.roots);
-            assert!(set.candidates.iter().any(|candidate| {
-                candidate.version == "8.4" && candidate.canonical == canonical
-            }));
+            let choice =
+                choose_phpfpm_serve_candidate("8.4", Some(&pick), &fx.roots, &set.candidates)
+                    .unwrap();
+            assert_eq!(choice.candidate.canonical, canonical);
+            assert_eq!(choice.resolver_mismatch, None);
         }
     }
 
@@ -418,6 +517,15 @@ mod tests {
                 .collect();
             assert_eq!(verified.len(), 1);
             assert_eq!(verified[0].tier, FpmTier::Homebrew);
+            let choice =
+                choose_phpfpm_serve_candidate("8.4", Some(&higher), &fx.roots, &set.candidates)
+                    .unwrap();
+            assert_eq!(choice.candidate.tier, FpmTier::Homebrew);
+            let mismatch = choice
+                .resolver_mismatch
+                .expect("serve choice must expose the resolver mismatch");
+            assert!(mismatch.contains("failed verified provider mapping"));
+            assert!(mismatch.chars().count() <= 512);
         }
     }
 
@@ -439,6 +547,15 @@ mod tests {
             .collect();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].tier, FpmTier::Homebrew);
+        let choice =
+            choose_phpfpm_serve_candidate("8.4", Some(&herd), &fx.roots, &set.candidates).unwrap();
+        assert_eq!(choice.candidate.tier, FpmTier::Homebrew);
+        assert!(
+            choice
+                .resolver_mismatch
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Herd identity verification failed"))
+        );
     }
 
     #[test]

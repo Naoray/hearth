@@ -37,7 +37,8 @@ SMOKE_ROOT="$(mktemp -d /tmp/hearth-smoke.XXXXXX)"
 SMOKE_ROOT="$(cd "$SMOKE_ROOT" && pwd -P)"
 export HEARTH_ISOLATED_ROOT="$SMOKE_ROOT"
 export HEARTH_CONFIG_DIR="$SMOKE_ROOT/hearth"
-mkdir -p "$HEARTH_CONFIG_DIR" "$SMOKE_ROOT/herd" "$SMOKE_ROOT/homebrew"
+S11_PROOF_ROOT="$SMOKE_ROOT/s11-real-fpm-proof"
+mkdir -p "$HEARTH_CONFIG_DIR" "$SMOKE_ROOT/herd" "$SMOKE_ROOT/homebrew" "$S11_PROOF_ROOT"
 
 REAL_HEARTH_DIR="$HOME/Library/Application Support/hearth"
 REAL_SOCK="$REAL_HEARTH_DIR/hearth.sock"
@@ -146,9 +147,18 @@ on_exit() {
     [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null && wait "$DAEMON_PID" 2>/dev/null
     chmod 755 "$HEARTH_CONFIG_DIR/fpm" 2>/dev/null || true
     rm -rf "$SMOKE_ROOT" 2>/dev/null
-    # Orphan check: nothing referencing the disposable root may survive.
-    if pgrep -f "$SMOKE_ROOT" >/dev/null 2>&1; then
-        echo "  ORPHAN fake processes detected for $SMOKE_ROOT"
+    # Orphan check: nothing referencing the disposable root may survive. Print
+    # exact matching argv so an S11 real-proof leak is attributable without
+    # signalling or otherwise touching unrelated processes.
+    local orphan_details
+    orphan_details="$(pgrep -fl "$SMOKE_ROOT" 2>/dev/null || true)"
+    if [ -n "$orphan_details" ]; then
+        if echo "$orphan_details" | grep -Fq "$S11_PROOF_ROOT"; then
+            echo "  ORPHAN S11 real-FPM process detected for $S11_PROOF_ROOT"
+        else
+            echo "  ORPHAN fake processes detected for $SMOKE_ROOT"
+        fi
+        echo "$orphan_details" | sed 's/^/    /'
         GUARD_FAIL=1
     else
         echo "  cleanup: no orphan fixture processes"
@@ -719,9 +729,21 @@ fi
 info "S11: identity-verified all-candidate real FPM proof..."
 REAL_FPM_OUTPUT=$(env -u HEARTH_CONFIG_DIR -u HEARTH_ISOLATED_ROOT \
     -u HEARTH_HERD_ROOT -u HEARTH_HOMEBREW_ROOT \
+    HEARTH_REAL_FPM_PROOF_ROOT="$S11_PROOF_ROOT" \
     cargo test -p hearth-lib real_fpm_starts_and_serves_the_generated_config \
     -- --test-threads=1 --nocapture 2>&1)
 REAL_FPM_STATUS=$?
+if echo "$REAL_FPM_OUTPUT" | grep -Fq "HEARTH_REAL_FPM_PROOF_ROOT=$S11_PROOF_ROOT"; then
+    pass "S11: real-FPM fixture is rooted beneath the current smoke root"
+else
+    fail "S11: real-FPM fixture was not discoverable beneath $S11_PROOF_ROOT"
+fi
+S11_SURVIVORS="$(pgrep -fl "$S11_PROOF_ROOT" 2>/dev/null || true)"
+if [ -z "$S11_SURVIVORS" ]; then
+    pass "S11: no exact proof-root process survived the real-FPM test"
+else
+    fail "S11: exact proof-root survivor detected: $(echo "$S11_SURVIVORS" | tr '\n' ' ')"
+fi
 if [ "$REAL_FPM_STATUS" -eq 0 ] && echo "$REAL_FPM_OUTPUT" | grep -q "SKIP: no real php-fpm"; then
     pass "S11: SKIP recorded — no identity-verified real php-fpm candidates"
 elif [ "$REAL_FPM_STATUS" -eq 0 ]; then
