@@ -115,12 +115,6 @@ impl PhpConfigEngine {
         (self.herd_running)()
     }
 
-    /// "Is Herd PROVEN live" convenience for row/registration display
-    /// gating. Activation decisions must use [`Self::fpm_ownership`].
-    pub fn herd_running(&self) -> bool {
-        matches!(self.fpm_ownership(), FpmOwnership::Owned)
-    }
-
     /// `Some(reason)` when Hearth's own FPM cannot launch because nothing has
     /// generated its config yet (todo #2343 owns generation).
     pub fn fpm_launch_blocked_reason(&self) -> Option<String> {
@@ -657,33 +651,57 @@ impl PhpConfigEngine {
             }
         }
 
-        // Hearth's own supervised FPM service — truthfully LAUNCH-BLOCKED
-        // while nothing generates its config (todo #2343). Herd running means
-        // Herd owns FPM and no Hearth FPM service row exists.
-        if !self.herd_running() {
-            let effective = php_ini.effective_for(default_php);
-            let coverage = if let Some(reason) = self.fpm_launch_blocked_reason() {
-                format!("LAUNCH-BLOCKED: {reason}")
-            } else if crate::php::resolver::resolve_phpfpm_binary(default_php, &self.config_dir)
-                .is_none()
-            {
-                format!("LAUNCH-BLOCKED: php-fpm binary for {default_php} not found")
-            } else {
-                "supervised (scan-dir env at launch)".to_string()
-            };
-            rows.push(PhpTargetRow {
-                provider: "hearth".to_string(),
-                version: default_php.to_string(),
-                sapi: "fpm".to_string(),
-                context: "launched".to_string(),
-                channel: None,
-                coverage,
-                configured: key.and_then(|k| effective.get(k).cloned()),
-                observed: None,
-                observed_state: "n/a".to_string(),
-                pending_restart: false,
-                run_state: None,
-            });
+        // Hearth's own supervised FPM service row — exhaustive on TYPED
+        // ownership (C5-1C): Owned = Herd's domain, no Hearth row; Unowned =
+        // truthful supervised/LAUNCH-BLOCKED row; Unknown = a LOUD
+        // ownership-unknown row with the diagnostic + remediation — never
+        // rendered as if ownership were proven Unowned.
+        match self.fpm_ownership() {
+            FpmOwnership::Owned => {}
+            FpmOwnership::Unowned => {
+                let effective = php_ini.effective_for(default_php);
+                let coverage = if let Some(reason) = self.fpm_launch_blocked_reason() {
+                    format!("LAUNCH-BLOCKED: {reason}")
+                } else if crate::php::resolver::resolve_phpfpm_binary(default_php, &self.config_dir)
+                    .is_none()
+                {
+                    format!("LAUNCH-BLOCKED: php-fpm binary for {default_php} not found")
+                } else {
+                    "supervised (scan-dir env at launch)".to_string()
+                };
+                rows.push(PhpTargetRow {
+                    provider: "hearth".to_string(),
+                    version: default_php.to_string(),
+                    sapi: "fpm".to_string(),
+                    context: "launched".to_string(),
+                    channel: None,
+                    coverage,
+                    configured: key.and_then(|k| effective.get(k).cloned()),
+                    observed: None,
+                    observed_state: "n/a".to_string(),
+                    pending_restart: false,
+                    run_state: None,
+                });
+            }
+            FpmOwnership::Unknown(diag) => {
+                let effective = php_ini.effective_for(default_php);
+                rows.push(PhpTargetRow {
+                    provider: "hearth".to_string(),
+                    version: default_php.to_string(),
+                    sapi: "fpm".to_string(),
+                    context: "launched".to_string(),
+                    channel: None,
+                    coverage: format!(
+                        "OWNERSHIP-UNKNOWN: {diag} — FPM activation fails closed; fix the \
+                         ownership probe and retry"
+                    ),
+                    configured: key.and_then(|k| effective.get(k).cloned()),
+                    observed: None,
+                    observed_state: "n/a".to_string(),
+                    pending_restart: false,
+                    run_state: None,
+                });
+            }
         }
         rows
     }
@@ -745,8 +763,13 @@ impl PhpConfigEngine {
         }
 
         // The supervised FPM service row (context `launched`), only while
-        // registrable: Herd absent, config generated, binary resolvable.
-        if self.herd_running() || self.fpm_launch_blocked_reason().is_some() {
+        // registrable under PROVEN Unowned ownership (C5-1C exhaustive):
+        // Owned AND Unknown both mean zero `-i` execution.
+        match self.fpm_ownership() {
+            FpmOwnership::Unowned => {}
+            FpmOwnership::Owned | FpmOwnership::Unknown(_) => return,
+        }
+        if self.fpm_launch_blocked_reason().is_some() {
             return;
         }
         let Some(binary) =
@@ -924,10 +947,34 @@ impl PhpConfigEngine {
         }
 
         let mut sup = supervisor.lock().await;
+        // C5-1B TOCTOU recheck UNDER the supervisor lock: ownership may have
+        // changed since the check above — a flip to Owned/Unknown here means
+        // zero FPM mutation (not even the own-child stop). The supervisor's
+        // own register/start boundary guards remain the final authority.
+        match self.fpm_ownership() {
+            FpmOwnership::Owned => {
+                return Ok(format!(
+                    "Switched to PHP {version}; php-fpm untouched (Herd manages PHP-FPM)"
+                ));
+            }
+            FpmOwnership::Unknown(diag) => {
+                return Ok(format!(
+                    "Switched to PHP {version}; php-fpm untouched (Herd ownership \
+                     unknown: {diag} — FPM activation skipped fail-closed)"
+                ));
+            }
+            FpmOwnership::Unowned => {}
+        }
         let _ = sup.stop_service(ServiceKind::PhpFpm);
         match crate::service::manager::hearth_fpm_service(version, &config_dir) {
             Ok(svc) => {
-                sup.register(svc);
+                if let Err(refusal) = sup.register(svc) {
+                    // Ownership flipped between the recheck and the boundary
+                    // guard: version stays persisted, FPM stays unmutated.
+                    return Ok(format!(
+                        "Switched to PHP {version}; php-fpm untouched ({refusal})"
+                    ));
+                }
                 sup.start_service(ServiceKind::PhpFpm).map_err(|e| {
                     format!("switched to PHP {version}, but php-fpm start failed: {e}")
                 })?;
@@ -935,10 +982,10 @@ impl PhpConfigEngine {
             }
             Err(reason) => {
                 let removed = sup.remove_service(ServiceKind::PhpFpm);
-                let herd_note = if self.herd_running() {
-                    " (Herd manages PHP-FPM)"
-                } else {
-                    ""
+                let ownership_note = match self.fpm_ownership() {
+                    FpmOwnership::Owned => " (Herd manages PHP-FPM)",
+                    FpmOwnership::Unknown(_) => " (Herd ownership unknown)",
+                    FpmOwnership::Unowned => "",
                 };
                 let stale_note = if removed {
                     "; previous php-fpm registration removed"
@@ -947,7 +994,7 @@ impl PhpConfigEngine {
                 };
                 Ok(format!(
                     "Switched to PHP {version}; php-fpm not registered: \
-                     {reason}{herd_note}{stale_note}"
+                     {reason}{ownership_note}{stale_note}"
                 ))
             }
         }
@@ -1603,7 +1650,8 @@ mod tests {
             let mut sup = supervisor.lock().await;
             sup.register(
                 crate::service::manager::hearth_fpm_service("8.3", &fx.config_dir).unwrap(),
-            );
+            )
+            .unwrap();
             let old = sup.service(ServiceKind::PhpFpm).unwrap();
             assert!(old.env()[0].1.contains("8.3"));
         }
@@ -1643,7 +1691,8 @@ mod tests {
         supervisor
             .lock()
             .await
-            .register(crate::service::manager::hearth_fpm_service("8.3", &fx.config_dir).unwrap());
+            .register(crate::service::manager::hearth_fpm_service("8.3", &fx.config_dir).unwrap())
+            .unwrap();
 
         // Launch-block the target: fpm config gone.
         std::fs::remove_file(fx.config_dir.join("fpm/php-fpm.conf")).unwrap();
@@ -2237,11 +2286,15 @@ echo "Scan for additional .ini files in: {}"
         // must survive completely untouched: no stop, no replace, no
         // remove, no start.
         let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
-        supervisor.lock().await.register(ManagedService::new(
-            ServiceKind::PhpFpm,
-            "/bin/echo".to_string(),
-            vec!["sentinel".to_string()],
-        ));
+        supervisor
+            .lock()
+            .await
+            .register(ManagedService::new(
+                ServiceKind::PhpFpm,
+                "/bin/echo".to_string(),
+                vec!["sentinel".to_string()],
+            ))
+            .unwrap();
 
         let msg = fx.engine.switch(&supervisor, "8.3").await.unwrap();
         assert!(msg.contains("php-fpm untouched"), "got: {msg}");
@@ -2293,7 +2346,8 @@ echo "Scan for additional .ini files in: {}"
                 ServiceKind::PhpFpm,
                 "/bin/sleep".to_string(),
                 vec!["30".to_string()],
-            ));
+            ))
+            .unwrap();
             sup.start_service(ServiceKind::PhpFpm).unwrap();
         }
         let started = supervisor
@@ -2337,6 +2391,138 @@ echo "Scan for additional .ini files in: {}"
             .await
             .stop_service(ServiceKind::PhpFpm)
             .unwrap();
+    }
+
+    // ---- C5-1C (review 5650 r6): Unknown never masquerades as Unowned ----
+
+    /// Unknown ownership renders a LOUD ownership-unknown launched row with
+    /// the diagnostic (never the "supervised" row) and performs zero FPM
+    /// binary execution on Show AND Set. Fails at head c22d446 (Boolean
+    /// adapter mapped Unknown → Herd-absent: supervised row + `-i` probe).
+    #[tokio::test]
+    async fn unknown_ownership_renders_loud_row_and_zero_fpm_exec() {
+        let fx = fixture_with_probe(Arc::new(|| {
+            FpmOwnership::Unknown("ownership probe (pgrep) failed with status 2".to_string())
+        }));
+        std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
+        std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
+        let base = fx._tmp.path().canonicalize().unwrap();
+        let log = base.join("fpm-invocations.log");
+        write_executable(
+            &fx.config_dir.join("php/8.4/php-fpm"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--warmup\" ]; then exit 0; fi\n\
+                 echo run >> \"{}\"\n\
+                 echo \"memory_limit => 1G => 1G\"\n",
+                log.display()
+            ),
+        );
+        let count = |path: &Path| {
+            std::fs::read_to_string(path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+
+        let shown = fx
+            .engine
+            .apply(PhpConfigAction::Show {
+                key: Some("memory_limit".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(count(&log), 0, "no -i execution under Unknown");
+        let launched = shown
+            .rows
+            .iter()
+            .find(|r| r.sapi == "fpm" && r.context == "launched")
+            .expect("launched row stays present and loud");
+        assert!(
+            launched.coverage.contains("OWNERSHIP-UNKNOWN"),
+            "got: {}",
+            launched.coverage
+        );
+        assert!(
+            launched.coverage.contains("pgrep"),
+            "diagnostic surfaced: {}",
+            launched.coverage
+        );
+        assert!(
+            !launched.coverage.contains("supervised"),
+            "must not claim supervised under Unknown: {}",
+            launched.coverage
+        );
+        assert_eq!(launched.observed, None);
+
+        // Mutation path: persistence proceeds, still zero FPM execution.
+        let outcome = fx
+            .engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.persisted, Some(true));
+        assert_eq!(count(&log), 0, "Set must not execute FPM under Unknown");
+    }
+
+    /// C5-1B TOCTOU inside `switch`: ownership flips to Owned between the
+    /// high-level check and the supervisor lock — the under-lock recheck
+    /// (and the register boundary guard behind it) yields ZERO FPM
+    /// mutation. Fails at head c22d446 (no recheck: register+start ran).
+    #[tokio::test]
+    async fn switch_toctou_flip_to_owned_performs_zero_fpm_mutation() {
+        use crate::service::supervisor::ManagedService;
+        use std::collections::VecDeque;
+
+        // Deterministic call sequence inside switch: #1 build_rows during
+        // the reconcile sync, #2 the high-level guard — both Unowned; the
+        // under-lock recheck (#3+) sees Owned.
+        let responses = Arc::new(std::sync::Mutex::new(VecDeque::from(vec![
+            FpmOwnership::Unowned,
+            FpmOwnership::Unowned,
+        ])));
+        let probe_responses = Arc::clone(&responses);
+        let fx = fixture_with_probe(Arc::new(move || {
+            probe_responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(FpmOwnership::Owned)
+        }));
+        std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
+        std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
+        write_executable(&fx.config_dir.join("php/8.3/php"), "#!/bin/sh\nexit 0\n");
+        write_spawnable_fpm(&fx.config_dir.join("php/8.3/php-fpm"));
+
+        // Pre-existing registration from an Unowned era (supervisor has no
+        // probe of its own here — the engine's is under test).
+        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        supervisor
+            .lock()
+            .await
+            .register(ManagedService::new(
+                ServiceKind::PhpFpm,
+                "/bin/echo".to_string(),
+                vec!["sentinel".to_string()],
+            ))
+            .unwrap();
+
+        let msg = fx.engine.switch(&supervisor, "8.3").await.unwrap();
+        assert!(msg.contains("php-fpm untouched"), "got: {msg}");
+        let sup = supervisor.lock().await;
+        let svc = sup
+            .service(ServiceKind::PhpFpm)
+            .expect("registration stands");
+        assert_eq!(svc.command(), "/bin/echo", "zero register/reconfigure");
+        assert!(svc.started_at().is_none(), "zero start");
+        drop(sup);
+        assert_eq!(
+            fx.config.lock().await.default_php,
+            "8.3",
+            "version persisted"
+        );
+    }
+
+    fn write_spawnable_fpm(path: &Path) {
+        write_executable(path, "#!/bin/sh\nexec sleep 30\n");
     }
 
     // ---- C4-3 (review 5650 r4): ambiguous roots fail closed everywhere ----
@@ -2536,7 +2722,8 @@ echo "Scan for additional .ini files in: {}"
                 ServiceKind::PhpFpm,
                 "/bin/sleep".to_string(),
                 vec!["30".to_string()],
-            ));
+            ))
+            .unwrap();
             sup.start_service(ServiceKind::PhpFpm).unwrap();
         }
         let started_before = supervisor

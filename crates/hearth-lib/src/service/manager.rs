@@ -70,22 +70,26 @@ fn isolated_herd_ownership_override() -> Option<FpmOwnership> {
         "0" => Some(FpmOwnership::Unowned),
         other => {
             let path = other.strip_prefix("file:")?;
-            Some(classify_flag_read(std::fs::read_to_string(path)))
+            Some(classify_flag_read(std::fs::read(path)))
         }
     }
 }
 
-/// Pure classification of the isolated flag-file evidence (C4-2): exact `1`
-/// → Owned, exact `0` → Unowned; missing/unreadable/empty/invalid content
-/// is `Unknown` (fail-closed), with an IO-error-class diagnostic only.
-fn classify_flag_read(result: std::io::Result<String>) -> FpmOwnership {
+/// Pure classification of the isolated flag-file evidence (C5-1A): the
+/// EXACT single byte `1` → Owned, the exact single byte `0` → Unowned —
+/// no trimming, ever. Any newline, surrounding or internal whitespace,
+/// BOM, extra bytes, empty file, invalid UTF-8, or read failure
+/// (missing/unreadable/racing) is `Unknown` (fail-closed) with a
+/// non-sensitive diagnostic. Malformed evidence must never become
+/// authoritative.
+fn classify_flag_read(result: std::io::Result<Vec<u8>>) -> FpmOwnership {
     match result {
-        Ok(content) => match content.trim() {
-            "1" => FpmOwnership::Owned,
-            "0" => FpmOwnership::Unowned,
-            _ => {
-                FpmOwnership::Unknown("isolated ownership flag has invalid content".to_string())
-            }
+        Ok(bytes) => match bytes.as_slice() {
+            b"1" => FpmOwnership::Owned,
+            b"0" => FpmOwnership::Unowned,
+            _ => FpmOwnership::Unknown(
+                "isolated ownership flag content is not exactly `1` or `0`".to_string(),
+            ),
         },
         Err(e) => FpmOwnership::Unknown(format!(
             "isolated ownership flag unreadable: {}",
@@ -885,25 +889,43 @@ mod tests {
         }
     }
 
-    /// Isolated flag-file evidence matrix: exact 1/0 only; missing,
-    /// unreadable, empty, and invalid content are all Unknown.
+    /// Isolated flag-file evidence matrix (C5-1A): the EXACT bytes `1`/`0`
+    /// only — trailing newlines, whitespace, BOM, extra bytes, empty
+    /// content, invalid UTF-8, and read failures are all Unknown.
     #[test]
     fn flag_file_classification_matrix() {
         assert_eq!(
-            classify_flag_read(Ok("1\n".to_string())),
-            FpmOwnership::Owned
+            classify_flag_read(Ok(b"1".to_vec())),
+            FpmOwnership::Owned,
+            "exact byte 1"
         );
         assert_eq!(
-            classify_flag_read(Ok("0".to_string())),
-            FpmOwnership::Unowned
+            classify_flag_read(Ok(b"0".to_vec())),
+            FpmOwnership::Unowned,
+            "exact byte 0"
         );
-        for invalid in ["", "  ", "yes", "2", "01"] {
+        let invalid_cases: &[&[u8]] = &[
+            b"",
+            b"1\n",
+            b"0\n",
+            b" 0 ",
+            b"\t1",
+            b"1 ",
+            b"0 0",
+            b"\xef\xbb\xbf1", // BOM + 1
+            b"10",
+            b"01",
+            b"yes",
+            b"2",
+            b"\xff\x31", // invalid UTF-8 followed by '1'
+        ];
+        for invalid in invalid_cases {
             assert!(
                 matches!(
-                    classify_flag_read(Ok(invalid.to_string())),
+                    classify_flag_read(Ok(invalid.to_vec())),
                     FpmOwnership::Unknown(_)
                 ),
-                "content {invalid:?} must be Unknown"
+                "bytes {invalid:?} must be Unknown"
             );
         }
         assert!(matches!(

@@ -503,8 +503,19 @@ impl ServiceSupervisor {
     }
 
     /// Register a service to be supervised.
-    pub fn register(&mut self, service: ManagedService) {
+    ///
+    /// C5-1B: FPM registration re-checks TYPED current ownership inside the
+    /// supervisor boundary immediately before mutation — higher-level checks
+    /// are TOCTOU-prone. Owned/Unknown refuse with zero mutation; there is
+    /// no raw insertion bypass.
+    pub fn register(&mut self, service: ManagedService) -> anyhow::Result<()> {
+        if service.kind == ServiceKind::PhpFpm
+            && let Some(reason) = self.fpm_activation_blocked()
+        {
+            anyhow::bail!("php-fpm registration refused: {reason}");
+        }
         self.services.insert(service.kind, service);
+        Ok(())
     }
 
     /// Start all registered services.
@@ -583,19 +594,27 @@ impl ServiceSupervisor {
     /// switch). The service must be stopped before reconfiguring. `env`
     /// REPLACES the stored child environment — a version switch must never
     /// retain the previous version's scan-dir env.
+    /// C5-1B: FPM reconfiguration re-checks TYPED current ownership inside
+    /// the supervisor boundary — Owned/Unknown refuse with zero mutation.
     pub fn reconfigure_service(
         &mut self,
         kind: ServiceKind,
         command: String,
         args: Vec<String>,
         env: Vec<(String, String)>,
-    ) {
+    ) -> anyhow::Result<()> {
+        if kind == ServiceKind::PhpFpm
+            && let Some(reason) = self.fpm_activation_blocked()
+        {
+            anyhow::bail!("php-fpm reconfiguration refused: {reason}");
+        }
         if let Some(svc) = self.services.get_mut(&kind) {
             svc.command = command;
             svc.args = args;
             svc.env = env;
             svc.circuit_breaker.reset();
         }
+        Ok(())
     }
 
     /// Deregister a service (e.g., a launch-blocked FPM after a version
@@ -749,7 +768,7 @@ mod tests {
         let mut sup = ServiceSupervisor::new();
         // Use `true` as a harmless command that exits immediately
         let svc = ManagedService::new(ServiceKind::Nginx, "true".to_string(), vec![]);
-        sup.register(svc);
+        sup.register(svc).unwrap();
         sup
     }
 
@@ -819,7 +838,7 @@ mod tests {
                     "PHP_INI_SCAN_DIR".to_string(),
                     ":/old/8.3/conf.d".to_string(),
                 )]),
-        );
+        ).unwrap();
         sup.reconfigure_service(
             ServiceKind::PhpFpm,
             "/new/php-fpm".to_string(),
@@ -828,7 +847,8 @@ mod tests {
                 "PHP_INI_SCAN_DIR".to_string(),
                 ":/new/8.4/conf.d".to_string(),
             )],
-        );
+        )
+        .unwrap();
         let svc = sup.services.get(&ServiceKind::PhpFpm).unwrap();
         assert_eq!(
             svc.env,
@@ -856,7 +876,8 @@ mod tests {
             "redis-server".to_string(),
             vec![],
             vec![],
-        );
+        )
+        .unwrap();
         assert!(sup.services.is_empty());
     }
 
@@ -876,9 +897,9 @@ mod tests {
     fn register_replaces_existing_service() {
         let mut sup = ServiceSupervisor::new();
         let svc1 = ManagedService::new(ServiceKind::Nginx, "nginx-old".to_string(), vec![]);
-        sup.register(svc1);
+        sup.register(svc1).unwrap();
         let svc2 = ManagedService::new(ServiceKind::Nginx, "nginx-new".to_string(), vec![]);
-        sup.register(svc2);
+        sup.register(svc2).unwrap();
         assert_eq!(sup.services.len(), 1);
         assert_eq!(sup.services[&ServiceKind::Nginx].command, "nginx-new");
     }
@@ -1028,8 +1049,8 @@ mod tests {
         let (flag, probe) = owned_flag();
         let mut sup = ServiceSupervisor::new();
         sup.set_fpm_ownership_probe(probe);
-        sup.register(sleeper(ServiceKind::PhpFpm));
-        sup.register(sleeper(ServiceKind::Mailpit));
+        sup.register(sleeper(ServiceKind::PhpFpm)).unwrap();
+        sup.register(sleeper(ServiceKind::Mailpit)).unwrap();
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
 
         sup.start_all().unwrap();
@@ -1063,7 +1084,7 @@ mod tests {
         let (flag, probe) = owned_flag();
         let mut sup = ServiceSupervisor::new();
         sup.set_fpm_ownership_probe(probe);
-        sup.register(sleeper(ServiceKind::PhpFpm));
+        sup.register(sleeper(ServiceKind::PhpFpm)).unwrap();
         sup.start_service(ServiceKind::PhpFpm).unwrap();
         assert!(
             sup.service(ServiceKind::PhpFpm)
@@ -1112,7 +1133,7 @@ mod tests {
     #[test]
     fn injected_stop_failure_is_transactional() {
         let mut sup = ServiceSupervisor::new();
-        sup.register(sleeper(ServiceKind::PhpFpm));
+        sup.register(sleeper(ServiceKind::PhpFpm)).unwrap();
         sup.start_service(ServiceKind::PhpFpm).unwrap();
         let started = sup
             .service(ServiceKind::PhpFpm)
@@ -1148,7 +1169,7 @@ mod tests {
         let (flag, probe) = owned_flag();
         let mut sup = ServiceSupervisor::new();
         sup.set_fpm_ownership_probe(probe);
-        sup.register(sleeper(ServiceKind::PhpFpm));
+        sup.register(sleeper(ServiceKind::PhpFpm)).unwrap();
         sup.start_service(ServiceKind::PhpFpm).unwrap();
         let started = sup
             .service(ServiceKind::PhpFpm)
@@ -1185,8 +1206,8 @@ mod tests {
     #[test]
     fn stop_all_aggregates_failures_but_stops_others() {
         let mut sup = ServiceSupervisor::new();
-        sup.register(sleeper(ServiceKind::PhpFpm));
-        sup.register(sleeper(ServiceKind::Mailpit));
+        sup.register(sleeper(ServiceKind::PhpFpm)).unwrap();
+        sup.register(sleeper(ServiceKind::Mailpit)).unwrap();
         sup.start_service(ServiceKind::PhpFpm).unwrap();
         sup.start_service(ServiceKind::Mailpit).unwrap();
 
@@ -1203,6 +1224,39 @@ mod tests {
         sup.stop_service(ServiceKind::PhpFpm).unwrap();
     }
 
+    /// C5-1B TOCTOU: ownership flips to Owned AFTER a legitimate Unowned
+    /// registration — the boundary re-check refuses further register/
+    /// reconfigure with zero mutation; the existing registration stands and
+    /// non-FPM services are unaffected.
+    #[test]
+    fn register_and_reconfigure_refuse_fpm_after_flip_to_owned() {
+        let (flag, probe) = owned_flag();
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(probe);
+        sup.register(sleeper(ServiceKind::PhpFpm)).unwrap(); // Unowned: normal
+
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = sup.register(sleeper(ServiceKind::PhpFpm)).unwrap_err();
+        assert!(err.to_string().contains("owned by Herd"), "{err}");
+        let err = sup
+            .reconfigure_service(ServiceKind::PhpFpm, "/bin/echo".to_string(), vec![], vec![])
+            .unwrap_err();
+        assert!(err.to_string().contains("owned by Herd"), "{err}");
+        let fpm = sup.service(ServiceKind::PhpFpm).unwrap();
+        assert_eq!(fpm.command(), "/bin/sleep", "zero mutation on refusal");
+        assert!(fpm.started_at().is_none(), "never spawned, no leak");
+
+        // Non-FPM registration/reconfiguration unaffected under Owned.
+        sup.register(sleeper(ServiceKind::Mailpit)).unwrap();
+        sup.reconfigure_service(
+            ServiceKind::Mailpit,
+            "/bin/echo".to_string(),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+    }
+
     /// C4-2: unknown ownership fails CLOSED on every supervisor path — no
     /// start, no restart, no relinquish, no replacement.
     #[test]
@@ -1211,9 +1265,30 @@ mod tests {
             FpmOwnership::Unknown("ownership probe (pgrep) failed with status 2".to_string())
         });
         let mut sup = ServiceSupervisor::new();
+        // C5-1B: register under proven-Unowned (no probe yet), THEN install
+        // the Unknown probe — registering under Unknown is itself refused.
+        sup.register(sleeper(ServiceKind::PhpFpm)).unwrap();
+        sup.register(sleeper(ServiceKind::Mailpit)).unwrap();
         sup.set_fpm_ownership_probe(std::sync::Arc::clone(&probe));
-        sup.register(sleeper(ServiceKind::PhpFpm));
-        sup.register(sleeper(ServiceKind::Mailpit));
+
+        // Registration and reconfiguration are refused at the boundary
+        // under Unknown, with zero mutation.
+        let err = sup.register(sleeper(ServiceKind::PhpFpm)).unwrap_err();
+        assert!(err.to_string().contains("registration refused"), "{err}");
+        let original_command = sup
+            .service(ServiceKind::PhpFpm)
+            .unwrap()
+            .command()
+            .to_string();
+        let err = sup
+            .reconfigure_service(ServiceKind::PhpFpm, "/bin/echo".to_string(), vec![], vec![])
+            .unwrap_err();
+        assert!(err.to_string().contains("reconfiguration refused"), "{err}");
+        assert_eq!(
+            sup.service(ServiceKind::PhpFpm).unwrap().command(),
+            original_command,
+            "zero mutation on refusal"
+        );
 
         // Generic start: FPM skipped, others start.
         sup.start_all().unwrap();
@@ -1244,7 +1319,7 @@ mod tests {
         // the child stays supervised, no relinquish, no restart.
         let mut owned_sup = ServiceSupervisor::new();
         sup.stop_all().unwrap();
-        owned_sup.register(sleeper(ServiceKind::PhpFpm));
+        owned_sup.register(sleeper(ServiceKind::PhpFpm)).unwrap();
         owned_sup.start_service(ServiceKind::PhpFpm).unwrap();
         let started = owned_sup
             .service(ServiceKind::PhpFpm)
@@ -1271,7 +1346,8 @@ mod tests {
             ServiceKind::PhpFpm,
             "/bin/sh".to_string(),
             vec!["-c".to_string(), "exit 0".to_string()],
-        ));
+        ))
+        .unwrap();
         sup.start_service(ServiceKind::PhpFpm).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -1297,7 +1373,8 @@ mod tests {
             ServiceKind::PhpFpm,
             "/bin/sh".to_string(),
             vec!["-c".to_string(), "exit 0".to_string()],
-        ));
+        ))
+        .unwrap();
         sup.start_all().unwrap();
         assert!(
             sup.service(ServiceKind::PhpFpm)

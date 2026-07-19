@@ -376,7 +376,8 @@ info "SH2: Herd ownership appears at runtime — relinquish, no restarts..."
 # supervisor unit tests. The fake FPM `exec`s sleep, so run-state assertions
 # use the supervisor's own truthful `hearth status` line, not pgrep.
 HERD_FLAG="$SMOKE_ROOT/herd-flag"
-echo 0 > "$HERD_FLAG"
+# C5-1A: the seam accepts EXACT bytes only — write with printf, never echo.
+printf '0' > "$HERD_FLAG"
 boot_daemon "file:$HERD_FLAG"
 $CLI restart php-fpm >/dev/null 2>&1
 if $CLI status 2>&1 | grep -i "php-fpm" | grep -qi "running"; then
@@ -384,7 +385,7 @@ if $CLI status 2>&1 | grep -i "php-fpm" | grep -qi "running"; then
 else
     fail "SH2: expected a running Hearth FPM before the flip"
 fi
-echo 1 > "$HERD_FLAG"
+printf '1' > "$HERD_FLAG"
 sleep 7   # > health interval (5s): one ownership-aware health tick
 if $CLI status 2>&1 | grep -i "php-fpm" | grep -qi "running"; then
     fail "SH2: Hearth FPM child must be relinquished after Herd appears"
@@ -398,14 +399,14 @@ else
     fail "SH2: got: $OUTPUT"
 fi
 # C4-2: invalid flag content = UNKNOWN ownership → activation fails closed.
-echo garbage > "$HERD_FLAG"
+printf 'garbage' > "$HERD_FLAG"
 OUTPUT=$($CLI restart php-fpm 2>&1)
 if echo "$OUTPUT" | grep -qi "ownership is unknown"; then
     pass "SH2: unknown ownership refuses FPM activation fail-closed"
 else
     fail "SH2: got: $OUTPUT"
 fi
-echo 1 > "$HERD_FLAG"
+printf '1' > "$HERD_FLAG"
 if $CLI status 2>&1 | grep -i "php-fpm" | grep -qi "running"; then
     fail "SH2: restart must not revive FPM under Herd"
 else

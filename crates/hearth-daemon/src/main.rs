@@ -130,7 +130,13 @@ async fn main() -> anyhow::Result<()> {
     {
         let cfg = config.lock().await;
         for svc in default_services(&cfg, &config_dir, php_launches_enabled, &provider_roots) {
-            supervisor.register(svc);
+            // C5-1B: the supervisor's boundary guard is authoritative — a
+            // refusal (ownership flipped to Owned/Unknown since the boot
+            // check) is a truthful skip, never a partial registration.
+            let name = svc.display_name();
+            if let Err(e) = supervisor.register(svc) {
+                tracing::warn!(service = %name, error = %e, "boot registration skipped");
+            }
         }
     }
 
@@ -807,7 +813,11 @@ async fn process_request(
                         &config_dir,
                         state.php_engine.provider_roots(),
                     );
-                    sup.register(svc);
+                    if let Err(e) = sup.register(svc) {
+                        // Workers are never PhpFpm; the guard cannot refuse
+                        // them — surfaced defensively all the same.
+                        warn!(package = %package, error = %e, "worker registration refused");
+                    }
                     if let Err(e) = sup.start_service(kind) {
                         warn!(
                             package = %package,

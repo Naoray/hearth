@@ -50,12 +50,19 @@ All notable changes to Hearth will be documented in this file.
   reporting false success), a failed FPM handoff keeps the child
   supervised and retries on later health ticks, and "stopped" is only ever
   recorded after proof.
-- Herd-ownership detection is typed evidence (`Owned`/`Unowned`/`Unknown`):
-  a failed probe (pgrep spawn error, signal, exit codes above the
-  documented no-match 1; missing/invalid isolated flag file) is `Unknown`,
-  and every FPM activation path fails closed on it with an actionable
-  "ownership unknown; activation skipped" report (new
-  `SkippedOwnershipUnknown` restart outcome on the wire).
+- Herd-ownership detection is typed evidence (`Owned`/`Unowned`/`Unknown`)
+  end-to-end: a failed probe (pgrep spawn error, signal, exit codes above
+  the documented no-match 1) is `Unknown`, the isolated flag file must
+  contain EXACTLY the single byte `1` or `0` (any newline, whitespace,
+  BOM, extra bytes, empty, invalid UTF-8, or unreadable content is
+  `Unknown`), and every FPM path fails closed on it: registration and
+  reconfiguration are refused at the supervisor boundary itself (TOCTOU-
+  safe re-check immediately before mutation), start/restart/health skip,
+  `--status` renders a loud `OWNERSHIP-UNKNOWN` FPM row with the
+  diagnostic instead of a "supervised" row, no FPM binary is executed,
+  and config restarts report the `SkippedOwnershipUnknown` outcome.
+  Unknown is never silently treated as "Herd absent" anywhere in the
+  PHP/FPM paths.
 - Provider roots are validated as a SET: equal, nested, or symlink-aliased
   Hearth/Herd/Homebrew roots are rejected at construction, and provider
   identity additionally requires membership in exactly one canonical root —

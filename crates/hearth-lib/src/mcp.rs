@@ -577,12 +577,14 @@ mod tests {
             ServiceKind::Nginx,
             "true".to_string(),
             vec![],
-        ));
+        ))
+        .unwrap();
         sup.register(ManagedService::new(
             ServiceKind::PhpFpm,
             "true".to_string(),
             vec![],
-        ));
+        ))
+        .unwrap();
 
         let tmp_valet = tempfile::TempDir::new().expect("tempdir");
         let sm = SiteManager::new(tmp_valet.path().to_path_buf(), "test".to_string());
@@ -649,7 +651,8 @@ mod tests {
             ServiceKind::PhpFpm,
             "true".to_string(),
             vec![],
-        ));
+        ))
+        .unwrap();
 
         let tmp_php = tempfile::TempDir::new().expect("tempdir");
         let php_dir = tmp_php.path().join("php/8.3");
@@ -810,7 +813,8 @@ mod tests {
             ServiceKind::PhpFpm,
             fake_fpm.to_string_lossy().to_string(),
             vec![],
-        ));
+        ))
+        .unwrap();
 
         let herd_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let probe_flag = Arc::clone(&herd_live);

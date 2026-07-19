@@ -610,7 +610,8 @@ mod tests {
                 hearth_lib::service::ServiceKind::PhpFpm,
                 "/bin/sleep".to_string(),
                 vec!["30".to_string()],
-            ));
+            ))
+            .unwrap();
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
@@ -751,7 +752,8 @@ mod tests {
                 hearth_lib::service::ServiceKind::PhpFpm,
                 hearth_bin.to_string_lossy().to_string(),
                 vec![],
-            ));
+            ))
+            .unwrap();
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
@@ -816,7 +818,8 @@ mod tests {
                 hearth_lib::service::ServiceKind::PhpFpm,
                 "/bin/sleep".to_string(),
                 vec!["30".to_string()],
-            ));
+            ))
+            .unwrap();
             // Registered but never started.
         }
         let mut outcome = outcome_with(vec![launched_row(&default_php)]);
@@ -855,7 +858,8 @@ mod tests {
                 hearth_lib::service::ServiceKind::PhpFpm,
                 herd_bin.to_string_lossy().to_string(),
                 vec![],
-            ));
+            ))
+            .unwrap();
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
@@ -910,7 +914,8 @@ mod tests {
                 hearth_bin.to_string_lossy().to_string(),
                 vec![],
                 vec![],
-            );
+            )
+            .unwrap();
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
@@ -1006,7 +1011,8 @@ mod tests {
                 hearth_lib::service::ServiceKind::PhpFpm,
                 herd_bin.to_string_lossy().to_string(),
                 vec![],
-            ));
+            ))
+            .unwrap();
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
@@ -1148,7 +1154,8 @@ mod tests {
                 hearth_lib::service::ServiceKind::PhpFpm,
                 herd_bin.to_string_lossy().to_string(),
                 vec![],
-            ));
+            ))
+            .unwrap();
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
@@ -1215,7 +1222,8 @@ mod tests {
                 hearth_lib::service::ServiceKind::PhpFpm,
                 hearth_bin.to_string_lossy().to_string(),
                 vec![],
-            ));
+            ))
+            .unwrap();
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
@@ -1299,7 +1307,8 @@ mod tests {
                 hearth_lib::service::ServiceKind::PhpFpm,
                 rogue.to_string_lossy().to_string(),
                 vec![],
-            ));
+            ))
+            .unwrap();
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
@@ -1325,7 +1334,8 @@ mod tests {
                 layout_slot.to_string_lossy().to_string(),
                 vec![],
                 vec![],
-            );
+            )
+            .unwrap();
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
@@ -1349,7 +1359,8 @@ mod tests {
                 layout_slot.to_string_lossy().to_string(),
                 vec![],
                 vec![],
-            );
+            )
+            .unwrap();
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
@@ -1395,7 +1406,8 @@ mod tests {
                 hearth_lib::service::ServiceKind::PhpFpm,
                 herd_bin.to_string_lossy().to_string(),
                 vec![],
-            ));
+            ))
+            .unwrap();
             sup.start_service(hearth_lib::service::ServiceKind::PhpFpm)
                 .unwrap();
         }
