@@ -925,78 +925,51 @@ impl PhpConfigEngine {
         require_reconciled(self.sync_locked().await)
             .map_err(|e| format!("switched default_php to {version} (persisted), but: {e}"))?;
 
-        // C1-1/C4-2 (review 5650): an ordinary version switch must NEVER
-        // take FPM ownership while Herd owns it — and unknown ownership
-        // fails CLOSED. Version selection + reconcile above stand; FPM
-        // handling becomes a truthful skip with ZERO supervisor mutation.
-        // Ownership comes from the same injected probe the daemon's service
-        // registration consults — never mutable process titles.
-        match self.fpm_ownership() {
-            FpmOwnership::Owned => {
-                return Ok(format!(
-                    "Switched to PHP {version}; php-fpm untouched (Herd manages PHP-FPM)"
-                ));
-            }
-            FpmOwnership::Unknown(diag) => {
-                return Ok(format!(
-                    "Switched to PHP {version}; php-fpm untouched (Herd ownership \
-                     unknown: {diag} — FPM activation skipped fail-closed)"
-                ));
-            }
-            FpmOwnership::Unowned => {}
-        }
-
+        // C6-2 (review 5650 r7): the ENTIRE FPM replacement is one
+        // supervisor-owned transaction under ONE authoritative typed
+        // ownership snapshot taken immediately before mutation. No engine-
+        // level pre-checks remain — split checks created windows where a
+        // flip could refuse AFTER destructive mutation while reporting
+        // "untouched". Preparation happens before the old child is touched;
+        // an ownership change after the snapshot is the health handoff's
+        // job. Version persistence + reconcile above stand regardless.
+        use crate::service::supervisor::FpmReplaceOutcome;
         let mut sup = supervisor.lock().await;
-        // C5-1B TOCTOU recheck UNDER the supervisor lock: ownership may have
-        // changed since the check above — a flip to Owned/Unknown here means
-        // zero FPM mutation (not even the own-child stop). The supervisor's
-        // own register/start boundary guards remain the final authority.
-        match self.fpm_ownership() {
-            FpmOwnership::Owned => {
-                return Ok(format!(
-                    "Switched to PHP {version}; php-fpm untouched (Herd manages PHP-FPM)"
-                ));
-            }
-            FpmOwnership::Unknown(diag) => {
-                return Ok(format!(
-                    "Switched to PHP {version}; php-fpm untouched (Herd ownership \
-                     unknown: {diag} — FPM activation skipped fail-closed)"
-                ));
-            }
-            FpmOwnership::Unowned => {}
-        }
-        let _ = sup.stop_service(ServiceKind::PhpFpm);
-        match crate::service::manager::hearth_fpm_service(version, &config_dir) {
-            Ok(svc) => {
-                if let Err(refusal) = sup.register(svc) {
-                    // Ownership flipped between the recheck and the boundary
-                    // guard: version stays persisted, FPM stays unmutated.
-                    return Ok(format!(
-                        "Switched to PHP {version}; php-fpm untouched ({refusal})"
-                    ));
-                }
-                sup.start_service(ServiceKind::PhpFpm).map_err(|e| {
-                    format!("switched to PHP {version}, but php-fpm start failed: {e}")
-                })?;
+        let build_version = version.to_string();
+        let build_config_dir = config_dir.clone();
+        match sup.replace_fpm_service(move || {
+            crate::service::manager::hearth_fpm_service(&build_version, &build_config_dir)
+        }) {
+            FpmReplaceOutcome::Replaced => {
                 Ok(format!("Switched to PHP {version}; php-fpm restarted"))
             }
-            Err(reason) => {
-                let removed = sup.remove_service(ServiceKind::PhpFpm);
-                let ownership_note = match self.fpm_ownership() {
-                    FpmOwnership::Owned => " (Herd manages PHP-FPM)",
-                    FpmOwnership::Unknown(_) => " (Herd ownership unknown)",
-                    FpmOwnership::Unowned => "",
-                };
-                let stale_note = if removed {
+            FpmReplaceOutcome::SkippedOwned => Ok(format!(
+                "Switched to PHP {version}; php-fpm untouched (Herd manages PHP-FPM)"
+            )),
+            FpmReplaceOutcome::SkippedOwnershipUnknown(diag) => Ok(format!(
+                "Switched to PHP {version}; php-fpm untouched (Herd ownership \
+                 unknown: {diag} — FPM activation skipped fail-closed)"
+            )),
+            FpmReplaceOutcome::BuildFailed {
+                reason,
+                removed_stale,
+            } => {
+                let stale_note = if removed_stale {
                     "; previous php-fpm registration removed"
                 } else {
                     ""
                 };
                 Ok(format!(
-                    "Switched to PHP {version}; php-fpm not registered: \
-                     {reason}{ownership_note}{stale_note}"
+                    "Switched to PHP {version}; php-fpm not registered: {reason}{stale_note}"
                 ))
             }
+            FpmReplaceOutcome::StopFailed { error } => Err(format!(
+                "switched to PHP {version} (persisted), but stopping the previous php-fpm \
+                 failed: {error} — the previous php-fpm remains supervised for retry"
+            )),
+            FpmReplaceOutcome::StartFailed { error } => Err(format!(
+                "switched to PHP {version}, but php-fpm start failed: {error}"
+            )),
         }
     }
 }
@@ -1627,6 +1600,16 @@ mod tests {
         );
     }
 
+    /// C6-1: supervisor carrying explicit isolated Unowned probe evidence —
+    /// probe-less supervisors refuse every FPM mutation by construction.
+    fn supervisor_unowned() -> Arc<Mutex<ServiceSupervisor>> {
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(Arc::new(|| {
+            crate::service::supervisor::FpmOwnership::Unowned
+        }));
+        Arc::new(Mutex::new(sup))
+    }
+
     fn write_fake_fpm_pair(fx: &Fixture, version: &str) {
         // Long-running fake so start_service succeeds and supervision works.
         write_executable(
@@ -1644,7 +1627,7 @@ mod tests {
         std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
         fx.config.lock().await.default_php = "8.3".to_string();
 
-        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        let supervisor = supervisor_unowned();
         {
             // Old registration carrying the OLD version's env.
             let mut sup = supervisor.lock().await;
@@ -1687,7 +1670,7 @@ mod tests {
         std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
         std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
 
-        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        let supervisor = supervisor_unowned();
         supervisor
             .lock()
             .await
@@ -1856,7 +1839,7 @@ mod tests {
         std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
         std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
         fx.config.lock().await.default_php = "8.3".to_string();
-        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        let supervisor = supervisor_unowned();
 
         // Deterministic barrier: hold the engine op lock; both operations
         // must block behind it (no sleeps deciding the outcome).
@@ -1894,7 +1877,7 @@ mod tests {
         write_fake_fpm_pair(&fx, "8.4");
         std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
         std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
-        let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        let supervisor = supervisor_unowned();
 
         let barrier = fx.engine.op_lock.lock().await;
         let e1 = Arc::clone(&fx.engine);
@@ -2284,17 +2267,28 @@ echo "Scan for additional .ini files in: {}"
 
         // A pre-existing registration (e.g. left from a Herd-absent boot)
         // must survive completely untouched: no stop, no replace, no
-        // remove, no start.
+        // remove, no start. C6-1: register under explicit Unowned evidence,
+        // then Herd takes ownership before the switch snapshot.
+        let herd_owns = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_flag = Arc::clone(&herd_owns);
         let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
-        supervisor
-            .lock()
-            .await
-            .register(ManagedService::new(
+        {
+            let mut sup = supervisor.lock().await;
+            sup.set_fpm_ownership_probe(Arc::new(move || {
+                if probe_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    FpmOwnership::Owned
+                } else {
+                    FpmOwnership::Unowned
+                }
+            }));
+            sup.register(ManagedService::new(
                 ServiceKind::PhpFpm,
                 "/bin/echo".to_string(),
                 vec!["sentinel".to_string()],
             ))
             .unwrap();
+        }
+        herd_owns.store(true, std::sync::atomic::Ordering::SeqCst);
 
         let msg = fx.engine.switch(&supervisor, "8.3").await.unwrap();
         assert!(msg.contains("php-fpm untouched"), "got: {msg}");
@@ -2316,6 +2310,10 @@ echo "Scan for additional .ini files in: {}"
 
         // And an empty supervisor gains NO registration either.
         let empty = Arc::new(Mutex::new(ServiceSupervisor::new()));
+        empty
+            .lock()
+            .await
+            .set_fpm_ownership_probe(Arc::new(|| FpmOwnership::Owned));
         fx.engine.switch(&empty, "8.3").await.unwrap();
         assert!(
             empty.lock().await.service(ServiceKind::PhpFpm).is_none(),
@@ -2341,7 +2339,11 @@ echo "Scan for additional .ini files in: {}"
 
         let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
         {
+            // C6-1: register + start under explicit Unowned evidence, THEN
+            // swap in the Unknown probe — the switch below must consult the
+            // supervisor's own snapshot and refuse fail-closed.
             let mut sup = supervisor.lock().await;
+            sup.set_fpm_ownership_probe(Arc::new(|| FpmOwnership::Unowned));
             sup.register(ManagedService::new(
                 ServiceKind::PhpFpm,
                 "/bin/sleep".to_string(),
@@ -2349,6 +2351,9 @@ echo "Scan for additional .ini files in: {}"
             ))
             .unwrap();
             sup.start_service(ServiceKind::PhpFpm).unwrap();
+            sup.set_fpm_ownership_probe(Arc::new(|| {
+                FpmOwnership::Unknown("ownership probe (pgrep) failed with status 2".to_string())
+            }));
         }
         let started = supervisor
             .lock()
@@ -2463,50 +2468,60 @@ echo "Scan for additional .ini files in: {}"
         assert_eq!(count(&log), 0, "Set must not execute FPM under Unknown");
     }
 
-    /// C5-1B TOCTOU inside `switch`: ownership flips to Owned between the
-    /// high-level check and the supervisor lock — the under-lock recheck
-    /// (and the register boundary guard behind it) yields ZERO FPM
-    /// mutation. Fails at head c22d446 (no recheck: register+start ran).
+    /// C6-2 (review 5650 r7): the switch takes ONE authoritative ownership
+    /// snapshot on the SUPERVISOR immediately before mutation. A flip to
+    /// Owned landing before that snapshot yields a truthful skip with ZERO
+    /// FPM mutation — and the snapshot is exactly one probe call (no split
+    /// checks, no post-mutation recheck). Fails at head 79d54d2 (split
+    /// engine-level checks; the supervisor's own probe was never the
+    /// transaction authority).
     #[tokio::test]
     async fn switch_toctou_flip_to_owned_performs_zero_fpm_mutation() {
         use crate::service::supervisor::ManagedService;
-        use std::collections::VecDeque;
 
-        // Deterministic call sequence inside switch: #1 build_rows during
-        // the reconcile sync, #2 the high-level guard — both Unowned; the
-        // under-lock recheck (#3+) sees Owned.
-        let responses = Arc::new(std::sync::Mutex::new(VecDeque::from(vec![
-            FpmOwnership::Unowned,
-            FpmOwnership::Unowned,
-        ])));
-        let probe_responses = Arc::clone(&responses);
-        let fx = fixture_with_probe(Arc::new(move || {
-            probe_responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(FpmOwnership::Owned)
-        }));
+        let fx = fixture(false);
         std::fs::create_dir_all(fx.config_dir.join("fpm")).unwrap();
         std::fs::write(fx.config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
         write_executable(&fx.config_dir.join("php/8.3/php"), "#!/bin/sh\nexit 0\n");
         write_spawnable_fpm(&fx.config_dir.join("php/8.3/php-fpm"));
 
-        // Pre-existing registration from an Unowned era (supervisor has no
-        // probe of its own here — the engine's is under test).
+        // Supervisor sequence probe: call #1 (the registration boundary
+        // guard) proves Unowned; every later call — the switch's single
+        // transaction snapshot — sees Owned. The counter pins the arity.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_calls = Arc::clone(&calls);
         let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
-        supervisor
-            .lock()
-            .await
-            .register(ManagedService::new(
+        {
+            let mut sup = supervisor.lock().await;
+            sup.set_fpm_ownership_probe(Arc::new(move || {
+                let n = probe_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    FpmOwnership::Unowned
+                } else {
+                    FpmOwnership::Owned
+                }
+            }));
+            sup.register(ManagedService::new(
                 ServiceKind::PhpFpm,
                 "/bin/echo".to_string(),
                 vec!["sentinel".to_string()],
             ))
             .unwrap();
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "registration takes exactly one boundary snapshot"
+        );
 
         let msg = fx.engine.switch(&supervisor, "8.3").await.unwrap();
         assert!(msg.contains("php-fpm untouched"), "got: {msg}");
+        assert!(msg.contains("Herd manages PHP-FPM"), "got: {msg}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "switch takes exactly ONE ownership snapshot for the transaction"
+        );
         let sup = supervisor.lock().await;
         let svc = sup
             .service(ServiceKind::PhpFpm)
@@ -2717,7 +2732,11 @@ echo "Scan for additional .ini files in: {}"
         let (fx, herd_live) = fixture_with_herd_flag();
         let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
         {
+            // C6-1: register + start under explicit Unowned evidence; the
+            // restart policy under test consults the ENGINE's flip-aware
+            // probe, so the supervisor keeps its registration-time evidence.
             let mut sup = supervisor.lock().await;
+            sup.set_fpm_ownership_probe(Arc::new(|| FpmOwnership::Unowned));
             sup.register(ManagedService::new(
                 ServiceKind::PhpFpm,
                 "/bin/sleep".to_string(),

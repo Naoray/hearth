@@ -573,6 +573,11 @@ mod tests {
 
     fn make_server() -> HearthMcpServer {
         let mut sup = ServiceSupervisor::new();
+        // C6-1: probe-less supervisors refuse FPM registration fail-closed;
+        // the fixture supplies explicit isolated Unowned evidence.
+        sup.set_fpm_ownership_probe(Arc::new(|| {
+            crate::service::supervisor::FpmOwnership::Unowned
+        }));
         sup.register(ManagedService::new(
             ServiceKind::Nginx,
             "true".to_string(),
@@ -647,6 +652,9 @@ mod tests {
     async fn php_list_tool_works() {
         // Create a server with a mock PHP version in the cache
         let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(Arc::new(|| {
+            crate::service::supervisor::FpmOwnership::Unowned
+        }));
         sup.register(ManagedService::new(
             ServiceKind::PhpFpm,
             "true".to_string(),
@@ -808,16 +816,26 @@ mod tests {
         std::fs::write(&fake_fpm, "#!/bin/sh\nsleep 30\n").unwrap();
         std::fs::set_permissions(&fake_fpm, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        let herd_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_flag = Arc::clone(&herd_live);
+
         let mut sup = ServiceSupervisor::new();
+        // C6-1: the fixture supervisor shares the flip-aware probe so
+        // registration succeeds under Unowned and later flips are observed.
+        let sup_flag = Arc::clone(&herd_live);
+        sup.set_fpm_ownership_probe(Arc::new(move || {
+            if sup_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                crate::service::supervisor::FpmOwnership::Owned
+            } else {
+                crate::service::supervisor::FpmOwnership::Unowned
+            }
+        }));
         sup.register(ManagedService::new(
             ServiceKind::PhpFpm,
             fake_fpm.to_string_lossy().to_string(),
             vec![],
         ))
         .unwrap();
-
-        let herd_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let probe_flag = Arc::clone(&herd_live);
         let config = Arc::new(Mutex::new(HearthConfig::default()));
         let engine = Arc::new(PhpConfigEngine::new(
             Arc::clone(&config),

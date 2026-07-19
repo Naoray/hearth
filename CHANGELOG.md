@@ -63,6 +63,17 @@ All notable changes to Hearth will be documented in this file.
   and config restarts report the `SkippedOwnershipUnknown` outcome.
   Unknown is never silently treated as "Herd absent" anywhere in the
   PHP/FPM paths.
+- The supervisor's FPM ownership evidence is fail-closed BY CONSTRUCTION:
+  a supervisor whose ownership probe has not been configured reports
+  `Unknown` (`FPM ownership probe is not configured`) and refuses every
+  FPM mutation until explicit evidence is installed — missing evidence is
+  never treated as "Unowned". The `hearth php use` FPM replacement is one
+  atomic supervisor transaction under a single authoritative ownership
+  snapshot taken immediately before mutation: the replacement service is
+  built before the old child is touched, a failed stop aborts with the old
+  child still supervised, a failed build never costs a running FPM, and a
+  failed start reports the truthful partial state — no interleaving can
+  report "untouched" after mutating.
 - Provider roots are validated as a SET: equal, nested, or symlink-aliased
   Hearth/Herd/Homebrew roots are rejected at construction, and provider
   identity additionally requires membership in exactly one canonical root —

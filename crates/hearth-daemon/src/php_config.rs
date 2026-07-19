@@ -337,11 +337,15 @@ mod tests {
             config_path.clone(),
             config_dir.clone(),
             roots,
-            herd,
+            Arc::clone(&herd),
             Duration::from_millis(50),
         ));
+        // C6-1: the fixture supervisor gets the SAME explicit typed probe as
+        // the engine — a probe-less supervisor fails closed by design.
+        let mut supervisor = ServiceSupervisor::new();
+        supervisor.set_fpm_ownership_probe(herd);
         let state = Arc::new(DaemonState {
-            supervisor: Arc::new(Mutex::new(ServiceSupervisor::new())),
+            supervisor: Arc::new(Mutex::new(supervisor)),
             config,
             site_manager: Arc::new(Mutex::new(SiteManager::with_homes(
                 vec![base.join("valet")],
