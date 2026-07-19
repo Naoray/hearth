@@ -960,21 +960,7 @@ async fn run_install() -> anyhow::Result<()> {
     // One-shot daemon-free php-config reconcile (plan 5560 §2.3 install hook):
     // recovers any pending journal and materializes channel files for the
     // preserved php_ini settings.
-    let engine = hearth_lib::php::engine::PhpConfigEngine::new(
-        std::sync::Arc::new(tokio::sync::Mutex::new(
-            hearth_lib::config::HearthConfig::load_from(&config_path)?,
-        )),
-        config_path.clone(),
-        config_dir.clone(),
-        provider_roots,
-        std::sync::Arc::new(hearth_lib::service::manager::current_fpm_ownership),
-        std::time::Duration::from_secs(5),
-    );
-    // Hard gate (F4): a Refused/Failed channel outcome aborts install with a
-    // nonzero exit (the preserved config stays persisted; rerun after fixing
-    // the reported path).
-    hearth_lib::php::engine::require_reconciled(engine.boot_sync().await)
-        .map_err(|e| anyhow::anyhow!("php-config reconcile failed: {e}"))?;
+    install_php_config_sync(&config_path, &config_dir, provider_roots).await?;
 
     // 3. Setup DNS resolver (requires sudo)
     println!("\n[3/3] Setting up DNS resolver (requires sudo)...");
@@ -1011,6 +997,28 @@ async fn run_install() -> anyhow::Result<()> {
 
     println!("\nSetup complete! Run `hearth daemon start` to start the daemon,");
     println!("then use `hearth start` to bring up services.");
+    Ok(())
+}
+
+async fn install_php_config_sync(
+    config_path: &std::path::Path,
+    config_dir: &std::path::Path,
+    provider_roots: hearth_lib::php::targets::ProviderRoots,
+) -> anyhow::Result<()> {
+    let engine = hearth_lib::php::engine::PhpConfigEngine::new(
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            hearth_lib::config::HearthConfig::load_from(config_path)?,
+        )),
+        config_path.to_path_buf(),
+        config_dir.to_path_buf(),
+        provider_roots,
+        std::sync::Arc::new(hearth_lib::service::manager::current_fpm_ownership),
+        std::time::Duration::from_secs(5),
+    );
+    // Hard gate (F4): a Refused/Failed channel or FPM outcome aborts install
+    // with a nonzero exit; the preserved config remains persisted.
+    hearth_lib::php::engine::require_reconciled(engine.boot_sync().await)
+        .map_err(|e| anyhow::anyhow!("php-config reconcile failed: {e}"))?;
     Ok(())
 }
 
@@ -2307,5 +2315,36 @@ mod tests {
             "zero mutation on rejection"
         );
         assert!(lone.is_err(), "lone discovery override must fail closed");
+    }
+
+    #[tokio::test]
+    async fn install_sync_materializes_fpm_without_daemon() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let config_dir = base.join("hearth");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        hearth_lib::config::HearthConfig::default()
+            .save_to(&config_path)
+            .unwrap();
+        let roots = hearth_lib::php::targets::ProviderRoots::isolated(
+            &base,
+            config_dir.clone(),
+            base.join("herd"),
+            base.join("homebrew"),
+        )
+        .unwrap();
+
+        install_php_config_sync(&config_path, &config_dir, roots)
+            .await
+            .unwrap();
+
+        assert!(hearth_lib::php::fpm::conf_path(&config_dir).is_file());
+        assert!(hearth_lib::php::fpm::probe_script_path(&config_dir).is_file());
+        assert!(hearth_lib::php::fpm::fpm_manifest_path(&config_dir).is_file());
+        assert!(matches!(
+            hearth_lib::php::fpm::conf_state(&config_dir),
+            hearth_lib::php::fpm::FpmConfState::HearthOwned { .. }
+        ));
     }
 }

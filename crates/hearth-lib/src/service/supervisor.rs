@@ -39,6 +39,32 @@ impl ShutdownStrategy {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FpmLaunchConf {
+    HearthOwned {
+        conf: PathBuf,
+        conf_sha256: String,
+        probe_sha256: String,
+        listen: PathBuf,
+    },
+    UserManaged {
+        conf: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FpmLaunchSnapshot {
+    pub generation: u64,
+    pub group_id: Option<u32>,
+    pub conf: FpmLaunchConf,
+    pub started_at: std::time::SystemTime,
+    pub running: bool,
+}
+
+pub struct LaunchStamp {
+    generation: u64,
+}
+
 /// Manages a single supervised service process.
 ///
 /// Each service runs in its own process group via `command-group`. Shutdown is
@@ -63,6 +89,8 @@ pub struct ManagedService {
     /// Extra environment variables for the spawned child (e.g. the Belt-E
     /// `PHP_INI_SCAN_DIR` pair for PHP workers/FPM). Empty = inherit only.
     env: Vec<(String, String)>,
+    fpm_launch: Option<FpmLaunchConf>,
+    launch_generation: Option<u64>,
     /// Trustworthy Hearth-owned start metadata: recorded at the moment THIS
     /// supervisor spawned the child, cleared only once termination is
     /// positively confirmed. Never inferred from ambient process evidence
@@ -90,6 +118,8 @@ impl ManagedService {
             cwd: None,
             site_name: None,
             env: Vec::new(),
+            fpm_launch: None,
+            launch_generation: None,
             started_at: None,
             #[cfg(test)]
             fail_next_stop: None,
@@ -109,16 +139,20 @@ impl ManagedService {
         self
     }
 
+    pub fn with_fpm_launch_conf(mut self, conf: FpmLaunchConf) -> Self {
+        self.fpm_launch = Some(conf);
+        self
+    }
+
+    pub fn fpm_launch_conf(&self) -> Option<&FpmLaunchConf> {
+        self.fpm_launch.as_ref()
+    }
+
     /// Create a managed service that runs in a specific working directory.
     ///
     /// Used by supervised Laravel workers (Horizon, Reverb) which must run inside
     /// the site root so `php artisan` finds the application bootstrap.
-    pub fn with_cwd(
-        kind: ServiceKind,
-        command: String,
-        args: Vec<String>,
-        cwd: PathBuf,
-    ) -> Self {
+    pub fn with_cwd(kind: ServiceKind, command: String, args: Vec<String>, cwd: PathBuf) -> Self {
         Self {
             kind,
             state: ServiceState::Stopped,
@@ -130,6 +164,8 @@ impl ManagedService {
             cwd: Some(cwd),
             site_name: None,
             env: Vec::new(),
+            fpm_launch: None,
+            launch_generation: None,
             started_at: None,
             #[cfg(test)]
             fail_next_stop: None,
@@ -155,6 +191,8 @@ impl ManagedService {
             cwd: Some(cwd),
             site_name: Some(site_name.into()),
             env: Vec::new(),
+            fpm_launch: None,
+            launch_generation: None,
             started_at: None,
             #[cfg(test)]
             fail_next_stop: None,
@@ -200,7 +238,7 @@ impl ManagedService {
     }
 
     /// Start the service in a new process group.
-    pub fn start(&mut self) -> anyhow::Result<()> {
+    pub fn start(&mut self, stamp: LaunchStamp) -> anyhow::Result<()> {
         info!(service = %self.kind, "starting service");
 
         let mut cmd = std::process::Command::new(&self.command);
@@ -219,9 +257,15 @@ impl ManagedService {
         self.child = Some(child);
         self.state = ServiceState::Running { pid };
         self.started_at = Some(std::time::SystemTime::now());
+        self.launch_generation = Some(stamp.generation);
 
         info!(service = %self.kind, pid, "service started");
         Ok(())
+    }
+
+    fn clear_launch_metadata(&mut self) {
+        self.started_at = None;
+        self.launch_generation = None;
     }
 
     /// Stop the service. Strategy:
@@ -239,7 +283,7 @@ impl ManagedService {
     pub fn stop(&mut self) -> anyhow::Result<()> {
         if self.child.is_none() {
             self.state = ServiceState::Stopped;
-            self.started_at = None;
+            self.clear_launch_metadata();
             return Ok(());
         }
 
@@ -260,7 +304,7 @@ impl ManagedService {
                 info!(service = %self.kind, "child had already exited");
                 self.child = None;
                 self.state = ServiceState::Stopped;
-                self.started_at = None;
+                self.clear_launch_metadata();
                 return Ok(());
             }
             Ok(None) => {}
@@ -275,7 +319,11 @@ impl ManagedService {
 
         let mut needs_signal = true;
 
-        if let ShutdownStrategy::Postgres { datadir, pg_ctl_binary } = &self.shutdown_strategy {
+        if let ShutdownStrategy::Postgres {
+            datadir,
+            pg_ctl_binary,
+        } = &self.shutdown_strategy
+        {
             // `pg_ctl stop -m fast` does a clean shutdown with a checkpoint.
             match std::process::Command::new(pg_ctl_binary)
                 .args(["stop", "-m", "fast", "-w", "-D"])
@@ -320,7 +368,7 @@ impl ManagedService {
                             info!(service = %self.kind, "child exited during stop");
                             self.child = None;
                             self.state = ServiceState::Stopped;
-                            self.started_at = None;
+                            self.clear_launch_metadata();
                             return Ok(());
                         }
                         _ => {
@@ -347,7 +395,7 @@ impl ManagedService {
                     info!(service = %self.kind, "service stopped cleanly");
                     self.child = None;
                     self.state = ServiceState::Stopped;
-                    self.started_at = None;
+                    self.clear_launch_metadata();
                     return Ok(());
                 }
                 Ok(None) => {
@@ -377,7 +425,7 @@ impl ManagedService {
             if let Ok(Some(_status)) = child.try_wait() {
                 self.child = None;
                 self.state = ServiceState::Stopped;
-                self.started_at = None;
+                self.clear_launch_metadata();
                 return Ok(());
             }
             anyhow::bail!(
@@ -389,7 +437,7 @@ impl ManagedService {
             Ok(_status) => {
                 self.child = None;
                 self.state = ServiceState::Stopped;
-                self.started_at = None;
+                self.clear_launch_metadata();
                 Ok(())
             }
             Err(e) => anyhow::bail!(
@@ -434,6 +482,7 @@ impl ManagedService {
 pub struct ServiceSupervisor {
     services: HashMap<ServiceKind, ManagedService>,
     health_interval: Duration,
+    launch_generation_counter: u64,
     /// C3-1/C6-1 (review 5650): the typed current-ownership probe for
     /// PHP-FPM — ONE coherent policy enforced INSIDE the supervisor so
     /// every mutation path (boot, register/reconfigure, generic
@@ -521,6 +570,7 @@ impl ServiceSupervisor {
         Self {
             services: HashMap::new(),
             health_interval: Duration::from_secs(5),
+            launch_generation_counter: 0,
             // C6-1: fail-CLOSED until real evidence is installed — a
             // probe-less supervisor refuses every FPM activation.
             fpm_ownership: std::sync::Arc::new(|| {
@@ -540,6 +590,16 @@ impl ServiceSupervisor {
     /// Current PHP-FPM ownership, consulted live on every FPM-mutating path.
     fn current_fpm_ownership(&self) -> FpmOwnership {
         (self.fpm_ownership)()
+    }
+
+    fn mint_launch_stamp(&mut self) -> LaunchStamp {
+        self.launch_generation_counter = self
+            .launch_generation_counter
+            .checked_add(1)
+            .expect("launch generation counter exhausted");
+        LaunchStamp {
+            generation: self.launch_generation_counter,
+        }
     }
 
     /// May Hearth activate (start/restart) its own FPM right now? `Unknown`
@@ -586,8 +646,9 @@ impl ServiceSupervisor {
                 info!("php-fpm start skipped: {reason}");
                 continue;
             }
+            let stamp = self.mint_launch_stamp();
             if let Some(svc) = self.services.get_mut(&kind) {
-                if let Err(e) = svc.start() {
+                if let Err(e) = svc.start(stamp) {
                     warn!(service = %kind, error = %e, "failed to start service, skipping");
                     svc.state = ServiceState::Failed {
                         reason: e.to_string(),
@@ -625,12 +686,13 @@ impl ServiceSupervisor {
         {
             anyhow::bail!("{reason} — Hearth will not start its own FPM");
         }
+        let stamp = self.mint_launch_stamp();
         let svc = self
             .services
             .get_mut(&kind)
             .ok_or_else(|| anyhow::anyhow!("service {kind} is not registered"))?;
         svc.circuit_breaker.reset();
-        svc.start()
+        svc.start(stamp)
     }
 
     /// Stop a specific service. Returns an error if the service is not registered.
@@ -744,12 +806,13 @@ impl ServiceSupervisor {
         // Replace metadata + start under the SAME snapshot. This insert is
         // part of the snapshot-guarded transaction, not a public raw path.
         self.services.insert(ServiceKind::PhpFpm, replacement);
+        let stamp = self.mint_launch_stamp();
         let svc = self
             .services
             .get_mut(&ServiceKind::PhpFpm)
             .expect("just inserted");
         svc.circuit_breaker.reset();
-        match svc.start() {
+        match svc.start(stamp) {
             Ok(()) => FpmReplaceOutcome::Replaced,
             Err(e) => {
                 svc.state = ServiceState::Failed {
@@ -791,7 +854,12 @@ impl ServiceSupervisor {
             };
         }
         svc.circuit_breaker.reset();
-        match svc.start() {
+        let stamp = self.mint_launch_stamp();
+        let svc = self
+            .services
+            .get_mut(&ServiceKind::PhpFpm)
+            .expect("registration checked above");
+        match svc.start(stamp) {
             Ok(()) => FpmRestartTxOutcome::Restarted,
             Err(e) => {
                 svc.state = ServiceState::Failed {
@@ -816,15 +884,26 @@ impl ServiceSupervisor {
             if kind == ServiceKind::PhpFpm {
                 continue;
             }
-            let Some(svc) = self.services.get_mut(&kind) else {
-                continue;
+            let stopped = if let Some(svc) = self.services.get_mut(&kind) {
+                if let Err(e) = svc.stop() {
+                    errors.push((kind, format!("stop failed: {e}")));
+                    false
+                } else {
+                    svc.circuit_breaker.reset();
+                    true
+                }
+            } else {
+                false
             };
-            if let Err(e) = svc.stop() {
-                errors.push((kind, format!("stop failed: {e}")));
+            if !stopped {
                 continue;
             }
-            svc.circuit_breaker.reset();
-            if let Err(e) = svc.start() {
+            let stamp = self.mint_launch_stamp();
+            let svc = self
+                .services
+                .get_mut(&kind)
+                .expect("registration checked above");
+            if let Err(e) = svc.start(stamp) {
                 svc.state = ServiceState::Failed {
                     reason: e.to_string(),
                 };
@@ -842,6 +921,17 @@ impl ServiceSupervisor {
     /// Read access to one registered service (command/args/env inspection).
     pub fn service(&self, kind: ServiceKind) -> Option<&ManagedService> {
         self.services.get(&kind)
+    }
+
+    pub fn fpm_launch_snapshot(&self) -> Option<FpmLaunchSnapshot> {
+        let service = self.services.get(&ServiceKind::PhpFpm)?;
+        Some(FpmLaunchSnapshot {
+            generation: service.launch_generation?,
+            group_id: service.child.as_ref().map(GroupChild::id),
+            conf: service.fpm_launch.clone()?,
+            started_at: service.started_at?,
+            running: matches!(service.state, ServiceState::Running { .. }),
+        })
     }
 
     /// C4-1 test-only: arm the injected stop-failure seam for one service.
@@ -872,6 +962,7 @@ impl ServiceSupervisor {
             } else {
                 FpmOwnership::Unowned
             };
+            let mut restart = false;
             if let Some(svc) = self.services.get_mut(&kind) {
                 match fpm_ownership {
                     FpmOwnership::Owned => {
@@ -891,7 +982,7 @@ impl ServiceSupervisor {
                             // Crashed while Herd owns it: record truthfully,
                             // no replacement child.
                             svc.state = ServiceState::Stopped;
-                            svc.started_at = None;
+                            svc.clear_launch_metadata();
                         }
                         continue;
                     }
@@ -913,16 +1004,24 @@ impl ServiceSupervisor {
                             reason: "Too many restarts (3 failures in 60s)".to_string(),
                         };
                     } else {
-                        info!(service = %kind, "attempting restart");
-                        if let Err(e) = svc.start() {
-                            error!(service = %kind, error = %e, "restart failed");
-                            svc.state = ServiceState::Failed {
-                                reason: e.to_string(),
-                            };
-                        }
+                        restart = true;
                     }
 
                     crashed.push(kind);
+                }
+            }
+            if restart {
+                info!(service = %kind, "attempting restart");
+                let stamp = self.mint_launch_stamp();
+                let svc = self
+                    .services
+                    .get_mut(&kind)
+                    .expect("health-checked service remains registered");
+                if let Err(e) = svc.start(stamp) {
+                    error!(service = %kind, error = %e, "restart failed");
+                    svc.state = ServiceState::Failed {
+                        reason: e.to_string(),
+                    };
                 }
             }
         }
@@ -941,10 +1040,7 @@ impl ServiceSupervisor {
 
     /// Get the current state of all services.
     pub fn status(&self) -> HashMap<ServiceKind, &ServiceState> {
-        self.services
-            .iter()
-            .map(|(k, v)| (*k, &v.state))
-            .collect()
+        self.services.iter().map(|(k, v)| (*k, &v.state)).collect()
     }
 
     /// Same as `status()` but carries each service's display name (with site bracket
@@ -992,12 +1088,7 @@ mod tests {
         let mut sup = ServiceSupervisor::new();
         let result = sup.start_service(ServiceKind::DumpServer);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("not registered")
-        );
+        assert!(result.unwrap_err().to_string().contains("not registered"));
     }
 
     #[test]
@@ -1005,12 +1096,7 @@ mod tests {
         let mut sup = ServiceSupervisor::new();
         let result = sup.stop_service(ServiceKind::Redis);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("not registered")
-        );
+        assert!(result.unwrap_err().to_string().contains("not registered"));
     }
 
     #[test]
@@ -1050,12 +1136,14 @@ mod tests {
         let mut sup = ServiceSupervisor::new();
         sup.set_fpm_ownership_probe(unowned_probe());
         sup.register(
-            ManagedService::new(ServiceKind::PhpFpm, "php-fpm".to_string(), vec![])
-                .with_env(vec![(
+            ManagedService::new(ServiceKind::PhpFpm, "php-fpm".to_string(), vec![]).with_env(vec![
+                (
                     "PHP_INI_SCAN_DIR".to_string(),
                     ":/old/8.3/conf.d".to_string(),
-                )]),
-        ).unwrap();
+                ),
+            ]),
+        )
+        .unwrap();
         sup.reconfigure_service(
             ServiceKind::PhpFpm,
             "/new/php-fpm".to_string(),
@@ -1104,10 +1192,7 @@ mod tests {
         let status = sup.status();
         assert_eq!(status.len(), 1);
         assert!(status.contains_key(&ServiceKind::Nginx));
-        assert!(matches!(
-            status[&ServiceKind::Nginx],
-            ServiceState::Stopped
-        ));
+        assert!(matches!(status[&ServiceKind::Nginx], ServiceState::Stopped));
     }
 
     #[test]
@@ -1173,13 +1258,13 @@ mod tests {
             vec!["-c".to_string(), "pwd > pwd-output".to_string()],
             cwd.clone(),
         );
-        svc.start().unwrap();
+        svc.start(LaunchStamp { generation: 1 }).unwrap();
         // Allow the child to write the file
         std::thread::sleep(std::time::Duration::from_millis(200));
         let _ = svc.stop();
 
-        let contents = std::fs::read_to_string(&marker)
-            .expect("child should have written pwd-output in cwd");
+        let contents =
+            std::fs::read_to_string(&marker).expect("child should have written pwd-output in cwd");
         let observed = std::path::PathBuf::from(contents.trim());
         let observed = std::fs::canonicalize(&observed).unwrap_or(observed);
         assert_eq!(observed, cwd);
@@ -1203,7 +1288,7 @@ mod tests {
             "PHP_INI_SCAN_DIR".to_string(),
             ":/tmp/hearth/php/8.4/conf.d".to_string(),
         )]);
-        svc.start().unwrap();
+        svc.start(LaunchStamp { generation: 1 }).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         let _ = svc.stop();
 
@@ -1225,7 +1310,7 @@ mod tests {
         assert!(svc.started_at().is_none(), "no spawn yet");
 
         let before = std::time::SystemTime::now();
-        svc.start().unwrap();
+        svc.start(LaunchStamp { generation: 1 }).unwrap();
         let started = svc.started_at().expect("spawn recorded");
         let after = std::time::SystemTime::now();
         assert!(
@@ -1343,7 +1428,7 @@ mod tests {
             "/bin/sh".to_string(),
             vec!["-c".to_string(), "exit 0".to_string()],
         );
-        svc.start().unwrap();
+        svc.start(LaunchStamp { generation: 1 }).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         svc.stop().unwrap();
         assert!(matches!(svc.state, ServiceState::Stopped));
@@ -2143,5 +2228,136 @@ mod tests {
             "FPM restarted under Unowned"
         );
         sup.stop_all().unwrap();
+    }
+
+    fn stamped_fpm_service(command: &str, args: Vec<String>) -> ManagedService {
+        ManagedService::new(ServiceKind::PhpFpm, command.to_string(), args).with_fpm_launch_conf(
+            FpmLaunchConf::HearthOwned {
+                conf: PathBuf::from("/tmp/hearth/fpm/php-fpm.conf"),
+                conf_sha256: "conf-sha".to_string(),
+                probe_sha256: "probe-sha".to_string(),
+                listen: PathBuf::from("/tmp/hearth/run/php-fpm.sock"),
+            },
+        )
+    }
+
+    fn stamped_sleeper() -> ManagedService {
+        stamped_fpm_service("/bin/sleep", vec!["30".to_string()])
+    }
+
+    #[test]
+    fn start_all_stamps_fresh_generation() {
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(unowned_probe());
+        sup.register(stamped_sleeper()).unwrap();
+        sup.start_all().unwrap();
+        let snapshot = sup.fpm_launch_snapshot().expect("stamped FPM");
+        assert!(snapshot.generation > 0);
+        assert!(snapshot.group_id.is_some());
+        assert!(snapshot.running);
+        sup.stop_all().unwrap();
+    }
+
+    #[test]
+    fn named_start_service_stamps_fresh_generation() {
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(unowned_probe());
+        sup.register(stamped_sleeper()).unwrap();
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        let first = sup.fpm_launch_snapshot().unwrap().generation;
+        sup.stop_service(ServiceKind::PhpFpm).unwrap();
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        let second = sup.fpm_launch_snapshot().unwrap().generation;
+        sup.stop_service(ServiceKind::PhpFpm).unwrap();
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        let third = sup.fpm_launch_snapshot().unwrap().generation;
+        assert!(first < second && second < third);
+        sup.stop_all().unwrap();
+    }
+
+    #[test]
+    fn replace_fpm_service_stamps_fresh_generation() {
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(unowned_probe());
+        sup.register(stamped_sleeper()).unwrap();
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        let before = sup.fpm_launch_snapshot().unwrap();
+        assert!(matches!(
+            sup.replace_fpm_service(|| Ok(stamped_sleeper())),
+            FpmReplaceOutcome::Replaced
+        ));
+        let after = sup.fpm_launch_snapshot().unwrap();
+        assert!(after.generation > before.generation);
+        assert_ne!(after.group_id, before.group_id);
+        sup.stop_all().unwrap();
+    }
+
+    #[test]
+    fn restart_fpm_service_and_restart_all_stamp_fresh_generations() {
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(unowned_probe());
+        sup.register(stamped_sleeper()).unwrap();
+        sup.register(sleeper(ServiceKind::Mailpit)).unwrap();
+        sup.start_all().unwrap();
+        let first = sup.fpm_launch_snapshot().unwrap().generation;
+        assert_eq!(sup.restart_fpm_service(), FpmRestartTxOutcome::Restarted);
+        let second = sup.fpm_launch_snapshot().unwrap().generation;
+        let mailpit_before = sup
+            .service(ServiceKind::Mailpit)
+            .unwrap()
+            .launch_generation
+            .unwrap();
+        let (fpm, errors) = sup.restart_all();
+        assert!(errors.is_empty());
+        assert_eq!(fpm, Some(FpmRestartTxOutcome::Restarted));
+        let third = sup.fpm_launch_snapshot().unwrap().generation;
+        let mailpit_after = sup
+            .service(ServiceKind::Mailpit)
+            .unwrap()
+            .launch_generation
+            .unwrap();
+        assert!(first < second && second < third);
+        assert!(
+            mailpit_after > mailpit_before,
+            "uniform seam stamps non-FPM starts too"
+        );
+        sup.stop_all().unwrap();
+    }
+
+    #[test]
+    fn health_respawn_stamps_fresh_generation_and_new_group() {
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(unowned_probe());
+        sup.register(stamped_fpm_service(
+            "/bin/sh",
+            vec!["-c".to_string(), "exit 0".to_string()],
+        ))
+        .unwrap();
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        let before = sup.fpm_launch_snapshot().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let crashed = sup.health_check();
+        assert!(crashed.contains(&ServiceKind::PhpFpm));
+        let after = sup.fpm_launch_snapshot().unwrap();
+        assert!(after.generation > before.generation);
+        assert_ne!(after.group_id, before.group_id);
+        let _ = sup.stop_all();
+    }
+
+    #[test]
+    fn generation_cleared_only_on_positively_confirmed_termination() {
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(unowned_probe());
+        sup.register(stamped_sleeper()).unwrap();
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        let before = sup.fpm_launch_snapshot().unwrap();
+        sup.inject_stop_failure(ServiceKind::PhpFpm, "retain launch metadata");
+        assert!(sup.stop_service(ServiceKind::PhpFpm).is_err());
+        let retained = sup.fpm_launch_snapshot().unwrap();
+        assert_eq!(retained.generation, before.generation);
+        assert_eq!(retained.group_id, before.group_id);
+        assert_eq!(retained.started_at, before.started_at);
+        sup.stop_service(ServiceKind::PhpFpm).unwrap();
+        assert!(sup.fpm_launch_snapshot().is_none());
     }
 }

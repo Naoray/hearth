@@ -1,8 +1,9 @@
 use tracing::{info, warn};
 
 use super::ServiceKind;
-use super::supervisor::{FpmOwnership, ManagedService};
+use super::supervisor::{FpmLaunchConf, FpmOwnership, ManagedService};
 use crate::config::{AddedPackage, HearthConfig};
+use crate::php::fpm::{self, FpmConfState};
 
 /// Current Herd ownership of the web/PHP services, as TYPED evidence
 /// (C4-2, review 5650 r4): a failed probe is `Unknown`, never a silent
@@ -91,10 +92,9 @@ fn classify_flag_read(result: std::io::Result<Vec<u8>>) -> FpmOwnership {
                 "isolated ownership flag content is not exactly `1` or `0`".to_string(),
             ),
         },
-        Err(e) => FpmOwnership::Unknown(format!(
-            "isolated ownership flag unreadable: {}",
-            e.kind()
-        )),
+        Err(e) => {
+            FpmOwnership::Unknown(format!("isolated ownership flag unreadable: {}", e.kind()))
+        }
     }
 }
 
@@ -109,7 +109,10 @@ pub fn prune_added_packages(packages: &[AddedPackage]) -> (Vec<AddedPackage>, Ve
     let mut kept = Vec::with_capacity(packages.len());
     let mut dropped = Vec::new();
     for pkg in packages {
-        let vendor_path = pkg.site_path.join("vendor").join(vendor_path_for(&pkg.package));
+        let vendor_path = pkg
+            .site_path
+            .join("vendor")
+            .join(vendor_path_for(&pkg.package));
         if vendor_path.exists() {
             kept.push(pkg.clone());
         } else {
@@ -298,10 +301,9 @@ pub fn default_services(
 
 /// Build Hearth's own supervised php-fpm service for one PHP version, or a
 /// truthful skip reason. Registration requires BOTH a resolvable binary and a
-/// generated fpm config; a missing config is launch-blocked (generation is
-/// todo #2343) and must never surface as a supervisor start failure. Takes
-/// the version directly so version-switch paths build the NEW version's
-/// service — binary, args, AND scan-dir env — from scratch.
+/// validated FPM config state. Takes the version directly so version-switch
+/// paths build the NEW version's service — binary, args, scan-dir env, and
+/// launch provenance — from scratch.
 pub fn hearth_fpm_service(
     version: &str,
     config_dir: &std::path::Path,
@@ -313,10 +315,30 @@ pub fn hearth_fpm_service(
             "php-fpm binary for {version} not found — skipping registration"
         ));
     };
-    let fpm_conf = config_dir.join("fpm/php-fpm.conf");
-    if !fpm_conf.is_file() {
-        return Err("launch-blocked: missing fpm config — see todo #2343".to_string());
-    }
+    let (fpm_conf, launch_conf) = match fpm::conf_state(config_dir) {
+        FpmConfState::HearthOwned {
+            conf,
+            conf_sha256,
+            probe_sha256,
+            listen,
+        } => {
+            remove_stale_fpm_socket(&listen)?;
+            let launch = FpmLaunchConf::HearthOwned {
+                conf: conf.clone(),
+                conf_sha256,
+                probe_sha256,
+                listen,
+            };
+            (conf, launch)
+        }
+        FpmConfState::UserManaged { conf } => {
+            let launch = FpmLaunchConf::UserManaged { conf: conf.clone() };
+            (conf, launch)
+        }
+        FpmConfState::Blocked { reason } => {
+            return Err(format!("launch-blocked: {reason}"));
+        }
+    };
     Ok(ManagedService::new(
         ServiceKind::PhpFpm,
         binary.to_string_lossy().to_string(),
@@ -325,7 +347,56 @@ pub fn hearth_fpm_service(
             format!("--fpm-config={}", fpm_conf.display()),
         ],
     )
-    .with_env(vec![crate::php::scan_dir_env(config_dir, version)]))
+    .with_env(vec![crate::php::scan_dir_env(config_dir, version)])
+    .with_fpm_launch_conf(launch_conf))
+}
+
+/// Remove only Hearth's exact dead unix listener. A live listener, symlink,
+/// regular file, or socket whose identity changes during the probe is foreign
+/// evidence and is left untouched.
+fn remove_stale_fpm_socket(socket: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::os::unix::net::UnixStream;
+
+    let before = match std::fs::symlink_metadata(socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "launch-blocked: cannot inspect FPM listener: {error}"
+            ));
+        }
+    };
+    if !before.file_type().is_socket() {
+        return Ok(());
+    }
+    match UnixStream::connect(socket) {
+        Ok(_) => return Ok(()),
+        Err(error)
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(_) => {}
+    }
+    let after = match std::fs::symlink_metadata(socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "launch-blocked: cannot recheck FPM listener: {error}"
+            ));
+        }
+    };
+    if !after.file_type().is_socket() || before.dev() != after.dev() || before.ino() != after.ino()
+    {
+        return Ok(());
+    }
+    std::fs::remove_file(socket)
+        .map_err(|error| format!("launch-blocked: cannot remove stale FPM listener: {error}"))
 }
 
 /// Supervised worker with Belt-E scan-dir env when its PHP version is known.
@@ -680,15 +751,24 @@ mod tests {
         bin
     }
 
+    fn materialize_owned_fpm(root: &std::path::Path) -> std::path::PathBuf {
+        let root = std::fs::canonicalize(root).unwrap();
+        let config_dir = root.join("config");
+        let report = crate::php::fpm::materialize(&config_dir, &root);
+        assert!(matches!(
+            report.state,
+            crate::php::fpm::FpmConfState::HearthOwned { .. }
+        ));
+        config_dir
+    }
+
     #[test]
     fn fpm_uses_resolved_binary_and_scan_env() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config_dir = tmp.path();
-        let bin = write_fake_fpm(config_dir, "8.4");
-        std::fs::create_dir_all(config_dir.join("fpm")).unwrap();
-        std::fs::write(config_dir.join("fpm/php-fpm.conf"), "; fpm").unwrap();
+        let config_dir = materialize_owned_fpm(tmp.path());
+        let bin = write_fake_fpm(&config_dir, "8.4");
 
-        let svc = hearth_fpm_service("8.4", config_dir).expect("fpm should register");
+        let svc = hearth_fpm_service("8.4", &config_dir).expect("fpm should register");
         assert_eq!(
             svc.env(),
             &[(
@@ -699,19 +779,102 @@ mod tests {
         // Resolved absolute binary, never bare PATH "php-fpm".
         assert_eq!(svc.command(), bin.display().to_string());
         assert_eq!(svc.display_name(), "php-fpm");
+        assert!(matches!(
+            svc.fpm_launch_conf(),
+            Some(crate::service::supervisor::FpmLaunchConf::HearthOwned {
+                conf,
+                listen,
+                ..
+            }) if conf == &config_dir.join("fpm/php-fpm.conf")
+                && listen == &config_dir.join("run/php-fpm.sock")
+        ));
     }
 
     #[test]
     fn fpm_skipped_and_launch_blocked_when_conf_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         write_fake_fpm(tmp.path(), "8.4");
-        // No fpm/php-fpm.conf generated (that is todo #2343's job).
         let err = match hearth_fpm_service("8.4", tmp.path()) {
             Err(e) => e,
             Ok(_) => panic!("expected launch-blocked skip"),
         };
         assert!(err.contains("launch-blocked"), "got: {err}");
-        assert!(err.contains("#2343"), "got: {err}");
+        assert!(err.contains("run `hearth php config --sync`"), "got: {err}");
+    }
+
+    #[test]
+    fn user_managed_fpm_conf_is_launchable_with_exact_provenance() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        write_fake_fpm(&config_dir, "8.4");
+        let conf = config_dir.join("fpm/php-fpm.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "; user managed\n").unwrap();
+
+        let svc = hearth_fpm_service("8.4", &config_dir).expect("user config is launchable");
+        assert_eq!(
+            svc.fpm_launch_conf(),
+            Some(&crate::service::supervisor::FpmLaunchConf::UserManaged { conf })
+        );
+    }
+
+    #[test]
+    fn stale_socket_cleanup_is_guarded() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::net::UnixListener;
+
+        let stale = tempfile::TempDir::new().unwrap();
+        let stale_config = materialize_owned_fpm(stale.path());
+        write_fake_fpm(&stale_config, "8.4");
+        let stale_socket = stale_config.join("run/php-fpm.sock");
+        drop(UnixListener::bind(&stale_socket).unwrap());
+        hearth_fpm_service("8.4", &stale_config).unwrap();
+        assert!(
+            !stale_socket.exists(),
+            "dead owned socket should be removed"
+        );
+
+        let live = tempfile::TempDir::new().unwrap();
+        let live_config = materialize_owned_fpm(live.path());
+        write_fake_fpm(&live_config, "8.4");
+        let live_socket = live_config.join("run/php-fpm.sock");
+        let listener = UnixListener::bind(&live_socket).unwrap();
+        hearth_fpm_service("8.4", &live_config).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&live_socket)
+                .unwrap()
+                .file_type()
+                .is_socket(),
+            "live socket must remain"
+        );
+        drop(listener);
+
+        let foreign = tempfile::TempDir::new().unwrap();
+        let foreign_config = materialize_owned_fpm(foreign.path());
+        write_fake_fpm(&foreign_config, "8.4");
+        let exact = foreign_config.join("run/php-fpm.sock");
+        std::fs::write(&exact, "foreign regular file").unwrap();
+        hearth_fpm_service("8.4", &foreign_config).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&exact)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "regular file must remain"
+        );
+
+        std::fs::remove_file(&exact).unwrap();
+        let target = foreign.path().join("foreign.sock");
+        drop(UnixListener::bind(&target).unwrap());
+        std::os::unix::fs::symlink(&target, &exact).unwrap();
+        hearth_fpm_service("8.4", &foreign_config).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&exact)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "socket symlink must remain"
+        );
     }
 
     #[test]

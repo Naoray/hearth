@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 
 use crate::config::{HearthConfig, PhpIniSettings};
+use crate::php::fpm::{self, FpmConfState};
 use crate::php::ini_guard;
 use crate::php::reconcile::{
     self, CHANNEL_FILE_NAME, EntryState, LastOutcome, Manifest, WriteOutcome, render_ini,
@@ -44,11 +45,11 @@ pub type HerdProbe = Arc<dyn Fn() -> FpmOwnership + Send + Sync>;
 // B4-1 class (argv masquerade, mutable titles, ambiguous/duplicate
 // executable records, PID reuse, stale evidence) is unrepresentable because
 // no ambient authority source exists. Authoritative Hearth-generated FPM
-// ownership is todo #2343.
+// ownership is deliberately outside the ambient-provider trust boundary.
 
 /// Truthful static coverage for every ambient-provider FPM row in Stage B.
-pub const EXTERNAL_FPM_COVERAGE: &str = "unverified: external launch context cannot be authenticated in Stage B — Hearth never \
-     writes on its behalf; authoritative Hearth-generated FPM ownership lands with todo #2343";
+pub const EXTERNAL_FPM_COVERAGE: &str = "unverified: ambient/external FPM launch context cannot be authenticated — Hearth never \
+     writes on its behalf and never executes it; use Hearth's supervised FPM for managed/live-observed coverage";
 
 /// Channel-file materialization state for one expected file, used to join
 /// classification with outcome (tier ⊓ outcome — status never overclaims).
@@ -115,14 +116,16 @@ impl PhpConfigEngine {
         (self.herd_running)()
     }
 
-    /// `Some(reason)` when Hearth's own FPM cannot launch because nothing has
-    /// generated its config yet (todo #2343 owns generation).
+    pub fn fpm_conf_state(&self) -> FpmConfState {
+        fpm::conf_state(&self.config_dir)
+    }
+
+    /// Compatibility adapter for callers that only need the launch-blocked
+    /// reason. Typed launch decisions consume [`Self::fpm_conf_state`].
     pub fn fpm_launch_blocked_reason(&self) -> Option<String> {
-        let conf = self.config_dir.join("fpm").join("php-fpm.conf");
-        if conf.is_file() {
-            None
-        } else {
-            Some("missing fpm config — see todo #2343".to_string())
+        match self.fpm_conf_state() {
+            FpmConfState::Blocked { reason } => Some(reason),
+            FpmConfState::HearthOwned { .. } | FpmConfState::UserManaged { .. } => None,
         }
     }
 
@@ -292,8 +295,22 @@ impl PhpConfigEngine {
 
     /// Journal recovery → guarded legacy migration → reconcile.
     async fn sync_locked(&self) -> Result<PhpConfigOutcome, String> {
-        reconcile::recover_pending(&self.manifest_path())
+        self.sync_locked_mode(true).await
+    }
+
+    async fn sync_locked_mode(
+        &self,
+        materialize_static_fpm: bool,
+    ) -> Result<PhpConfigOutcome, String> {
+        let manifest_dir = self.config_dir.join("php");
+        crate::php::targets::ensure_hearth_channel_dir(&self.provider_roots.hearth, &manifest_dir)
+            .map_err(|error| format!("manifest directory guard failed: {error}"))?;
+        reconcile::recover_pending(&self.manifest_path(), &self.provider_roots.hearth)
             .map_err(|e| format!("journal recovery failed: {e}"))?;
+        if materialize_static_fpm {
+            fpm::recover_pending_fpm(&self.config_dir, &self.provider_roots.hearth)
+                .map_err(|e| format!("FPM journal recovery failed: {e}"))?;
+        }
 
         let (snapshot, default_php) = {
             let mut cfg = self.config.lock().await;
@@ -328,6 +345,25 @@ impl PhpConfigEngine {
             })
             .collect();
         files.extend(creation_failures);
+        if materialize_static_fpm {
+            let fpm_report = fpm::materialize(&self.config_dir, &self.provider_roots.hearth);
+            if !matches!(fpm_report.state, FpmConfState::UserManaged { .. }) {
+                files.extend([
+                    FileOutcome {
+                        path: fpm::conf_path(&self.config_dir)
+                            .to_string_lossy()
+                            .to_string(),
+                        result: wire_result(&fpm_report.conf),
+                    },
+                    FileOutcome {
+                        path: fpm::probe_script_path(&self.config_dir)
+                            .to_string_lossy()
+                            .to_string(),
+                        result: wire_result(&fpm_report.probe),
+                    },
+                ]);
+            }
+        }
         let rows = self.build_rows(&snapshot, &default_php, &targets, None, &file_states);
 
         Ok(PhpConfigOutcome {
@@ -343,7 +379,12 @@ impl PhpConfigEngine {
     /// Remove every manifest-tracked channel file (journal-resolved,
     /// exact-hash only — survivors are reported Refused).
     fn unmanage_locked(&self) -> Result<PhpConfigOutcome, String> {
-        let actions = reconcile::unmanage(&self.manifest_path()).map_err(|e| e.to_string())?;
+        let mut actions = reconcile::unmanage(&self.manifest_path(), &self.provider_roots.hearth)
+            .map_err(|e| e.to_string())?;
+        actions.extend(
+            fpm::unmanage_fpm(&self.config_dir, &self.provider_roots.hearth)
+                .map_err(|e| e.to_string())?,
+        );
         let files = actions
             .iter()
             .map(|action| FileOutcome {
@@ -581,7 +622,7 @@ impl PhpConfigEngine {
             // exactly ONE static, truthful row. No ambient observation can
             // prove or manage them in Stage B, so the coverage text is a
             // constant and the channel is always absent — see
-            // EXTERNAL_FPM_COVERAGE; authoritative ownership is todo #2343.
+            // EXTERNAL_FPM_COVERAGE; ambient ownership is never inferred.
             if target.id.provider != PhpProvider::Hearth && target.id.sapi == PhpSapi::Fpm {
                 rows.push(PhpTargetRow {
                     provider: provider_str(target.id.provider).to_string(),
@@ -660,14 +701,24 @@ impl PhpConfigEngine {
             FpmOwnership::Owned => {}
             FpmOwnership::Unowned => {
                 let effective = php_ini.effective_for(default_php);
-                let coverage = if let Some(reason) = self.fpm_launch_blocked_reason() {
-                    format!("LAUNCH-BLOCKED: {reason}")
-                } else if crate::php::resolver::resolve_phpfpm_binary(default_php, &self.config_dir)
-                    .is_none()
-                {
-                    format!("LAUNCH-BLOCKED: php-fpm binary for {default_php} not found")
-                } else {
-                    "supervised (scan-dir env at launch)".to_string()
+                let binary_missing =
+                    crate::php::resolver::resolve_phpfpm_binary(default_php, &self.config_dir)
+                        .is_none();
+                let coverage = match self.fpm_conf_state() {
+                    FpmConfState::Blocked { reason } => format!("LAUNCH-BLOCKED: {reason}"),
+                    FpmConfState::HearthOwned { .. } | FpmConfState::UserManaged { .. }
+                        if binary_missing =>
+                    {
+                        format!("LAUNCH-BLOCKED: php-fpm binary for {default_php} not found")
+                    }
+                    FpmConfState::HearthOwned { listen, .. } => format!(
+                        "supervised (scan-dir env at launch; listen: {})",
+                        listen.display()
+                    ),
+                    FpmConfState::UserManaged { .. } => "supervised (user-managed fpm config — \
+                         live observation requires Hearth-generated config; remove/rename it and \
+                         run --sync to adopt)"
+                        .to_string(),
                 };
                 rows.push(PhpTargetRow {
                     provider: "hearth".to_string(),
@@ -712,7 +763,7 @@ impl PhpConfigEngine {
     /// classification-context env (normal / sanitized). Only the
     /// Hearth-supervised, registrable FPM service row is probed — `-i`
     /// under the exact service env (launch-probed, never live-observed;
-    /// live FastCGI observation is todo #2343). Ambient external FPM rows
+    /// live FastCGI observation is a separate evidence-gated stage). Ambient external FPM rows
     /// are never probed: no ambient launch context can be authenticated
     /// (Stage-B locked design), so their static unverified row stands.
     /// A probe failure leaves the row's truthful non-success state
@@ -931,7 +982,7 @@ impl PhpConfigEngine {
         // Reconcile for the new active version, hard-gated: a Refused/Failed
         // channel aborts the FPM restart (config release above keeps lock
         // order; op lock stays held for the whole transaction).
-        require_reconciled(self.sync_locked().await)
+        require_reconciled(self.sync_locked_mode(false).await)
             .map_err(|e| format!("switched default_php to {version} (persisted), but: {e}"))?;
 
         // C6-2 (review 5650 r7): the ENTIRE FPM replacement is one
@@ -1204,8 +1255,8 @@ mod tests {
         match fpm {
             FpmRestartOutcome::LaunchBlocked { reason } => {
                 assert!(
-                    reason.contains("#2343"),
-                    "reason must cite todo #2343: {reason}"
+                    reason.contains("run `hearth php config --sync`"),
+                    "{reason}"
                 );
             }
             other => panic!("expected LaunchBlocked, got {other:?}"),
@@ -1320,7 +1371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_reports_hearth_fpm_launch_blocked_with_todo() {
+    async fn status_reports_hearth_fpm_launch_blocked_with_sync_remediation() {
         let fx = fixture(false);
         let outcome = fx
             .engine
@@ -1341,9 +1392,263 @@ mod tests {
             fpm_row.coverage
         );
         assert!(
-            fpm_row.coverage.contains("#2343"),
+            fpm_row.coverage.contains("run `hearth php config --sync`"),
             "got: {}",
             fpm_row.coverage
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_reconcile_recovery_rejects_symlinked_ini_manifest_dir() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let fx = fixture(false);
+        let outside = fx.config_dir.parent().unwrap().join("outside-ini-recovery");
+        std::fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        std::fs::write(&sentinel, b"pre-recovery-outside").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&sentinel).unwrap();
+        std::os::unix::fs::symlink(&outside, fx.config_dir.join("php")).unwrap();
+
+        let error = fx.engine.boot_sync().await.unwrap_err();
+        assert!(error.contains("manifest directory guard failed"), "{error}");
+        let after = std::fs::metadata(&sentinel).unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"pre-recovery-outside");
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.permissions().mode() & 0o777, 0o640);
+        assert!(!outside.join(".manifest.lock").exists());
+        assert!(!outside.join("manifest.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn boot_sync_generates_fpm_conf_and_service_registers() {
+        let fx = fixture(false);
+        write_fake_fpm_pair(&fx, "8.4");
+
+        let outcome = fx.engine.boot_sync().await.unwrap();
+        assert_eq!(outcome.fpm, FpmRestartOutcome::NotAttempted);
+        assert!(matches!(
+            fx.engine.fpm_conf_state(),
+            crate::php::fpm::FpmConfState::HearthOwned { .. }
+        ));
+        let service = crate::service::manager::hearth_fpm_service("8.4", &fx.config_dir)
+            .expect("boot sync makes FPM launchable");
+        assert!(matches!(
+            service.fpm_launch_conf(),
+            Some(crate::service::supervisor::FpmLaunchConf::HearthOwned { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn status_row_shows_listener_for_hearth_owned_conf() {
+        let fx = fixture(false);
+        fx.engine.boot_sync().await.unwrap();
+
+        let outcome = fx
+            .engine
+            .apply(PhpConfigAction::Status {
+                key: None,
+                token: None,
+            })
+            .await
+            .unwrap();
+        let row = outcome
+            .rows
+            .iter()
+            .find(|row| row.provider == "hearth" && row.sapi == "fpm")
+            .unwrap();
+        assert_eq!(
+            row.coverage,
+            format!(
+                "supervised (scan-dir env at launch; listen: {})",
+                fx.config_dir.join("run/php-fpm.sock").display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn user_managed_conf_row_is_truthful_and_launchable() {
+        let fx = fixture(false);
+        write_fake_fpm_pair(&fx, "8.4");
+        let conf = fx.config_dir.join("fpm/php-fpm.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "; foreign\n").unwrap();
+
+        let status = fx
+            .engine
+            .apply(PhpConfigAction::Status {
+                key: None,
+                token: None,
+            })
+            .await
+            .unwrap();
+        let row = status
+            .rows
+            .iter()
+            .find(|row| row.provider == "hearth" && row.sapi == "fpm")
+            .unwrap();
+        assert_eq!(
+            row.coverage,
+            "supervised (user-managed fpm config — live observation requires Hearth-generated \
+             config; remove/rename it and run --sync to adopt)"
+        );
+        let service = crate::service::manager::hearth_fpm_service("8.4", &fx.config_dir).unwrap();
+        assert_eq!(
+            service.fpm_launch_conf(),
+            Some(&crate::service::supervisor::FpmLaunchConf::UserManaged { conf })
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_generation_renders_launch_blocked_with_remediation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fx = fixture(false);
+        fx.engine.boot_sync().await.unwrap();
+        fx.engine.apply(PhpConfigAction::Unmanage).await.unwrap();
+        let fpm_dir = fx.config_dir.join("fpm");
+        std::fs::set_permissions(&fpm_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let sync = fx.engine.apply(PhpConfigAction::Sync).await.unwrap();
+        let row = sync
+            .rows
+            .iter()
+            .find(|row| row.provider == "hearth" && row.sapi == "fpm")
+            .unwrap();
+        assert!(row.coverage.starts_with("LAUNCH-BLOCKED:"), "{row:?}");
+        assert!(row.coverage.contains("--sync"), "{row:?}");
+
+        let set = fx
+            .engine
+            .apply(set_global("memory_limit", "1G"))
+            .await
+            .unwrap();
+        std::fs::set_permissions(&fpm_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            set.persisted,
+            Some(true),
+            "Set stays independent of static FPM generation"
+        );
+        assert!(!fpm::conf_path(&fx.config_dir).exists());
+    }
+
+    #[tokio::test]
+    async fn sync_under_owned_or_unknown_writes_files_zero_supervisor_mutation() {
+        for ownership in [
+            FpmOwnership::Owned,
+            FpmOwnership::Unknown("probe unavailable".to_string()),
+        ] {
+            let fx = fixture_with_probe(Arc::new(move || ownership.clone()));
+            let supervisor = ServiceSupervisor::new();
+            let before = supervisor.status();
+            let outcome = fx.engine.apply(PhpConfigAction::Sync).await.unwrap();
+            let after = supervisor.status();
+            assert!(before.is_empty() && after.is_empty());
+            assert!(matches!(
+                fx.engine.fpm_conf_state(),
+                crate::php::fpm::FpmConfState::HearthOwned { .. }
+            ));
+            assert!(
+                outcome
+                    .files
+                    .iter()
+                    .any(|file| file.path.ends_with("php-fpm.conf"))
+            );
+            assert_eq!(outcome.fpm, FpmRestartOutcome::NotAttempted);
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_never_registers_or_restarts_fpm() {
+        let fx = fixture(false);
+        let supervisor = supervisor_unowned();
+        let outcome = fx.engine.apply(PhpConfigAction::Sync).await.unwrap();
+
+        assert!(
+            supervisor
+                .lock()
+                .await
+                .service(ServiceKind::PhpFpm)
+                .is_none()
+        );
+        assert_eq!(outcome.fpm, FpmRestartOutcome::NotAttempted);
+        assert!(matches!(
+            fx.engine.fpm_conf_state(),
+            crate::php::fpm::FpmConfState::HearthOwned { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unmanage_while_running_keeps_child_blocks_future_start() {
+        let fx = fixture(false);
+        write_fake_fpm_pair(&fx, "8.4");
+        fx.engine.boot_sync().await.unwrap();
+        let supervisor = supervisor_unowned();
+        {
+            let mut sup = supervisor.lock().await;
+            sup.register(
+                crate::service::manager::hearth_fpm_service("8.4", &fx.config_dir).unwrap(),
+            )
+            .unwrap();
+            sup.start_service(ServiceKind::PhpFpm).unwrap();
+        }
+        let before = supervisor.lock().await.fpm_launch_snapshot().unwrap();
+
+        fx.engine.apply(PhpConfigAction::Unmanage).await.unwrap();
+
+        let after = supervisor.lock().await.fpm_launch_snapshot().unwrap();
+        assert_eq!(after, before, "unmanage must not touch the running child");
+        assert!(matches!(
+            fx.engine.fpm_conf_state(),
+            crate::php::fpm::FpmConfState::Blocked { .. }
+        ));
+        assert!(crate::service::manager::hearth_fpm_service("8.4", &fx.config_dir).is_err());
+        let row = fx
+            .engine
+            .apply(PhpConfigAction::Status {
+                key: None,
+                token: None,
+            })
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .find(|row| row.provider == "hearth" && row.sapi == "fpm")
+            .unwrap();
+        assert!(row.coverage.starts_with("LAUNCH-BLOCKED:"), "{row:?}");
+        supervisor
+            .lock()
+            .await
+            .stop_service(ServiceKind::PhpFpm)
+            .unwrap();
+
+        let stopped = fixture(false);
+        write_fake_fpm_pair(&stopped, "8.4");
+        stopped.engine.boot_sync().await.unwrap();
+        let stopped_supervisor = supervisor_unowned();
+        stopped_supervisor
+            .lock()
+            .await
+            .register(
+                crate::service::manager::hearth_fpm_service("8.4", &stopped.config_dir).unwrap(),
+            )
+            .unwrap();
+        stopped
+            .engine
+            .apply(PhpConfigAction::Unmanage)
+            .await
+            .unwrap();
+        assert!(
+            stopped_supervisor
+                .lock()
+                .await
+                .service(ServiceKind::PhpFpm)
+                .is_some(),
+            "stopped registration is also untouched"
+        );
+        assert!(
+            crate::service::manager::hearth_fpm_service("8.4", &stopped.config_dir).is_err(),
+            "future service construction is blocked"
         );
     }
 
@@ -1436,7 +1741,7 @@ mod tests {
                 result: FileWriteResult::Written,
             }],
             fpm: FpmRestartOutcome::LaunchBlocked {
-                reason: "missing fpm config — see todo #2343".to_string(),
+                reason: "missing fpm config — run `hearth php config --sync`".to_string(),
             },
             status_key: None,
             status_token: None,
@@ -1623,7 +1928,7 @@ mod tests {
         // Long-running fake so start_service succeeds and supervision works.
         write_executable(
             &fx.config_dir.join("php").join(version).join("php-fpm"),
-            "#!/bin/sh\nsleep 30\n",
+            "#!/bin/sh\n[ \"$1\" = \"--warmup\" ] && exit 0\nsleep 30\n",
         );
     }
 
@@ -1686,13 +1991,16 @@ mod tests {
             .register(crate::service::manager::hearth_fpm_service("8.3", &fx.config_dir).unwrap())
             .unwrap();
 
-        // Launch-block the target: fpm config gone.
+        // Static FPM generation is reserved for boot/explicit Sync.
         std::fs::remove_file(fx.config_dir.join("fpm/php-fpm.conf")).unwrap();
         let message = switch_php_version(&supervisor, &fx.engine, "8.4")
             .await
             .unwrap();
         assert!(message.contains("php-fpm not registered"), "got: {message}");
-        assert!(message.contains("#2343"), "got: {message}");
+        assert!(
+            message.contains("run `hearth php config --sync`"),
+            "got: {message}"
+        );
         assert!(
             supervisor
                 .lock()
@@ -1701,6 +2009,10 @@ mod tests {
                 .is_none(),
             "stale registration must be removed"
         );
+        assert!(matches!(
+            fx.engine.fpm_conf_state(),
+            FpmConfState::Blocked { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1833,11 +2145,8 @@ mod tests {
             !fpm_row.coverage.contains("privileged-dir"),
             "no privileged-dir claim without observation"
         );
-        assert!(
-            fpm_row.coverage.contains("#2343"),
-            "limitation must point at the authoritative-ownership follow-up: {}",
-            fpm_row.coverage
-        );
+        assert!(fpm_row.coverage.contains("never executes it"));
+        assert!(fpm_row.coverage.contains("Hearth's supervised FPM"));
     }
 
     #[tokio::test]

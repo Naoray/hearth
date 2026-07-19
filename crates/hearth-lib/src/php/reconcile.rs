@@ -8,11 +8,20 @@
 //! a collision and is refused, never adopted.
 
 use crate::config::{HearthConfig, PhpIniSettings};
-use crate::php::targets::{PhpProvider, PhpTarget, ProviderRoots, verify_user_channel};
+use crate::php::targets::{
+    PhpProvider, PhpTarget, ProviderRoots, ensure_hearth_channel_dir, verify_user_channel,
+};
+use nix::fcntl::{OFlag, openat};
+use nix::sys::stat::Mode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt;
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// File name Hearth materializes into every verified channel. `zz-` sorts
 /// last in the alphabetical scan order, so Hearth values win over Herd's
@@ -20,6 +29,9 @@ use std::path::{Path, PathBuf};
 pub const CHANNEL_FILE_NAME: &str = "zz-hearth.ini";
 
 pub const MANIFEST_VERSION: u64 = 1;
+
+const DEFAULT_MANIFEST_LOCK_WAIT: Duration = Duration::from_secs(5);
+const MANIFEST_LOCK_POLL: Duration = Duration::from_millis(25);
 
 const REFUSED_REMEDIATION: &str = "remove or rename the file, then run `hearth php config --sync`";
 
@@ -243,10 +255,659 @@ pub struct RecoveryAction {
     pub outcome: RecoveryOutcome,
 }
 
+#[derive(Debug)]
+pub(crate) struct ManifestLock {
+    file: File,
+    directory: GuardedManifestDir,
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(Debug)]
+struct GuardedManifestDir {
+    file: File,
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl GuardedManifestDir {
+    fn verify_identity(&self) -> Result<(), LockError> {
+        let path_metadata = std::fs::symlink_metadata(&self.path)
+            .map_err(|error| LockError::Io(error.to_string()))?;
+        let fd_metadata = self
+            .file
+            .metadata()
+            .map_err(|error| LockError::Io(error.to_string()))?;
+        if path_metadata.file_type().is_symlink()
+            || !path_metadata.file_type().is_dir()
+            || path_metadata.dev() != self.dev
+            || path_metadata.ino() != self.ino
+            || fd_metadata.dev() != self.dev
+            || fd_metadata.ino() != self.ino
+        {
+            return Err(LockError::Io(format!(
+                "guarded manifest directory {} was replaced",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl ManifestLock {
+    fn verify_identity(&self) -> Result<(), LockError> {
+        self.directory.verify_identity()?;
+        let path_metadata = std::fs::symlink_metadata(&self.path)
+            .map_err(|error| LockError::Io(error.to_string()))?;
+        let fd_metadata = self
+            .file
+            .metadata()
+            .map_err(|error| LockError::Io(error.to_string()))?;
+        if path_metadata.file_type().is_symlink()
+            || !path_metadata.file_type().is_file()
+            || path_metadata.dev() != self.dev
+            || path_metadata.ino() != self.ino
+            || fd_metadata.dev() != self.dev
+            || fd_metadata.ino() != self.ino
+            || fd_metadata.nlink() != 1
+            || fd_metadata.len() != 0
+        {
+            return Err(LockError::Io(format!(
+                "manifest lock {} has unsafe or replaced identity",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum LockError {
+    Busy {
+        manifest_dir: PathBuf,
+        waited: Duration,
+    },
+    Io(String),
+}
+
+impl fmt::Display for LockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Busy {
+                manifest_dir,
+                waited,
+            } => write!(
+                f,
+                "another Hearth process is updating the manifest in {} (waited {:?}) — retry",
+                manifest_dir.display(),
+                waited
+            ),
+            Self::Io(error) => write!(f, "manifest lock I/O failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for LockError {}
+
+pub(crate) fn acquire_manifest_lock(
+    hearth_root: &Path,
+    manifest_dir: &Path,
+    wait: Duration,
+) -> Result<ManifestLock, LockError> {
+    let verified = ensure_hearth_channel_dir(hearth_root, manifest_dir)
+        .map_err(|error| LockError::Io(error.to_string()))?;
+    let directory_file =
+        File::open(&verified.path).map_err(|error| LockError::Io(error.to_string()))?;
+    let directory = GuardedManifestDir {
+        file: directory_file,
+        path: verified.path,
+        dev: verified.dev,
+        ino: verified.ino,
+    };
+    directory.verify_identity()?;
+
+    let lock_path = directory.path.join(".manifest.lock");
+    if let Ok(metadata) = std::fs::symlink_metadata(&lock_path)
+        && (metadata.file_type().is_symlink()
+            || !metadata.file_type().is_file()
+            || metadata.nlink() != 1)
+    {
+        return Err(LockError::Io(format!(
+            "manifest lock {} must be a single-link regular file",
+            lock_path.display()
+        )));
+    }
+    let existed = std::fs::symlink_metadata(&lock_path).is_ok();
+    let raw_fd = openat(
+        Some(directory.file.as_raw_fd()),
+        Path::new(".manifest.lock"),
+        OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_RDWR,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| LockError::Io(error.to_string()))?;
+    // SAFETY: `openat` returned a new owned descriptor on success.
+    let file = unsafe { File::from_raw_fd(raw_fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|error| LockError::Io(error.to_string()))?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.len() != 0
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+    {
+        return Err(LockError::Io(format!(
+            "manifest lock {} must be an owned, zero-byte, single-link regular file",
+            lock_path.display()
+        )));
+    }
+    let lock_dev = metadata.dev();
+    let lock_ino = metadata.ino();
+    let provisional = ManifestLock {
+        file,
+        directory,
+        path: lock_path,
+        dev: lock_dev,
+        ino: lock_ino,
+    };
+    provisional.verify_identity()?;
+    let started = Instant::now();
+    loop {
+        match provisional.file.try_lock() {
+            Ok(()) => {
+                provisional.verify_identity()?;
+                let mode = provisional
+                    .file
+                    .metadata()
+                    .map_err(|error| LockError::Io(error.to_string()))?
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                if mode != 0o600 {
+                    provisional
+                        .file
+                        .set_permissions(std::fs::Permissions::from_mode(0o600))
+                        .map_err(|error| LockError::Io(error.to_string()))?;
+                }
+                provisional
+                    .file
+                    .sync_all()
+                    .map_err(|error| LockError::Io(error.to_string()))?;
+                if !existed {
+                    provisional
+                        .directory
+                        .file
+                        .sync_all()
+                        .map_err(|error| LockError::Io(error.to_string()))?;
+                }
+                provisional.verify_identity()?;
+                let effective_mode = provisional
+                    .file
+                    .metadata()
+                    .map_err(|error| LockError::Io(error.to_string()))?
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                if effective_mode != 0o600 {
+                    return Err(LockError::Io(format!(
+                        "manifest lock {} mode is {:04o}, expected 0600",
+                        provisional.path.display(),
+                        effective_mode
+                    )));
+                }
+                return Ok(provisional);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if started.elapsed() >= wait {
+                    return Err(LockError::Busy {
+                        manifest_dir: manifest_dir.to_path_buf(),
+                        waited: wait,
+                    });
+                }
+                std::thread::sleep(MANIFEST_LOCK_POLL.min(wait.saturating_sub(started.elapsed())));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(LockError::Io(error.to_string()));
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum TxnError {
+    Lock(LockError),
+    Load(String),
+    Recovery(String),
+    Finalize(String),
+}
+
+impl fmt::Display for TxnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lock(error) => error.fmt(f),
+            Self::Load(error) => write!(f, "manifest unreadable: {error}"),
+            Self::Recovery(error) => write!(f, "journal recovery failed: {error}"),
+            Self::Finalize(error) => write!(f, "manifest finalization failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for TxnError {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OwnedArtifactSpec {
+    pub final_path: PathBuf,
+    pub channel: String,
+    pub php_version: String,
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+pub(crate) trait ArtifactDirVerifier {
+    fn verify(&self) -> Result<DirIdentity, String>;
+    fn recheck(&self, id: &DirIdentity) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Consumed by the FPM transaction in the next staged commit.
+pub(crate) enum FinalizeMode {
+    SaveAlways,
+    DeleteWhenEmpty,
+}
+
+pub(crate) struct ManifestTxn<'a> {
+    manifest: &'a mut Manifest,
+    manifest_path: &'a Path,
+    finalize: FinalizeMode,
+    finalize_requested: bool,
+    recovery_actions: Option<Vec<RecoveryAction>>,
+}
+
+impl ManifestTxn<'_> {
+    pub(crate) fn manifest(&mut self) -> &mut Manifest {
+        self.manifest
+    }
+
+    pub(crate) fn apply_owned_artifact(
+        &mut self,
+        spec: &OwnedArtifactSpec,
+        bytes: &[u8],
+        verifier: &dyn ArtifactDirVerifier,
+    ) -> WriteOutcome {
+        let desired_sha = sha256_hex(bytes);
+        let actual = file_sha256(&spec.final_path);
+
+        if let Some(actual_sha) = &actual {
+            match self.manifest.entry_index(&spec.final_path) {
+                None => {
+                    return WriteOutcome::Refused {
+                        reason: format!(
+                            "{} exists but is not tracked by the Hearth manifest — {}",
+                            spec.final_path.display(),
+                            REFUSED_REMEDIATION
+                        ),
+                    };
+                }
+                Some(idx) => {
+                    let entry = &self.manifest.files[idx];
+                    if !entry_owns(entry, actual_sha) {
+                        return WriteOutcome::Refused {
+                            reason: format!(
+                                "{} was modified outside Hearth — {}",
+                                spec.final_path.display(),
+                                REFUSED_REMEDIATION
+                            ),
+                        };
+                    }
+                    if entry.sha256 == desired_sha
+                        && entry.state == EntryState::Applied
+                        && *actual_sha == desired_sha
+                    {
+                        return WriteOutcome::Unchanged;
+                    }
+                }
+            }
+        }
+
+        let pending = ManifestEntry {
+            path: spec.final_path.clone(),
+            php_version: spec.php_version.clone(),
+            channel: spec.channel.clone(),
+            sha256: actual.clone().unwrap_or_default(),
+            state: EntryState::Pending,
+            expected_old_sha256: actual,
+            desired_sha256: Some(desired_sha.clone()),
+            last_outcome: LastOutcome::Written,
+            applied_at_unix_ms: None,
+        };
+        match self.manifest.entry_index(&spec.final_path) {
+            Some(idx) => self.manifest.files[idx] = pending,
+            None => self.manifest.files.push(pending),
+        }
+        if let Err(error) = self.manifest.save(self.manifest_path) {
+            return WriteOutcome::Failed {
+                error: format!("could not journal pending write: {error}"),
+            };
+        }
+        txn_test_pause(self.manifest_path, "after_journal");
+
+        let dir = spec.final_path.parent().unwrap_or(Path::new("."));
+        if !dir.exists() {
+            return self.finalize_failure(format!(
+                "channel directory {} disappeared after classification — refusing to recreate at write time; run `hearth php config --sync`",
+                dir.display()
+            ), &spec.final_path);
+        }
+        let verified = match verifier.verify() {
+            Ok(identity) => identity,
+            Err(rejection) => {
+                let idx = self.manifest.entry_index(&spec.final_path).unwrap();
+                self.manifest.files[idx].state = EntryState::Applied;
+                self.manifest.files[idx].expected_old_sha256 = None;
+                self.manifest.files[idx].desired_sha256 = None;
+                self.manifest.files[idx].last_outcome = LastOutcome::Refused;
+                let mut reason = format!("channel blocked: {rejection}");
+                if let Err(error) = self.manifest.save(self.manifest_path) {
+                    reason = format!(
+                        "{reason}; additionally, recording this refusal in the manifest failed: {error}"
+                    );
+                }
+                return WriteOutcome::Refused { reason };
+            }
+        };
+
+        if let Err(error) = atomic_write(dir, &spec.final_path, bytes, spec.mode) {
+            return self.finalize_failure(error.to_string(), &spec.final_path);
+        }
+        if let Err(error) = verifier.recheck(&verified) {
+            return self.finalize_failure(error, &spec.final_path);
+        }
+
+        let idx = self.manifest.entry_index(&spec.final_path).unwrap();
+        self.manifest.files[idx].sha256 = desired_sha;
+        self.manifest.files[idx].state = EntryState::Applied;
+        self.manifest.files[idx].expected_old_sha256 = None;
+        self.manifest.files[idx].desired_sha256 = None;
+        self.manifest.files[idx].last_outcome = LastOutcome::Written;
+        self.manifest.files[idx].applied_at_unix_ms = now_unix_ms();
+        if let Err(error) = self.manifest.save(self.manifest_path) {
+            return WriteOutcome::Failed {
+                error: format!("written but manifest finalization failed: {error}"),
+            };
+        }
+        WriteOutcome::Written
+    }
+
+    pub(crate) fn remove_owned_artifact(&mut self, final_path: &Path) -> WriteOutcome {
+        let actual = match file_sha256(final_path) {
+            Some(sha) => sha,
+            None => {
+                if let Some(idx) = self.manifest.entry_index(final_path) {
+                    let entry = self.manifest.files.remove(idx);
+                    if let Err(error) = self.manifest.save(self.manifest_path) {
+                        self.manifest.files.insert(idx, entry);
+                        return WriteOutcome::Failed {
+                            error: format!(
+                                "could not durably release ownership of missing {}: {error}",
+                                final_path.display()
+                            ),
+                        };
+                    }
+                }
+                return WriteOutcome::Unchanged;
+            }
+        };
+
+        let owned = self
+            .manifest
+            .entry_index(final_path)
+            .map(|idx| entry_owns(&self.manifest.files[idx], &actual))
+            .unwrap_or(false);
+        if !owned {
+            return WriteOutcome::Refused {
+                reason: format!(
+                    "{} is not tracked by the Hearth manifest — {}",
+                    final_path.display(),
+                    REFUSED_REMEDIATION
+                ),
+            };
+        }
+
+        let idx = self.manifest.entry_index(final_path).unwrap();
+        self.manifest.files[idx].state = EntryState::Pending;
+        self.manifest.files[idx].expected_old_sha256 = Some(actual);
+        self.manifest.files[idx].desired_sha256 = None;
+        if let Err(error) = self.manifest.save(self.manifest_path) {
+            return WriteOutcome::Failed {
+                error: format!("could not journal pending delete: {error}"),
+            };
+        }
+        txn_test_pause(self.manifest_path, "after_journal");
+
+        let removal = std::fs::remove_file(final_path).and_then(|()| {
+            crate::fsync::note_remove(final_path);
+            let parent = final_path.parent().unwrap_or(Path::new("."));
+            crate::fsync::sync_dir(parent)
+        });
+        if let Err(error) = removal {
+            return self.finalize_failure(error.to_string(), final_path);
+        }
+        let idx = self.manifest.entry_index(final_path).unwrap();
+        let entry = self.manifest.files.remove(idx);
+        if let Err(error) = self.manifest.save(self.manifest_path) {
+            self.manifest.files.insert(idx, entry);
+            return WriteOutcome::Failed {
+                error: format!("channel file removed but manifest finalization failed: {error}"),
+            };
+        }
+        WriteOutcome::Deleted
+    }
+
+    fn finalize_failure(&mut self, mut error: String, final_path: &Path) -> WriteOutcome {
+        if let Some(idx) = self.manifest.entry_index(final_path) {
+            self.manifest.files[idx].last_outcome = LastOutcome::Failed;
+            if let Err(save_error) = self.manifest.save(self.manifest_path) {
+                error = format!(
+                    "{error}; additionally, recording this failure in the manifest failed: {save_error}"
+                );
+            }
+        }
+        WriteOutcome::Failed { error }
+    }
+
+    pub(crate) fn save_manifest(&mut self) -> anyhow::Result<()> {
+        self.manifest.save(self.manifest_path)
+    }
+
+    pub(crate) fn request_finalize(&mut self) {
+        self.finalize_requested = true;
+    }
+
+    fn take_recovery_actions(&mut self) -> Vec<RecoveryAction> {
+        self.recovery_actions.take().unwrap_or_default()
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        match self.finalize {
+            FinalizeMode::SaveAlways if self.finalize_requested => self
+                .manifest
+                .save(self.manifest_path)
+                .map_err(|e| e.to_string()),
+            FinalizeMode::DeleteWhenEmpty if self.manifest.files.is_empty() => {
+                if self.manifest_path.exists() {
+                    txn_test_pause(self.manifest_path, "before_manifest_unlink");
+                    std::fs::remove_file(self.manifest_path).map_err(|e| e.to_string())?;
+                    crate::fsync::note_remove(self.manifest_path);
+                    let parent = self.manifest_path.parent().unwrap_or(Path::new("."));
+                    crate::fsync::sync_dir(parent).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }
+            FinalizeMode::DeleteWhenEmpty if self.finalize_requested => self
+                .manifest
+                .save(self.manifest_path)
+                .map_err(|e| e.to_string()),
+            _ => Ok(()),
+        }
+    }
+}
+
+pub(crate) fn manifest_set_transaction<T>(
+    hearth_root: &Path,
+    manifest_dir: &Path,
+    manifest_path: &Path,
+    lock_wait: Duration,
+    loader: impl FnOnce(&Path) -> Result<Manifest, String>,
+    finalize: FinalizeMode,
+    body: impl FnOnce(&mut ManifestTxn<'_>) -> T,
+) -> Result<T, TxnError> {
+    let lock =
+        acquire_manifest_lock(hearth_root, manifest_dir, lock_wait).map_err(TxnError::Lock)?;
+    let _lock_file = &lock.file;
+    lock.verify_identity().map_err(TxnError::Lock)?;
+    let mut manifest = loader(manifest_path).map_err(TxnError::Load)?;
+    lock.verify_identity().map_err(TxnError::Lock)?;
+    let recovery_actions = recover_pending_manifest(&mut manifest, manifest_path)
+        .map_err(|error| TxnError::Recovery(error.to_string()))?;
+    lock.verify_identity().map_err(TxnError::Lock)?;
+    let mut txn = ManifestTxn {
+        manifest: &mut manifest,
+        manifest_path,
+        finalize,
+        finalize_requested: false,
+        recovery_actions: Some(recovery_actions),
+    };
+    let output = body(&mut txn);
+    lock.verify_identity().map_err(TxnError::Lock)?;
+    txn.finish().map_err(TxnError::Finalize)?;
+    lock.verify_identity().map_err(TxnError::Lock)?;
+    Ok(output)
+}
+
+struct UserChannelVerifier<'a> {
+    dir: &'a Path,
+    allowed: &'a [PathBuf],
+}
+
+impl ArtifactDirVerifier for UserChannelVerifier<'_> {
+    fn verify(&self) -> Result<DirIdentity, String> {
+        let verified = verify_user_channel(self.dir, self.allowed).map_err(|e| e.to_string())?;
+        Ok(DirIdentity {
+            dev: verified.dev,
+            ino: verified.ino,
+        })
+    }
+
+    fn recheck(&self, id: &DirIdentity) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(self.dir).map_err(|e| e.to_string())?;
+        if metadata.dev() == id.dev && metadata.ino() == id.ino {
+            Ok(())
+        } else {
+            Err("channel directory was replaced during the write".to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TxnTestPause {
+    manifest_path: PathBuf,
+    entered: PathBuf,
+    release: PathBuf,
+}
+
+#[cfg(test)]
+fn txn_test_pause_slot() -> &'static std::sync::Mutex<Option<TxnTestPause>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<TxnTestPause>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn configure_txn_test_pause(manifest_path: &Path, entered: &Path, release: &Path) {
+    *txn_test_pause_slot().lock().unwrap() = Some(TxnTestPause {
+        manifest_path: manifest_path.to_path_buf(),
+        entered: entered.to_path_buf(),
+        release: release.to_path_buf(),
+    });
+}
+
+#[cfg(test)]
+fn txn_test_pause(manifest_path: &Path, stage: &str) {
+    let env_name = format!("HEARTH_TXN_PAUSE_{}", stage.to_ascii_uppercase());
+    if let Some(prefix) = std::env::var_os(env_name) {
+        let prefix = PathBuf::from(prefix);
+        let entered = prefix.with_extension("entered");
+        let release = prefix.with_extension("release");
+        if let Some(parent) = entered.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&entered, b"entered").unwrap();
+        if std::env::var_os("HEARTH_TXN_ABORT_AFTER_JOURNAL").is_some() {
+            std::process::abort();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !release.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "transaction test pause timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    if stage != "after_journal" {
+        return;
+    }
+    let pause = txn_test_pause_slot().lock().unwrap().clone();
+    let Some(pause) = pause.filter(|pause| pause.manifest_path == manifest_path) else {
+        return;
+    };
+    std::fs::write(&pause.entered, b"entered").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pause.release.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "transaction test pause timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    *txn_test_pause_slot().lock().unwrap() = None;
+}
+
+#[cfg(not(test))]
+fn txn_test_pause(_manifest_path: &Path, _stage: &str) {}
+
 /// Resolve every pending journal entry deterministically. Idempotent; called
 /// on daemon boot (before any reconcile) and before unmanage.
-pub fn recover_pending(manifest_path: &Path) -> anyhow::Result<Vec<RecoveryAction>> {
-    let mut manifest = Manifest::load(manifest_path)?;
+pub fn recover_pending(
+    manifest_path: &Path,
+    hearth_root: &Path,
+) -> anyhow::Result<Vec<RecoveryAction>> {
+    let manifest_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    manifest_set_transaction(
+        hearth_root,
+        manifest_dir,
+        manifest_path,
+        DEFAULT_MANIFEST_LOCK_WAIT,
+        |path| Manifest::load(path).map_err(|e| e.to_string()),
+        FinalizeMode::SaveAlways,
+        |txn| txn.take_recovery_actions(),
+    )
+    .map_err(anyhow::Error::from)
+}
+
+fn recover_pending_manifest(
+    manifest: &mut Manifest,
+    manifest_path: &Path,
+) -> anyhow::Result<Vec<RecoveryAction>> {
     let mut actions = Vec::new();
     let mut changed = false;
     let mut remove: Vec<usize> = Vec::new();
@@ -330,418 +991,143 @@ pub fn reconcile(
     manifest_path: &Path,
     roots: &ProviderRoots,
 ) -> ReconcileReport {
-    let mut report = ReconcileReport::default();
+    let manifest_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    match manifest_set_transaction(
+        &roots.hearth,
+        manifest_dir,
+        manifest_path,
+        DEFAULT_MANIFEST_LOCK_WAIT,
+        |path| Manifest::load(path).map_err(|error| error.to_string()),
+        FinalizeMode::SaveAlways,
+        |txn| {
+            let mut report = ReconcileReport::default();
+            let mut groups: BTreeMap<(String, PathBuf), PhpProvider> = BTreeMap::new();
+            for target in targets {
+                match &target.write_channel {
+                    Some(dir) => {
+                        groups
+                            .entry((target.id.version.clone(), dir.clone()))
+                            .or_insert(target.id.provider);
+                    }
+                    None => report.skipped.push(SkippedTarget {
+                        id: target.id.clone(),
+                        normal_channel: target.normal_channel.clone(),
+                        sanitized_channel: target.sanitized_channel.clone(),
+                    }),
+                }
+            }
 
-    // Resolve any crashed journal entries first — deterministic recovery.
-    if let Err(e) = recover_pending(manifest_path) {
-        report.files.push(FileAction {
-            path: manifest_path.to_path_buf(),
-            php_version: String::new(),
-            channel: String::new(),
-            outcome: WriteOutcome::Failed {
-                error: format!("journal recovery failed: {e}"),
-            },
-        });
-        return report;
-    }
+            let allowed = roots.allowed_prefixes();
+            let mut produced = Vec::new();
+            for ((version, dir), provider) in groups {
+                let file_path = dir.join(CHANNEL_FILE_NAME);
+                produced.push(file_path.clone());
+                let effective = php_ini.effective_for(&version);
+                let kind = channel_kind(provider);
+                let outcome = if effective.is_empty() {
+                    let outcome = txn.remove_owned_artifact(&file_path);
+                    (!matches!(outcome, WriteOutcome::Unchanged)).then_some(outcome)
+                } else {
+                    let content = render_ini(&effective);
+                    let spec = OwnedArtifactSpec {
+                        final_path: file_path.clone(),
+                        channel: kind.to_string(),
+                        php_version: version.clone(),
+                        mode: 0o644,
+                    };
+                    let verifier = UserChannelVerifier {
+                        dir: &dir,
+                        allowed: &allowed,
+                    };
+                    Some(txn.apply_owned_artifact(&spec, content.as_bytes(), &verifier))
+                };
 
-    let mut manifest = match Manifest::load(manifest_path) {
-        Ok(m) => m,
-        Err(e) => {
-            report.files.push(FileAction {
+                if let Some(outcome) = outcome {
+                    report.files.push(FileAction {
+                        path: file_path,
+                        php_version: version,
+                        channel: kind.to_string(),
+                        outcome,
+                    });
+                }
+            }
+
+            let changed = {
+                let manifest = txn.manifest();
+                let before = manifest.files.len();
+                manifest
+                    .files
+                    .retain(|entry| produced.contains(&entry.path) || entry.path.exists());
+                manifest.files.len() != before
+            };
+            if changed && let Err(error) = txn.save_manifest() {
+                report.files.push(FileAction {
+                    path: manifest_path.to_path_buf(),
+                    php_version: String::new(),
+                    channel: String::new(),
+                    outcome: WriteOutcome::Failed {
+                        error: format!(
+                            "stale manifest entries could not be pruned durably: {error}"
+                        ),
+                    },
+                });
+            }
+            report
+        },
+    ) {
+        Ok(report) => report,
+        Err(error) => ReconcileReport {
+            files: vec![FileAction {
                 path: manifest_path.to_path_buf(),
                 php_version: String::new(),
                 channel: String::new(),
                 outcome: WriteOutcome::Failed {
-                    error: format!("manifest unreadable: {e}"),
+                    error: error.to_string(),
                 },
-            });
-            return report;
-        }
-    };
-
-    // Group writable targets by (version, channel dir) — CLI and FPM twins of
-    // one provider share a single channel file.
-    let mut groups: BTreeMap<(String, PathBuf), PhpProvider> = BTreeMap::new();
-    for target in targets {
-        match &target.write_channel {
-            Some(dir) => {
-                groups
-                    .entry((target.id.version.clone(), dir.clone()))
-                    .or_insert(target.id.provider);
-            }
-            None => report.skipped.push(SkippedTarget {
-                id: target.id.clone(),
-                normal_channel: target.normal_channel.clone(),
-                sanitized_channel: target.sanitized_channel.clone(),
-            }),
-        }
+            }],
+            skipped: Vec::new(),
+        },
     }
-
-    let allowed = roots.allowed_prefixes();
-    let mut produced: Vec<PathBuf> = Vec::new();
-
-    for ((version, dir), provider) in groups {
-        let file_path = dir.join(CHANNEL_FILE_NAME);
-        produced.push(file_path.clone());
-        let effective = php_ini.effective_for(&version);
-        let kind = channel_kind(provider);
-
-        let outcome = if effective.is_empty() {
-            delete_channel_file(&mut manifest, manifest_path, &file_path, kind, &version)
-        } else {
-            let content = render_ini(&effective);
-            write_channel_file(
-                &mut manifest,
-                manifest_path,
-                &file_path,
-                &dir,
-                provider,
-                kind,
-                &version,
-                &content,
-                &allowed,
-            )
-        };
-
-        if let Some(outcome) = outcome {
-            report.files.push(FileAction {
-                path: file_path,
-                php_version: version,
-                channel: kind.to_string(),
-                outcome,
-            });
-        }
-    }
-
-    // Drop stale entries: not produced by any current group AND file gone.
-    // A non-durable prune is reported as a typed failure; the stale entries
-    // survive on disk and the next reconcile retries the prune.
-    let before = manifest.files.len();
-    manifest
-        .files
-        .retain(|e| produced.contains(&e.path) || e.path.exists());
-    if manifest.files.len() != before
-        && let Err(e) = manifest.save(manifest_path)
-    {
-        report.files.push(FileAction {
-            path: manifest_path.to_path_buf(),
-            php_version: String::new(),
-            channel: String::new(),
-            outcome: WriteOutcome::Failed {
-                error: format!("stale manifest entries could not be pruned durably: {e}"),
-            },
-        });
-    }
-
-    report
-}
-
-/// One channel file's write path. Journal → verify → temp+rename → finalize.
-/// Returns `None` for "nothing to do and nothing worth reporting".
-#[allow(clippy::too_many_arguments)]
-fn write_channel_file(
-    manifest: &mut Manifest,
-    manifest_path: &Path,
-    file_path: &Path,
-    dir: &Path,
-    _provider: PhpProvider,
-    kind: &str,
-    version: &str,
-    content: &str,
-    allowed: &[PathBuf],
-) -> Option<WriteOutcome> {
-    let desired_sha = sha256_hex(content.as_bytes());
-    let actual = file_sha256(file_path);
-
-    if let Some(actual_sha) = &actual {
-        match manifest.entry_index(file_path) {
-            None => {
-                return Some(WriteOutcome::Refused {
-                    reason: format!(
-                        "{} exists but is not tracked by the Hearth manifest — {}",
-                        file_path.display(),
-                        REFUSED_REMEDIATION
-                    ),
-                });
-            }
-            Some(idx) => {
-                let entry = &manifest.files[idx];
-                if !entry_owns(entry, actual_sha) {
-                    return Some(WriteOutcome::Refused {
-                        reason: format!(
-                            "{} was modified outside Hearth — {}",
-                            file_path.display(),
-                            REFUSED_REMEDIATION
-                        ),
-                    });
-                }
-                if entry.sha256 == desired_sha
-                    && entry.state == EntryState::Applied
-                    && *actual_sha == desired_sha
-                {
-                    return Some(WriteOutcome::Unchanged);
-                }
-            }
-        }
-    }
-
-    // 1. Journal the intent atomically BEFORE any channel mutation.
-    let pending = ManifestEntry {
-        path: file_path.to_path_buf(),
-        php_version: version.to_string(),
-        channel: kind.to_string(),
-        sha256: actual.clone().unwrap_or_default(),
-        state: EntryState::Pending,
-        expected_old_sha256: actual,
-        desired_sha256: Some(desired_sha.clone()),
-        last_outcome: LastOutcome::Written,
-        applied_at_unix_ms: None,
-    };
-    match manifest.entry_index(file_path) {
-        Some(idx) => manifest.files[idx] = pending,
-        None => manifest.files.push(pending),
-    }
-    if let Err(e) = manifest.save(manifest_path) {
-        return Some(WriteOutcome::Failed {
-            error: format!("could not journal pending write: {e}"),
-        });
-    }
-
-    // 2. Re-verify the channel and write via exclusive temp + rename.
-    //    NO creation here (review 5594 B2-5): the engine performs hardened,
-    //    verified Hearth-channel creation BEFORE reconcile. A directory that
-    //    disappeared or was substituted after classification is a typed
-    //    failure — never recreated through a possibly-changed path.
-    if !dir.exists() {
-        return finalize_failure(
-            manifest,
-            manifest_path,
-            file_path,
-            format!(
-                "channel directory {} disappeared after classification — refusing to \
-                 recreate at write time; run `hearth php config --sync`",
-                dir.display()
-            ),
-        );
-    }
-    let verified = match verify_user_channel(dir, allowed) {
-        Ok(v) => v,
-        Err(rejection) => {
-            let idx = manifest.entry_index(file_path).unwrap();
-            manifest.files[idx].state = EntryState::Applied;
-            manifest.files[idx].expected_old_sha256 = None;
-            manifest.files[idx].desired_sha256 = None;
-            manifest.files[idx].last_outcome = LastOutcome::Refused;
-            let mut reason = format!("channel blocked: {rejection}");
-            // The refusal stays primary, but a failure to durably record it
-            // must not be discarded.
-            if let Err(e) = manifest.save(manifest_path) {
-                reason = format!(
-                    "{reason}; additionally, recording this refusal in the manifest failed: {e}"
-                );
-            }
-            return Some(WriteOutcome::Refused { reason });
-        }
-    };
-
-    if let Err(e) = atomic_write(dir, file_path, content.as_bytes(), 0o644) {
-        return finalize_failure(manifest, manifest_path, file_path, e.to_string());
-    }
-
-    // Dev/inode identity fallback (no dirfd binding): the directory we
-    // verified must be the directory we wrote into.
-    match std::fs::metadata(dir) {
-        Ok(meta) => {
-            use std::os::unix::fs::MetadataExt;
-            if meta.dev() != verified.dev || meta.ino() != verified.ino {
-                return finalize_failure(
-                    manifest,
-                    manifest_path,
-                    file_path,
-                    "channel directory was replaced during the write".to_string(),
-                );
-            }
-        }
-        Err(e) => return finalize_failure(manifest, manifest_path, file_path, e.to_string()),
-    }
-
-    // 3. Finalize the manifest entry.
-    let idx = manifest.entry_index(file_path).unwrap();
-    manifest.files[idx].sha256 = desired_sha;
-    manifest.files[idx].state = EntryState::Applied;
-    manifest.files[idx].expected_old_sha256 = None;
-    manifest.files[idx].desired_sha256 = None;
-    manifest.files[idx].last_outcome = LastOutcome::Written;
-    manifest.files[idx].applied_at_unix_ms = now_unix_ms();
-    if let Err(e) = manifest.save(manifest_path) {
-        return Some(WriteOutcome::Failed {
-            error: format!("written but manifest finalization failed: {e}"),
-        });
-    }
-    Some(WriteOutcome::Written)
-}
-
-/// Record an io failure on the journaled entry, keeping it pending so the
-/// next recovery/reconcile can retry deterministically.
-fn finalize_failure(
-    manifest: &mut Manifest,
-    manifest_path: &Path,
-    file_path: &Path,
-    error: String,
-) -> Option<WriteOutcome> {
-    let mut error = error;
-    if let Some(idx) = manifest.entry_index(file_path) {
-        manifest.files[idx].last_outcome = LastOutcome::Failed;
-        // The original failure stays primary, but a failure to durably
-        // record it must not be discarded.
-        if let Err(e) = manifest.save(manifest_path) {
-            error = format!(
-                "{error}; additionally, recording this failure in the manifest failed: {e}"
-            );
-        }
-    }
-    Some(WriteOutcome::Failed { error })
-}
-
-/// Empty effective map → delete the channel file, but only when the manifest
-/// owns the exact on-disk bytes.
-fn delete_channel_file(
-    manifest: &mut Manifest,
-    manifest_path: &Path,
-    file_path: &Path,
-    kind: &str,
-    version: &str,
-) -> Option<WriteOutcome> {
-    let actual = match file_sha256(file_path) {
-        Some(sha) => sha,
-        None => {
-            // Nothing on disk; drop any leftover entry — but ownership is
-            // released only if that cleanup is durable.
-            if let Some(idx) = manifest.entry_index(file_path) {
-                let entry = manifest.files.remove(idx);
-                if let Err(e) = manifest.save(manifest_path) {
-                    manifest.files.insert(idx, entry);
-                    return Some(WriteOutcome::Failed {
-                        error: format!(
-                            "could not durably release ownership of missing {}: {e}",
-                            file_path.display()
-                        ),
-                    });
-                }
-            }
-            return None;
-        }
-    };
-
-    let owned = manifest
-        .entry_index(file_path)
-        .map(|idx| entry_owns(&manifest.files[idx], &actual))
-        .unwrap_or(false);
-    if !owned {
-        return Some(WriteOutcome::Refused {
-            reason: format!(
-                "{} is not tracked by the Hearth manifest — {}",
-                file_path.display(),
-                REFUSED_REMEDIATION
-            ),
-        });
-    }
-
-    // Journal the deletion (desired absent), delete, then drop the entry.
-    let idx = manifest.entry_index(file_path).unwrap();
-    manifest.files[idx].php_version = version.to_string();
-    manifest.files[idx].channel = kind.to_string();
-    manifest.files[idx].state = EntryState::Pending;
-    manifest.files[idx].expected_old_sha256 = Some(actual);
-    manifest.files[idx].desired_sha256 = None;
-    if let Err(e) = manifest.save(manifest_path) {
-        return Some(WriteOutcome::Failed {
-            error: format!("could not journal pending delete: {e}"),
-        });
-    }
-    // Removal barrier: the unlink is durable only after the containing
-    // directory syncs; ownership is dropped only past that barrier.
-    let removal = std::fs::remove_file(file_path).and_then(|()| {
-        crate::fsync::note_remove(file_path);
-        let parent = file_path.parent().unwrap_or(Path::new("."));
-        crate::fsync::sync_dir(parent)
-    });
-    if let Err(e) = removal {
-        return finalize_failure(manifest, manifest_path, file_path, e.to_string());
-    }
-    // `Deleted` is reported only after the ownership drop is durable. On
-    // failure the entry is restored in memory to mirror the durable pending
-    // journal on disk; recovery converges from either state.
-    let idx = manifest.entry_index(file_path).unwrap();
-    let entry = manifest.files.remove(idx);
-    if let Err(e) = manifest.save(manifest_path) {
-        manifest.files.insert(idx, entry);
-        return Some(WriteOutcome::Failed {
-            error: format!("channel file removed but manifest finalization failed: {e}"),
-        });
-    }
-    Some(WriteOutcome::Deleted)
 }
 
 /// Remove every Hearth-written channel file (journal-resolved, exact-hash
 /// deletions only). Hash-mismatched survivors are reported Refused.
-pub fn unmanage(manifest_path: &Path) -> anyhow::Result<Vec<FileAction>> {
-    recover_pending(manifest_path)?;
-    let mut manifest = Manifest::load(manifest_path)?;
-    let mut actions = Vec::new();
-    let mut keep = Vec::new();
-
-    for entry in manifest.files.drain(..) {
-        match file_sha256(&entry.path) {
-            None => {} // already gone — drop the entry silently
-            Some(actual) if actual == entry.sha256 => {
-                // Ownership is dropped only after the unlink is durable in
-                // its containing directory.
-                let removal = std::fs::remove_file(&entry.path).and_then(|()| {
-                    crate::fsync::note_remove(&entry.path);
-                    let parent = entry.path.parent().unwrap_or(Path::new("."));
-                    crate::fsync::sync_dir(parent)
-                });
-                match removal {
-                    Ok(()) => actions.push(FileAction {
-                        path: entry.path.clone(),
-                        php_version: entry.php_version.clone(),
-                        channel: entry.channel.clone(),
-                        outcome: WriteOutcome::Deleted,
-                    }),
-                    Err(e) => {
-                        actions.push(FileAction {
-                            path: entry.path.clone(),
-                            php_version: entry.php_version.clone(),
-                            channel: entry.channel.clone(),
-                            outcome: WriteOutcome::Failed {
-                                error: e.to_string(),
-                            },
-                        });
-                        keep.push(entry);
-                    }
+pub fn unmanage(manifest_path: &Path, hearth_root: &Path) -> anyhow::Result<Vec<FileAction>> {
+    let manifest_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    manifest_set_transaction(
+        hearth_root,
+        manifest_dir,
+        manifest_path,
+        DEFAULT_MANIFEST_LOCK_WAIT,
+        |path| Manifest::load(path).map_err(|error| error.to_string()),
+        FinalizeMode::SaveAlways,
+        |txn| {
+            let entries = txn.manifest().files.clone();
+            let mut actions = Vec::new();
+            for entry in entries {
+                let outcome = txn.remove_owned_artifact(&entry.path);
+                if let WriteOutcome::Failed { error } = &outcome
+                    && (error.starts_with("could not journal pending delete:")
+                        || error
+                            .starts_with("channel file removed but manifest finalization failed:"))
+                {
+                    return Err(error.clone());
+                }
+                if !matches!(outcome, WriteOutcome::Unchanged) {
+                    actions.push(FileAction {
+                        path: entry.path,
+                        php_version: entry.php_version,
+                        channel: entry.channel,
+                        outcome,
+                    });
                 }
             }
-            Some(_) => {
-                actions.push(FileAction {
-                    path: entry.path.clone(),
-                    php_version: entry.php_version.clone(),
-                    channel: entry.channel.clone(),
-                    outcome: WriteOutcome::Refused {
-                        reason: format!(
-                            "{} was modified outside Hearth — left in place",
-                            entry.path.display()
-                        ),
-                    },
-                });
-                keep.push(entry);
-            }
-        }
-    }
-    manifest.files = keep;
-    manifest.save(manifest_path)?;
-    Ok(actions)
+            txn.request_finalize();
+            Ok(actions)
+        },
+    )
+    .map_err(anyhow::Error::from)?
+    .map_err(anyhow::Error::msg)
 }
 
 // ---- legacy migration ----
@@ -877,7 +1263,7 @@ mod tests {
         expected_channel_dir,
     };
     use std::collections::BTreeMap;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     fn canon_tmp() -> (tempfile::TempDir, PathBuf) {
@@ -887,13 +1273,15 @@ mod tests {
     }
 
     fn test_roots(base: &Path) -> ProviderRoots {
-        ProviderRoots::isolated(
+        let roots = ProviderRoots::isolated(
             base,
             base.join("hearth"),
             base.join("Herd"),
             base.join("homebrew"),
         )
-        .unwrap()
+        .unwrap();
+        std::fs::create_dir_all(&roots.hearth).unwrap();
+        roots
     }
 
     fn verified_target(
@@ -1168,7 +1556,7 @@ mod tests {
         let manifest_path = base.join("manifest.toml");
         pending_manifest(&manifest_path, &file, None, Some(&desired_sha));
 
-        let actions = recover_pending(&manifest_path).unwrap();
+        let actions = recover_pending(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0].outcome, RecoveryOutcome::Finalized));
 
@@ -1193,7 +1581,7 @@ mod tests {
         let manifest_path = base.join("manifest.toml");
         pending_manifest(&manifest_path, &file, Some(&old_sha), Some(&desired_sha));
 
-        let actions = recover_pending(&manifest_path).unwrap();
+        let actions = recover_pending(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         assert!(matches!(actions[0].outcome, RecoveryOutcome::Retry));
         let manifest = Manifest::load(&manifest_path).unwrap();
         assert_eq!(
@@ -1220,7 +1608,7 @@ mod tests {
             Some(&sha256_hex(b"new")),
         );
 
-        let actions = recover_pending(&manifest_path).unwrap();
+        let actions = recover_pending(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         assert!(matches!(
             actions[0].outcome,
             RecoveryOutcome::Refused { .. }
@@ -1470,7 +1858,7 @@ mod tests {
 
         // The durable pending journal must remain recoverable: with the
         // failpoint cleared, recovery finalizes from the on-disk state.
-        let actions = recover_pending(&manifest_path).unwrap();
+        let actions = recover_pending(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         assert!(matches!(actions[0].outcome, RecoveryOutcome::Finalized));
         let manifest = Manifest::load(&manifest_path).unwrap();
         assert_eq!(manifest.files[0].state, EntryState::Applied);
@@ -1561,7 +1949,7 @@ mod tests {
         );
 
         // Recovery (barrier restored) resolves the journaled delete.
-        recover_pending(&manifest_path).unwrap();
+        recover_pending(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         assert!(
             Manifest::load(&manifest_path).unwrap().files.is_empty(),
             "recovery finalizes the durable delete"
@@ -1590,7 +1978,7 @@ mod tests {
 
         barriers::reset();
         let failpoint = barriers::fail_sync_of(&dir);
-        let actions = unmanage(&manifest_path).unwrap();
+        let actions = unmanage(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         drop(failpoint);
 
         assert!(
@@ -1972,7 +2360,7 @@ mod tests {
         );
 
         let failpoint = barriers::fail_sync_of(&manifest_dir);
-        let result = unmanage(&manifest_path);
+        let result = unmanage(&manifest_path, manifest_path.parent().unwrap());
         drop(failpoint);
         assert!(
             result.is_err(),
@@ -1980,7 +2368,7 @@ mod tests {
         );
 
         // Clean retry converges (files already durably removed).
-        assert!(unmanage(&manifest_path).is_ok());
+        assert!(unmanage(&manifest_path, manifest_path.parent().unwrap()).is_ok());
         assert!(Manifest::load(&manifest_path).unwrap().files.is_empty());
     }
 
@@ -1999,7 +2387,7 @@ mod tests {
         pending_manifest(&manifest_path, &file, None, Some(&desired_sha));
 
         let failpoint = barriers::fail_sync_of(&manifest_dir);
-        let result = recover_pending(&manifest_path);
+        let result = recover_pending(&manifest_path, manifest_path.parent().unwrap());
         drop(failpoint);
         assert!(
             result.is_err(),
@@ -2008,7 +2396,7 @@ mod tests {
 
         // Clean retry converges: disk exposes pending (rename not landed —
         // recovery finalizes) or applied (rename landed — nothing pending).
-        let actions = recover_pending(&manifest_path).unwrap();
+        let actions = recover_pending(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         assert!(
             actions.is_empty() || matches!(actions[0].outcome, RecoveryOutcome::Finalized),
             "{actions:?}"
@@ -2219,7 +2607,7 @@ mod tests {
         // Modified (no longer hash-matching) tracked file must survive.
         std::fs::write(&tracked, "user edited this\n").unwrap();
 
-        let actions = unmanage(&manifest_path).unwrap();
+        let actions = unmanage(&manifest_path, manifest_path.parent().unwrap()).unwrap();
 
         assert!(!pending_file.exists(), "journal-resolved file removed");
         assert!(tracked.exists(), "hash-mismatched file survives");
@@ -2265,7 +2653,7 @@ mod tests {
         let (_tmp, base) = canon_tmp();
         let roots = test_roots(&base);
         let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
-        let manifest_path = base.join("manifest-outside-hearth/manifest.toml");
+        let manifest_path = roots.hearth.join("manifest-store/manifest.toml");
         let ini = simple_ini("8.4", "memory_limit", "2G");
         let target = verified_target(PhpProvider::Hearth, "8.4", PhpSapi::Cli, &dir);
 
@@ -2289,5 +2677,295 @@ mod tests {
             !outside.join("8.4/conf.d").join(CHANNEL_FILE_NAME).exists(),
             "zero mutation through the substituted ancestor"
         );
+    }
+
+    #[derive(Clone)]
+    struct RecordingVerifier {
+        dir: PathBuf,
+        manifest_path: PathBuf,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl ArtifactDirVerifier for RecordingVerifier {
+        fn verify(&self) -> Result<DirIdentity, String> {
+            let manifest = Manifest::load(&self.manifest_path).map_err(|e| e.to_string())?;
+            assert_eq!(manifest.files.len(), 1);
+            assert_eq!(manifest.files[0].state, EntryState::Pending);
+            self.calls.lock().unwrap().push("verify-after-journal");
+            let meta = std::fs::metadata(&self.dir).map_err(|e| e.to_string())?;
+            use std::os::unix::fs::MetadataExt;
+            Ok(DirIdentity {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            })
+        }
+
+        fn recheck(&self, id: &DirIdentity) -> Result<(), String> {
+            let manifest = Manifest::load(&self.manifest_path).map_err(|e| e.to_string())?;
+            assert_eq!(manifest.files[0].state, EntryState::Pending);
+            self.calls.lock().unwrap().push("recheck-after-write");
+            let meta = std::fs::metadata(&self.dir).map_err(|e| e.to_string())?;
+            use std::os::unix::fs::MetadataExt;
+            if meta.dev() == id.dev && meta.ino() == id.ino {
+                Ok(())
+            } else {
+                Err("directory identity changed".to_string())
+            }
+        }
+    }
+
+    #[test]
+    fn apply_owned_artifact_matches_reconcile_journal_ordering() {
+        let (_tmp, base) = canon_tmp();
+        let manifest_dir = base.join("manifest");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        let manifest_path = manifest_dir.join("manifest.toml");
+        let artifact = manifest_dir.join("owned.conf");
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let verifier = RecordingVerifier {
+            dir: manifest_dir.clone(),
+            manifest_path: manifest_path.clone(),
+            calls: calls.clone(),
+        };
+        let spec = OwnedArtifactSpec {
+            final_path: artifact.clone(),
+            channel: "test".to_string(),
+            php_version: "8.4".to_string(),
+            mode: 0o600,
+        };
+
+        let outcome = manifest_set_transaction(
+            &manifest_dir,
+            &manifest_dir,
+            &manifest_path,
+            std::time::Duration::from_secs(1),
+            |path| Manifest::load(path).map_err(|error| error.to_string()),
+            FinalizeMode::SaveAlways,
+            |txn| txn.apply_owned_artifact(&spec, b"first\n", &verifier),
+        )
+        .unwrap();
+        assert_eq!(outcome, WriteOutcome::Written);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["verify-after-journal", "recheck-after-write"]
+        );
+        let manifest = Manifest::load(&manifest_path).unwrap();
+        assert_eq!(manifest.files[0].state, EntryState::Applied);
+        assert!(manifest.files[0].applied_at_unix_ms.is_some());
+
+        std::fs::write(&artifact, "tampered\n").unwrap();
+        let refused = manifest_set_transaction(
+            &manifest_dir,
+            &manifest_dir,
+            &manifest_path,
+            std::time::Duration::from_secs(1),
+            |path| Manifest::load(path).map_err(|error| error.to_string()),
+            FinalizeMode::SaveAlways,
+            |txn| txn.apply_owned_artifact(&spec, b"second\n", &verifier),
+        )
+        .unwrap();
+        assert!(matches!(refused, WriteOutcome::Refused { .. }));
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"tampered\n");
+    }
+
+    #[test]
+    fn manifest_lock_child_role() {
+        let Some(dir) = std::env::var_os("HEARTH_MANIFEST_LOCK_CHILD_DIR") else {
+            return;
+        };
+        let expect_busy = std::env::var_os("HEARTH_MANIFEST_LOCK_EXPECT_BUSY").is_some();
+        let result = acquire_manifest_lock(
+            Path::new(&dir),
+            Path::new(&dir),
+            std::time::Duration::from_millis(100),
+        );
+        if expect_busy {
+            assert!(matches!(result, Err(LockError::Busy { .. })));
+        } else {
+            assert!(
+                result.is_ok(),
+                "child failed to acquire released lock: {result:?}"
+            );
+        }
+    }
+
+    fn run_lock_child(dir: &Path, expect_busy: bool) {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("manifest_lock_child_role")
+            .arg("--nocapture")
+            .env("HEARTH_MANIFEST_LOCK_CHILD_DIR", dir);
+        if expect_busy {
+            command.env("HEARTH_MANIFEST_LOCK_EXPECT_BUSY", "1");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "lock child failed: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn manifest_lock_excludes_second_acquirer() {
+        let (_tmp, base) = canon_tmp();
+        let manifest_dir = base.join("locked");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        let first = acquire_manifest_lock(
+            &manifest_dir,
+            &manifest_dir,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        run_lock_child(&manifest_dir, true);
+        drop(first);
+        run_lock_child(&manifest_dir, false);
+
+        let lock_path = manifest_dir.join(".manifest.lock");
+        assert!(lock_path.is_file());
+        assert_eq!(std::fs::metadata(&lock_path).unwrap().len(), 0);
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn manifest_lock_rejects_ambiguous_identity_and_enforces_zero_byte_mode() {
+        let (_tmp, base) = canon_tmp();
+        let manifest_dir = base.join("locked");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        let lock_path = manifest_dir.join(".manifest.lock");
+        let sentinel = base.join("outside-sentinel");
+        std::fs::write(&sentinel, b"outside-bytes").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let sentinel_before = std::fs::metadata(&sentinel).unwrap();
+
+        std::os::unix::fs::symlink(&sentinel, &lock_path).unwrap();
+        assert!(acquire_manifest_lock(&base, &manifest_dir, Duration::ZERO).is_err());
+        std::fs::remove_file(&lock_path).unwrap();
+
+        std::fs::create_dir(&lock_path).unwrap();
+        assert!(acquire_manifest_lock(&base, &manifest_dir, Duration::ZERO).is_err());
+        std::fs::remove_dir(&lock_path).unwrap();
+
+        std::fs::hard_link(&sentinel, &lock_path).unwrap();
+        assert!(acquire_manifest_lock(&base, &manifest_dir, Duration::ZERO).is_err());
+        std::fs::remove_file(&lock_path).unwrap();
+
+        std::fs::write(&lock_path, []).unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let lock = acquire_manifest_lock(&base, &manifest_dir, Duration::ZERO).unwrap();
+        assert_eq!(
+            lock.file.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(lock);
+        std::fs::remove_file(&lock_path).unwrap();
+
+        std::fs::write(&lock_path, b"must-not-truncate").unwrap();
+        assert!(acquire_manifest_lock(&base, &manifest_dir, Duration::ZERO).is_err());
+        assert_eq!(std::fs::read(&lock_path).unwrap(), b"must-not-truncate");
+
+        let sentinel_after = std::fs::metadata(&sentinel).unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside-bytes");
+        assert_eq!(sentinel_after.ino(), sentinel_before.ino());
+        assert_eq!(sentinel_after.permissions().mode() & 0o777, 0o640);
+    }
+
+    #[test]
+    fn ini_recovery_and_reconcile_reject_symlinked_manifest_dir_zero_outside_mutation() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        std::fs::create_dir_all(&roots.hearth).unwrap();
+        let outside = base.join("outside-ini");
+        std::fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        std::fs::write(&sentinel, b"outside-ini-bytes").unwrap();
+        let sentinel_before = std::fs::metadata(&sentinel).unwrap();
+        std::os::unix::fs::symlink(&outside, roots.hearth.join("php")).unwrap();
+        let manifest_path = roots.hearth.join("php/manifest.toml");
+
+        let recovery = recover_pending(&manifest_path, &roots.hearth);
+        assert!(recovery.is_err());
+        let report = reconcile(&PhpIniSettings::default(), &[], &manifest_path, &roots);
+        assert!(matches!(
+            report.files.as_slice(),
+            [FileAction {
+                outcome: WriteOutcome::Failed { .. },
+                ..
+            }]
+        ));
+
+        let sentinel_after = std::fs::metadata(&sentinel).unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside-ini-bytes");
+        assert_eq!(sentinel_after.ino(), sentinel_before.ino());
+        assert!(!outside.join(".manifest.lock").exists());
+        assert!(!outside.join("manifest.toml").exists());
+    }
+
+    fn wait_for_file(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn ini_reconcile_acquires_and_releases_the_manifest_lock() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
+        let manifest_path = base.join("hearth/php/manifest.toml");
+        let entered = base.join("barrier/entered");
+        let release = base.join("barrier/release");
+        std::fs::create_dir_all(entered.parent().unwrap()).unwrap();
+        configure_txn_test_pause(&manifest_path, &entered, &release);
+
+        let thread_manifest = manifest_path.clone();
+        let thread_roots = roots.clone();
+        let handle = std::thread::spawn(move || {
+            let target = verified_target(
+                PhpProvider::Hearth,
+                "8.4",
+                PhpSapi::Cli,
+                &expected_channel_dir(PhpProvider::Hearth, "8.4", &thread_roots),
+            );
+            reconcile(
+                &simple_ini("8.4", "memory_limit", "2G"),
+                &[target],
+                &thread_manifest,
+                &thread_roots,
+            )
+        });
+
+        wait_for_file(&entered);
+        run_lock_child(manifest_path.parent().unwrap(), true);
+        std::fs::write(&release, b"go").unwrap();
+        let report = handle.join().unwrap();
+        let file = dir.join(CHANNEL_FILE_NAME);
+        assert_eq!(outcome_for(&report, &file), &WriteOutcome::Written);
+        run_lock_child(manifest_path.parent().unwrap(), false);
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            render_ini(&simple_ini("8.4", "memory_limit", "2G").effective_for("8.4"))
+        );
+    }
+
+    #[test]
+    fn finalize_mode_save_always_preserves_empty_ini_manifest() {
+        let (_tmp, base) = canon_tmp();
+        let manifest_path = base.join("php/manifest.toml");
+        let actions = unmanage(&manifest_path, &base).unwrap();
+        assert!(actions.is_empty());
+        assert!(manifest_path.is_file());
+        assert!(Manifest::load(&manifest_path).unwrap().files.is_empty());
     }
 }

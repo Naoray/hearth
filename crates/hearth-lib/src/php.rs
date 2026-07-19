@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod fpm;
 pub mod ini_guard;
 pub mod reconcile;
 pub mod resolver;

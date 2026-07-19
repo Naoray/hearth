@@ -180,6 +180,37 @@ unknown" message) until the probe recovers.
 When the running FPM predates the newest materialized config, status shows a
 truthful `pending restart` marker.
 
+### Hearth FPM
+
+On `hearth install`, daemon boot, or explicit `hearth php config --sync`,
+Hearth atomically generates `fpm/php-fpm.conf`, `fpm/hearth-probe.php`, and
+the exact-hash ownership record `fpm/manifest.toml`. The supervised master
+listens only on `run/php-fpm.sock` (mode `0600`); the generated pool accepts
+`.php` scripts, runs in the foreground, and keeps canonical PHP INI values in
+the existing scan-dir channel rather than duplicating them in FPM config.
+
+A pre-existing `fpm/php-fpm.conf` without Hearth's manifest is intentionally
+`user-managed`: Hearth can launch it but does not add a probe or ownership
+manifest, overwrite it, or remove it. Remove or rename that file and run
+`hearth php config --sync` to adopt the generated configuration.
+
+`hearth php config --unmanage` removes the Hearth-owned conf, probe, and
+manifest as one locked exact-hash set. It does not stop or unregister a running
+master; that child keeps running, while future service construction is
+launch-blocked until Sync regenerates the files. User-managed bytes survive
+Unmanage unchanged.
+
+Before launching a Hearth-owned config, stale-socket cleanup is deliberately
+narrow: only the exact `run/php-fpm.sock` path is considered, `lstat` must show
+an actual Unix socket, a synchronous connect must prove the endpoint dead, and
+the socket identity must remain unchanged. Live sockets, symlinks, regular
+files, and foreign paths are never unlinked.
+
+The separate `fpm/manifest.toml` prevents an older binary's INI reconcile from
+deleting FPM artifacts. Its persistent `.manifest.lock` is inert when no
+transaction is running. Live FPM-worker observation is not yet available and
+lands with PR-2 of todo #2343; PR-1 status remains `launch-probed` at most.
+
 **Observation labels** are exact about what was verified:
 
 - `configured` — the value in the canonical store
@@ -187,8 +218,8 @@ truthful `pending restart` marker.
 - `launch-probed` — the binary was executed under the exact launch
   environment (`php -r 'echo ini_get(...)'` for CLI; `php-fpm -i` under the
   service env for Hearth's supervised FPM) and reported it
-- `live-observed` — reserved for a running FPM worker (lands with the
-  FastCGI observation work in todo #2343; nothing is labeled this today)
+- `live-observed` — reserved for a running FPM worker; live FPM-worker
+  observation is not yet available and lands with PR-2 of todo #2343
 
 A value read from a file is never presented as the effective value of a
 running process.
@@ -217,8 +248,9 @@ Known limits, stated plainly:
   clears the environment and re-execs the absolute `PHP_BINARY` bypasses it —
   for that case use a Homebrew/Hearth build (verified compiled-in channel).
 - **Ambient Herd/Homebrew FPM** (not launched by Hearth): its launch context
-  cannot be authenticated, so it stays an unverified row and Hearth never
-  writes on its behalf until authoritative FPM ownership lands (todo #2343).
+  can never be authenticated. Hearth never writes on its behalf and never
+  executes it; use Hearth's supervised FPM for managed coverage (and, after
+  PR-2 of todo #2343, live-observed coverage).
 
 **Downgrade warning**: older Hearth binaries read this config but their next
 `config.save()` silently drops the `[php_ini]` tables — downgrading is
