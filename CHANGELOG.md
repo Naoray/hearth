@@ -2,6 +2,122 @@
 
 All notable changes to Hearth will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Global PHP configuration** (`hearth php config`): one canonical INI store
+  in `config.toml` (`[php_ini.global]` + `[php_ini.overrides."X.Y"]`,
+  override > global) materialized into per-version `zz-hearth.ini` scan-dir
+  channel files with exact-hash manifest ownership, crash-safe journaling,
+  and guarded migration of the legacy per-version Hearth `php.ini` files.
+  New actions: `--global`, `--php <V>`, `--show`, `--status`, `--unset`,
+  `--sync`, `--unmanage`, plus the `hearth php exec` launch shim.
+- **Launch-probed observation**: `--show [key]` and `--status [key]` report
+  per-target observed values by executing each CLI binary under its exact
+  launch environments (`-r 'echo ini_get(...)'`) and Hearth's supervised FPM
+  via `php-fpm -i` under the exact service env; a keyless `--status` stays
+  the pure coverage table. FPM binaries are never executed for
+  classification — ambient (Herd/Homebrew) FPM is structurally unprobed. Four-state vocabulary
+  (`configured` / `materialized` / `launch-probed` / `live-observed`), a
+  truthful `pending restart` marker (manifest materialization timestamp vs
+  the supervisor's own FPM spawn time), and `[not running]` for a
+  registered-but-stopped FPM. Probe failures render `n/a` and never fail
+  the command. Live FPM-worker observation is deferred to todo #2343;
+  ambient (non-Hearth-launched) FPM remains an unverified row that Hearth
+  never writes for. No universal coverage is claimed anywhere.
+
+### Changed
+- `hearth php use` never touches PHP-FPM while Herd owns it: the switch
+  persists the version and reconciles channels, then truthfully skips all
+  FPM supervisor mutation (`php-fpm untouched (Herd manages PHP-FPM)`).
+- Every config mutation (CLI/daemon set/unset and the MCP config write)
+  shares one centralized FPM-restart policy: under live Herd the restart is
+  skipped with zero supervisor mutation — even for an already-registered
+  FPM — and reported truthfully (`SkippedHerdOwned` on the wire; a legacy
+  CLI that cannot parse the new outcome fails into the actionable
+  stop/start version-mismatch remediation instead of rendering a false
+  state).
+- One coherent current-Herd-ownership policy for PHP-FPM now lives inside
+  the supervisor: generic `hearth start`/`hearth restart` skip (or, for an
+  explicit `restart php-fpm`, refuse with an actionable error) the FPM slot
+  while Herd owns it, and health supervision never respawns it. If Herd
+  appears while Hearth's own FPM is still running, the next health tick
+  relinquishes Hearth's own child — Hearth never signals or stops Herd's
+  process.
+- Stopping a supervised service is transactional: the child handle and
+  spawn record are kept until termination is positively confirmed, stop
+  failures propagate (and `hearth stop`/restart aggregate them instead of
+  reporting false success), a failed FPM handoff keeps the child
+  supervised and retries on later health ticks, and "stopped" is only ever
+  recorded after proof.
+- Herd-ownership detection is typed evidence (`Owned`/`Unowned`/`Unknown`)
+  end-to-end: a failed probe (pgrep spawn error, signal, exit codes above
+  the documented no-match 1) is `Unknown`, the isolated flag file must
+  contain EXACTLY the single byte `1` or `0` (any newline, whitespace,
+  BOM, extra bytes, empty, invalid UTF-8, or unreadable content is
+  `Unknown`), and every FPM path fails closed on it: registration and
+  reconfiguration are refused at the supervisor boundary itself (TOCTOU-
+  safe re-check immediately before mutation), start/restart/health skip,
+  `--status` renders a loud `OWNERSHIP-UNKNOWN` FPM row with the
+  diagnostic instead of a "supervised" row, no FPM binary is executed,
+  and config restarts report the `SkippedOwnershipUnknown` outcome.
+  Unknown is never silently treated as "Herd absent" anywhere in the
+  PHP/FPM paths.
+- The supervisor's FPM ownership evidence is fail-closed BY CONSTRUCTION:
+  a supervisor whose ownership probe has not been configured reports
+  `Unknown` (`FPM ownership probe is not configured`) and refuses every
+  FPM mutation until explicit evidence is installed — missing evidence is
+  never treated as "Unowned". The `hearth php use` FPM replacement is one
+  atomic supervisor transaction under a single authoritative ownership
+  snapshot taken immediately before mutation: the replacement service is
+  built before the old child is touched, a failed stop aborts with the old
+  child still supervised, a failed build never costs a running FPM, and a
+  failed start reports the truthful partial state — no interleaving can
+  report "untouched" after mutating.
+- EVERY restart that can touch PHP-FPM is that same kind of atomic
+  supervisor transaction: named `hearth restart php-fpm`, the all-services
+  `hearth restart`, and the config/MCP conditional FPM restart all take one
+  authoritative typed ownership snapshot immediately before any stop.
+  Owned/Unknown refuse or skip truthfully BEFORE the old child is touched
+  (the all-services aggregate reports the skip instead of claiming every
+  service restarted), Unowned performs one coherent stop/start with no
+  post-stop recheck, a failed stop keeps the old child fully supervised,
+  and a failed start leaves a truthful `Failed` registration with no
+  orphan. No restart path composes a public stop with the guarded start
+  anymore.
+- Provider roots are validated as a SET: equal, nested, or symlink-aliased
+  Hearth/Herd/Homebrew roots are rejected at construction, and provider
+  identity additionally requires membership in exactly one canonical root —
+  ambiguous identities render `identity unverified`, are never executed,
+  and hold no channel or pending-restart authority.
+- A keyed `--status` is certified by the daemon echoing the applied key
+  (`status_key`) AND a per-request correlation token (`status_token`) —
+  the certification is bound to the exact request/response pair, so an
+  unrelated success response or a stale report can never certify. Against
+  an older daemon that silently ignores the key, the keyed request fails
+  with the stop/start remediation instead of printing a valueless table;
+  keyless `--status` stays fully compatible in both directions. Invalid
+  `--status`/`--show` keys are rejected client-side and daemon-side. The
+  MCP `hearth_php_config_status` tool uses the same key + binding.
+- The truthful `pending restart` marker now requires the full chain of
+  evidence: the supervised command must equal the exact canonical
+  provider/version FPM layout binary (root-bounded, unambiguous), the
+  channel file must exist right now as a regular file whose bytes hash to
+  the recorded applied hash, and the manifest entry must be an
+  Applied/Written record for the exact path/version/channel. Targets whose
+  expected layout path resolves outside their provider root are rendered
+  `identity unverified` and are never executed.
+- Protocol-mismatch remediation now names only supported commands
+  (`hearth daemon stop && hearth daemon start`); there is no
+  `hearth daemon restart` command.
+
+### Removed
+- The legacy `PhpConfig { version, key, value }` socket request survives one
+  compatibility window (old CLI ↔ new daemon) and will be removed after it.
+  **Downgrade warning**: a pre-`[php_ini]` binary reads the new config but
+  its next `config.save()` silently drops the `[php_ini]` tables —
+  downgrading is write-destructive; back up `config.toml` first.
+
 ## [0.3.1] - 2026-07-18
 
 ### Changed

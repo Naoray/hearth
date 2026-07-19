@@ -89,6 +89,21 @@ pub struct ManifestEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desired_sha256: Option<String>,
     pub last_outcome: LastOutcome,
+    /// Unix milliseconds when this entry last reached `Applied` via a real
+    /// write (the materialization timestamp behind the truthful
+    /// `pending restart` marker). `#[serde(default)]` — entries from older
+    /// manifests carry `None` and never claim a pending restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at_unix_ms: Option<u64>,
+}
+
+/// Hearth-owned wall-clock in unix milliseconds; `None` if the clock is
+/// before the epoch (never panics a reconcile).
+fn now_unix_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
 }
 
 /// Authoritative ownership record for every channel file Hearth has written.
@@ -249,6 +264,7 @@ pub fn recover_pending(manifest_path: &Path) -> anyhow::Result<Vec<RecoveryActio
                 entry.expected_old_sha256 = None;
                 entry.desired_sha256 = None;
                 entry.last_outcome = LastOutcome::Written;
+                entry.applied_at_unix_ms = now_unix_ms();
                 RecoveryOutcome::Finalized
             }
             // Deletion intended and completed → drop the entry.
@@ -480,6 +496,7 @@ fn write_channel_file(
         expected_old_sha256: actual,
         desired_sha256: Some(desired_sha.clone()),
         last_outcome: LastOutcome::Written,
+        applied_at_unix_ms: None,
     };
     match manifest.entry_index(file_path) {
         Some(idx) => manifest.files[idx] = pending,
@@ -556,6 +573,7 @@ fn write_channel_file(
     manifest.files[idx].expected_old_sha256 = None;
     manifest.files[idx].desired_sha256 = None;
     manifest.files[idx].last_outcome = LastOutcome::Written;
+    manifest.files[idx].applied_at_unix_ms = now_unix_ms();
     if let Err(e) = manifest.save(manifest_path) {
         return Some(WriteOutcome::Failed {
             error: format!("written but manifest finalization failed: {e}"),
@@ -903,6 +921,7 @@ mod tests {
                 reason: "test".to_string(),
             },
             write_channel: Some(dir.to_path_buf()),
+            identity_verified: true,
         }
     }
 
@@ -918,6 +937,7 @@ mod tests {
             normal_channel: class.clone(),
             sanitized_channel: class,
             write_channel: None,
+            identity_verified: true,
         }
     }
 
@@ -1128,6 +1148,7 @@ mod tests {
                 expected_old_sha256: expected_old.map(str::to_string),
                 desired_sha256: desired.map(str::to_string),
                 last_outcome: LastOutcome::Written,
+                applied_at_unix_ms: None,
             }],
         };
         manifest.save(manifest_path).unwrap();
@@ -2191,6 +2212,7 @@ mod tests {
             expected_old_sha256: None,
             desired_sha256: Some(sha256_hex(pending_content.as_bytes())),
             last_outcome: LastOutcome::Written,
+            applied_at_unix_ms: None,
         });
         manifest.save(&manifest_path).unwrap();
 

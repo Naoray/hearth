@@ -183,7 +183,8 @@ enum PhpCommands {
         /// Remove a directive from the selected scope
         #[arg(long)]
         unset: bool,
-        /// Per-target coverage/status table
+        /// Per-target coverage/status table; with a key, each eligible row
+        /// also shows the configured and launch-probed value
         #[arg(long)]
         status: bool,
         /// Force journal recovery + reconcile of channel files
@@ -341,7 +342,31 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // C2-2/C3-2: a keyed Status is trustworthy only on the exact expected
+    // report response, with the key AND a per-request correlation token both
+    // echoed — a legacy daemon deserializes the keyed request as keyless and
+    // answers a valueless table; a stale or unrelated success-shaped
+    // response can never satisfy the token binding.
+    let mut request = request;
+    let keyed_status = match &mut request {
+        DaemonRequest::PhpConfigV2 {
+            action:
+                hearth_lib::socket::PhpConfigAction::Status {
+                    key: Some(key),
+                    token,
+                },
+        } => {
+            let correlation = new_status_correlation_token();
+            *token = Some(correlation.clone());
+            Some((key.clone(), correlation))
+        }
+        _ => None,
+    };
     let response = send_to_daemon(request).await?;
+    if let Some((expected_key, expected_token)) = keyed_status {
+        verify_keyed_status_certified(&response, &expected_key, &expected_token)
+            .map_err(|msg| anyhow::anyhow!(msg))?;
+    }
     // print_response is a pure renderer (returns ExitClass); main owns the
     // only process-exit application in the binary.
     if print_response(response) == ExitClass::Failure {
@@ -349,6 +374,52 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// C3-2 (review 5650 r3): per-request correlation token for keyed Status.
+/// Not a secret — a binding value that a stale or unrelated response cannot
+/// carry. Generated in-process (pid + monotonic-ish clock + counter), never
+/// via a shell.
+fn new_status_correlation_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "st-{}-{nanos:x}-{:x}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// C2-2/C3-2: a keyed Status may succeed ONLY on the exact expected
+/// `PhpConfigReport` whose `status_key` and `status_token` echoes both match
+/// this request. Every other success shape — an unrelated `Ok`, a service
+/// status, a stale report with a coincidentally matching key, a missing or
+/// mismatched echo — is an actionable protocol mismatch. A daemon `Error`
+/// keeps its own truthful nonzero path (it is never mislabeled success).
+fn verify_keyed_status_certified(
+    response: &DaemonResponse,
+    expected_key: &str,
+    expected_token: &str,
+) -> Result<(), String> {
+    match response {
+        DaemonResponse::PhpConfigReport(outcome)
+            if outcome.status_key.as_deref() == Some(expected_key)
+                && outcome.status_token.as_deref() == Some(expected_token) =>
+        {
+            Ok(())
+        }
+        DaemonResponse::Error { .. } => Ok(()),
+        _ => Err(format!(
+            "the daemon did not certify the keyed status request (key `{expected_key}`) — \
+             hearth CLI and daemon versions differ; run \
+             'hearth daemon stop && hearth daemon start' and retry."
+        )),
+    }
 }
 
 /// Build the typed php-config action from the CLI flag matrix, or an
@@ -388,23 +459,34 @@ fn build_php_config_action(
         PhpScope::Active
     };
 
-    if status || sync || unmanage {
-        let name = if status {
-            "--status"
-        } else if sync {
-            "--sync"
-        } else {
-            "--unmanage"
-        };
+    // C1-3: --status takes an optional key so the coverage table can carry
+    // per-target configured + launch-probed values (todo #2321 acceptance).
+    // Keyless --status stays the pure coverage table; it never fakes values.
+    if status {
+        if value.is_some() {
+            return Err("--status takes an optional key but no value".to_string());
+        }
+        if global || php.is_some() {
+            return Err("--status takes no --global/--php scope".to_string());
+        }
+        // C2-4: an invalid key is a stable actionable error before any
+        // daemon I/O — never a silent degradation to a valueless table.
+        if let Some(k) = &key {
+            hearth_lib::php::ini_guard::validate_key(k)
+                .map_err(|e| format!("invalid --status key: {e}"))?;
+        }
+        return Ok(PhpConfigAction::Status { key, token: None });
+    }
+
+    if sync || unmanage {
+        let name = if sync { "--sync" } else { "--unmanage" };
         if key.is_some() || value.is_some() {
             return Err(format!("{name} takes no key or value"));
         }
         if global || php.is_some() {
             return Err(format!("{name} takes no --global/--php scope"));
         }
-        return Ok(if status {
-            PhpConfigAction::Status
-        } else if sync {
+        return Ok(if sync {
             PhpConfigAction::Sync
         } else {
             PhpConfigAction::Unmanage
@@ -414,6 +496,10 @@ fn build_php_config_action(
     if show {
         if value.is_some() {
             return Err("--show takes an optional key but no value".to_string());
+        }
+        if let Some(k) = &key {
+            hearth_lib::php::ini_guard::validate_key(k)
+                .map_err(|e| format!("invalid --show key: {e}"))?;
         }
         return Ok(PhpConfigAction::Show { key });
     }
@@ -497,16 +583,37 @@ fn render_php_config_report(
                 "{:<9} {:<7} {:<4} {:<10} {:<48} {}",
                 row.provider, row.version, row.sapi, row.context, channel, row.coverage
             );
-            if let Some(configured) = &row.configured {
-                let _ = write!(line, "  configured={configured}");
-                match &row.observed {
-                    Some(observed) => {
-                        let _ = write!(line, " observed={observed} ({})", row.observed_state);
-                    }
-                    None => {
-                        let _ = write!(line, " observed=n/a");
-                    }
+            if row.run_state.as_deref() == Some("not running") {
+                let _ = write!(line, " [not running]");
+            }
+            // Four-state vocabulary stays intact in the label; the truthful
+            // `pending restart` marker rides alongside, never replacing it.
+            let observed_label = if row.pending_restart {
+                format!("{}; pending restart", row.observed_state)
+            } else {
+                row.observed_state.clone()
+            };
+            match (&row.configured, &row.observed) {
+                (Some(configured), Some(observed)) => {
+                    let _ = write!(
+                        line,
+                        "  configured={configured} observed={observed} ({observed_label})"
+                    );
                 }
+                (Some(configured), None) => {
+                    let _ = write!(line, "  configured={configured} observed=n/a");
+                }
+                // A launch-probe can surface a real effective value (e.g. a
+                // PHP default) for a key Hearth does not configure.
+                (None, Some(observed)) => {
+                    let _ = write!(line, "  observed={observed} ({observed_label})");
+                }
+                (None, None) => {}
+            }
+            // C1-5: pending restart is a runtime fact independent of probe
+            // success — a failed/keyless observation must still surface it.
+            if row.pending_restart && row.observed.is_none() {
+                let _ = write!(line, " [pending restart]");
             }
             let _ = writeln!(out, "{line}");
             if row.coverage.starts_with("UNMANAGED: privileged-dir") {
@@ -544,6 +651,15 @@ fn render_php_config_report(
         }
         FpmRestartOutcome::LaunchBlocked { reason } => {
             let _ = writeln!(out, "php-fpm not restarted: LAUNCH-BLOCKED ({reason})");
+        }
+        FpmRestartOutcome::SkippedHerdOwned => out.push_str(
+            "php-fpm restart skipped: Herd owns PHP-FPM — registered service left untouched\n",
+        ),
+        FpmRestartOutcome::SkippedOwnershipUnknown { reason } => {
+            let _ = writeln!(
+                out,
+                "php-fpm restart skipped: ownership unknown ({reason}) — activation fails closed"
+            );
         }
         FpmRestartOutcome::Failed { message } => {
             exit = ExitClass::Failure;
@@ -583,8 +699,10 @@ async fn send_to_daemon_at(
     // Protocol window: an old daemon closes without responding to an unknown
     // request variant (EOF → empty line), or answers with a shape this CLI
     // cannot parse. Either way the remediation is the same.
-    const MISMATCH: &str =
-        "hearth CLI and daemon versions differ — run 'hearth daemon restart' and retry.";
+    // `hearth daemon restart` does not exist (DaemonCommands = start/stop/
+    // status) — the remediation must name only supported commands.
+    const MISMATCH: &str = "hearth CLI and daemon versions differ — run \
+        'hearth daemon stop && hearth daemon start' and retry.";
     if line.trim().is_empty() {
         anyhow::bail!("{MISMATCH}");
     }
@@ -771,7 +889,7 @@ async fn run_php_exec(
         config_path,
         config_dir.clone(),
         provider_roots,
-        std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        std::sync::Arc::new(hearth_lib::service::manager::current_fpm_ownership),
         std::time::Duration::from_secs(5),
     );
     // Hard gate (F4): never exec PHP against unreconciled channel state.
@@ -849,7 +967,7 @@ async fn run_install() -> anyhow::Result<()> {
         config_path.clone(),
         config_dir.clone(),
         provider_roots,
-        std::sync::Arc::new(|| hearth_lib::service::manager::is_herd_running()),
+        std::sync::Arc::new(hearth_lib::service::manager::current_fpm_ownership),
         std::time::Duration::from_secs(5),
     );
     // Hard gate (F4): a Refused/Failed channel outcome aborts install with a
@@ -1441,11 +1559,12 @@ mod tests {
             )
             .is_err()
         );
-        // Status/Sync/Unmanage take no key/value/scope.
+        // Status takes an optional key (C1-3) but never a value; Sync/
+        // Unmanage take no key/value/scope.
         assert!(
             build(
                 Some("k"),
-                None,
+                Some("v"),
                 false,
                 None,
                 false,
@@ -1632,8 +1751,75 @@ mod tests {
         );
         assert_eq!(
             build(None, None, false, None, false, false, true, false, false),
-            Ok(PhpConfigAction::Status)
+            Ok(PhpConfigAction::Status {
+                key: None,
+                token: None
+            })
         );
+        // C1-3: --status accepts an optional key selector…
+        assert_eq!(
+            build(
+                Some("k"),
+                None,
+                false,
+                None,
+                false,
+                false,
+                true,
+                false,
+                false
+            ),
+            Ok(PhpConfigAction::Status {
+                key: Some("k".to_string()),
+                token: None
+            })
+        );
+        // …but still no value and no scope flags.
+        assert!(
+            build(
+                Some("k"),
+                Some("v"),
+                false,
+                None,
+                false,
+                false,
+                true,
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(build(None, None, true, None, false, false, true, false, false).is_err());
+        // C2-4: invalid Status/Show keys are stable actionable errors
+        // BEFORE any daemon I/O — never silent keyless degradation.
+        for bad in ["bad key", "1leading", "inject\")); system(\"id"] {
+            let err = build(
+                Some(bad),
+                None,
+                false,
+                None,
+                false,
+                false,
+                true,
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert!(err.contains("invalid --status key"), "got: {err}");
+            let err = build(
+                Some(bad),
+                None,
+                false,
+                None,
+                true,
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert!(err.contains("invalid --show key"), "got: {err}");
+        }
         assert_eq!(
             build(None, None, false, None, false, false, false, true, false),
             Ok(PhpConfigAction::Sync)
@@ -1655,6 +1841,8 @@ mod tests {
             configured: None,
             observed: None,
             observed_state: "n/a".to_string(),
+            pending_restart: false,
+            run_state: None,
         }
     }
 
@@ -1664,7 +1852,96 @@ mod tests {
             rows,
             files: vec![],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
+            status_token: None,
         }
+    }
+
+    /// C2-2/C3-2: keyed-Status certification is bound to the EXACT expected
+    /// report response and this request's correlation token. The exact
+    /// legacy wire shape, an unrelated success (`Ok`), a stale report with
+    /// the right key but wrong/missing token, and a mismatched key all fail
+    /// with the supported stop/start remediation; the exact echo passes; a
+    /// daemon `Error` keeps its own truthful nonzero path.
+    #[test]
+    fn keyed_status_binds_to_exact_response_and_token() {
+        let assert_mismatch = |response: &DaemonResponse| {
+            let err =
+                verify_keyed_status_certified(response, "memory_limit", "st-tok-1").unwrap_err();
+            assert!(
+                err.contains("did not certify the keyed status request"),
+                "got: {err}"
+            );
+            assert!(
+                err.contains("hearth daemon stop && hearth daemon start"),
+                "must carry the supported remediation: {err}"
+            );
+        };
+
+        // Exact wire bytes a b899ff04 daemon sends for the keyed request.
+        let legacy = r#"{"type":"PhpConfigReport","persisted":null,"rows":[],"files":[],"fpm":{"outcome":"NotAttempted"}}"#;
+        assert_mismatch(&serde_json::from_str(legacy).unwrap());
+
+        // Unrelated success shape (the reviewer's stale-socket reproduction):
+        // an `Ok` must NEVER certify a keyed Status.
+        let unrelated = r#"{"type":"Ok","message":"stale success"}"#;
+        assert_mismatch(&serde_json::from_str(unrelated).unwrap());
+
+        // Another unrelated report-free success shape.
+        assert_mismatch(&DaemonResponse::Pong);
+
+        // Stale report: right key, wrong token (a previous request's echo).
+        let mut stale = outcome_with_rows(vec![]);
+        stale.status_key = Some("memory_limit".to_string());
+        stale.status_token = Some("st-tok-OLD".to_string());
+        assert_mismatch(&DaemonResponse::PhpConfigReport(stale));
+
+        // Right key, missing token echo.
+        let mut untokened = outcome_with_rows(vec![]);
+        untokened.status_key = Some("memory_limit".to_string());
+        assert_mismatch(&DaemonResponse::PhpConfigReport(untokened));
+
+        // Mismatched key with correct token.
+        let mut wrong_key = outcome_with_rows(vec![]);
+        wrong_key.status_key = Some("upload_max_filesize".to_string());
+        wrong_key.status_token = Some("st-tok-1".to_string());
+        assert_mismatch(&DaemonResponse::PhpConfigReport(wrong_key));
+
+        // Duplicate/ambiguous certification fields are rejected at the
+        // deserialization boundary itself ("duplicate field") — the send
+        // path surfaces that as the unparseable-response version-mismatch
+        // remediation, so a smuggled duplicate can never certify.
+        let duplicated = r#"{"type":"PhpConfigReport","persisted":null,"rows":[],"files":[],"fpm":{"outcome":"NotAttempted"},"status_key":"memory_limit","status_token":"st-tok-1","status_token":"st-tok-SMUGGLED"}"#;
+        let parse_err = serde_json::from_str::<DaemonResponse>(duplicated).unwrap_err();
+        assert!(
+            parse_err.to_string().contains("duplicate field"),
+            "ambiguous certification data must not parse: {parse_err}"
+        );
+
+        // The exact echo passes.
+        let mut certified = outcome_with_rows(vec![]);
+        certified.status_key = Some("memory_limit".to_string());
+        certified.status_token = Some("st-tok-1".to_string());
+        assert!(
+            verify_keyed_status_certified(
+                &DaemonResponse::PhpConfigReport(certified),
+                "memory_limit",
+                "st-tok-1"
+            )
+            .is_ok()
+        );
+
+        // A daemon Error renders on its own truthful (nonzero) path.
+        let error_response = DaemonResponse::Error {
+            message: "boom".to_string(),
+        };
+        assert!(verify_keyed_status_certified(&error_response, "memory_limit", "st-tok-1").is_ok());
+
+        // Correlation tokens are per-request unique.
+        assert_ne!(
+            new_status_correlation_token(),
+            new_status_correlation_token()
+        );
     }
 
     #[test]
@@ -1722,6 +1999,115 @@ mod tests {
         assert!(out.contains("observed=n/a"), "got: {out}");
     }
 
+    /// Task 8 label-vocabulary fixture: a value read from a channel FILE is
+    /// only ever `materialized`; `launch-probed` marks an executed binary; a
+    /// probed PHP default renders without a configured value; and the word
+    /// "effective" appears in NO rendering — file parses are never dressed
+    /// up as effective/observed-live state.
+    #[test]
+    fn render_labels_never_claim_effective_for_file_parse() {
+        let mut file_parse = row("managed (channel)");
+        file_parse.configured = Some("1G".to_string());
+        file_parse.observed = Some("1G".to_string());
+        file_parse.observed_state = "materialized".to_string();
+
+        let mut probed = row("managed (channel+env)");
+        probed.context = "normal".to_string();
+        probed.configured = Some("1G".to_string());
+        probed.observed = Some("1G".to_string());
+        probed.observed_state = "launch-probed".to_string();
+
+        let mut default_only = row("managed (channel+env)");
+        default_only.context = "normal".to_string();
+        default_only.configured = None;
+        default_only.observed = Some("128M".to_string());
+        default_only.observed_state = "launch-probed".to_string();
+
+        let (out, _err, exit) =
+            render_php_config_report(&outcome_with_rows(vec![file_parse, probed, default_only]));
+        assert!(out.contains("observed=1G (materialized)"), "got: {out}");
+        assert!(out.contains("observed=1G (launch-probed)"), "got: {out}");
+        assert!(
+            out.contains("observed=128M (launch-probed)"),
+            "a probed PHP default renders without configured=: {out}"
+        );
+        assert!(
+            !out.to_lowercase().contains("effective"),
+            "file parses must never be labeled effective: {out}"
+        );
+        assert_eq!(exit, ExitClass::Success);
+    }
+
+    /// Task 8: the pending-restart marker rides beside the four-state label
+    /// (never replacing it), and a stopped supervised FPM renders its
+    /// truthful `[not running]` marker.
+    #[test]
+    fn render_pending_restart_and_not_running_markers() {
+        let mut pending = row("supervised (scan-dir env at launch)");
+        pending.sapi = "fpm".to_string();
+        pending.context = "launched".to_string();
+        pending.channel = None;
+        pending.configured = Some("2G".to_string());
+        pending.observed = Some("2G".to_string());
+        pending.observed_state = "launch-probed".to_string();
+        pending.pending_restart = true;
+        pending.run_state = Some("running".to_string());
+
+        let (out, _err, exit) = render_php_config_report(&outcome_with_rows(vec![pending]));
+        assert!(
+            out.contains("observed=2G (launch-probed; pending restart)"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("[not running]"),
+            "running service renders no run-state noise: {out}"
+        );
+        assert_eq!(exit, ExitClass::Success, "pending restart is informational");
+
+        let mut stopped = row("supervised (scan-dir env at launch)");
+        stopped.sapi = "fpm".to_string();
+        stopped.context = "launched".to_string();
+        stopped.channel = None;
+        stopped.run_state = Some("not running".to_string());
+        let (out, _err, exit) = render_php_config_report(&outcome_with_rows(vec![stopped]));
+        assert!(out.contains("[not running]"), "got: {out}");
+        assert_eq!(exit, ExitClass::Success, "run state alone never fails");
+    }
+
+    /// C1-5 (review 5650): pending restart renders independently of probe
+    /// success — a failed probe (configured, observed=n/a) and a keyless
+    /// row both still surface the truthful marker.
+    #[test]
+    fn render_pending_restart_survives_probe_failure_and_keyless_rows() {
+        let mut probe_failed = row("supervised (scan-dir env at launch)");
+        probe_failed.sapi = "fpm".to_string();
+        probe_failed.context = "launched".to_string();
+        probe_failed.channel = None;
+        probe_failed.configured = Some("2G".to_string());
+        probe_failed.observed = None;
+        probe_failed.pending_restart = true;
+        probe_failed.run_state = Some("running".to_string());
+        let (out, _err, exit) = render_php_config_report(&outcome_with_rows(vec![probe_failed]));
+        assert!(out.contains("observed=n/a"), "got: {out}");
+        assert!(
+            out.contains("[pending restart]"),
+            "probe failure must not suppress the marker: {out}"
+        );
+        assert_eq!(exit, ExitClass::Success);
+
+        let mut keyless = row("supervised (scan-dir env at launch)");
+        keyless.sapi = "fpm".to_string();
+        keyless.context = "launched".to_string();
+        keyless.channel = None;
+        keyless.pending_restart = true;
+        keyless.run_state = Some("running".to_string());
+        let (out, _err, _exit) = render_php_config_report(&outcome_with_rows(vec![keyless]));
+        assert!(
+            out.contains("[pending restart]"),
+            "keyless row must still surface the marker: {out}"
+        );
+    }
+
     #[test]
     fn exit_class_rules() {
         // Refused channel file → nonzero.
@@ -1735,6 +2121,8 @@ mod tests {
                 },
             }],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
+            status_token: None,
         };
         assert_eq!(render_php_config_report(&refused).2, ExitClass::Failure);
 
@@ -1749,6 +2137,8 @@ mod tests {
                 },
             }],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
+            status_token: None,
         };
         assert_eq!(render_php_config_report(&failed).2, ExitClass::Failure);
 
@@ -1760,6 +2150,8 @@ mod tests {
             fpm: FpmRestartOutcome::Failed {
                 message: "boom".to_string(),
             },
+            status_key: None,
+            status_token: None,
         };
         assert_eq!(render_php_config_report(&fpm_failed).2, ExitClass::Failure);
 
@@ -1772,6 +2164,7 @@ mod tests {
             },
             FpmRestartOutcome::Restarted,
             FpmRestartOutcome::NotAttempted,
+            FpmRestartOutcome::SkippedHerdOwned,
         ] {
             let ok = PhpConfigOutcome {
                 persisted: Some(true),
@@ -1781,6 +2174,8 @@ mod tests {
                     result: FileWriteResult::Written,
                 }],
                 fpm,
+                status_key: None,
+                status_token: None,
             };
             assert_eq!(render_php_config_report(&ok).2, ExitClass::Success);
         }
@@ -1826,6 +2221,8 @@ mod tests {
                 },
             }],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
+            status_token: None,
         };
         assert_eq!(
             print_response(DaemonResponse::PhpConfigReport(refused)),

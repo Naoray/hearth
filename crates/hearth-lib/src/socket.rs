@@ -103,7 +103,20 @@ pub enum PhpConfigAction {
     /// Report configured (and, where materialized, observed) values. Read-only.
     Show { key: Option<String> },
     /// Per-target coverage table. Read-only; only reports `sync pending`.
-    Status,
+    /// With `key` (C1-3), eligible rows additionally carry configured +
+    /// launch-probed values; a keyless Status never fakes values. The field
+    /// defaults + is omitted when None, so the wire form of a keyless
+    /// Status is byte-identical to the legacy unit variant.
+    Status {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        /// C3-2 correlation token: a keyed client binds its request to the
+        /// response by requiring this exact token echoed as `status_token`.
+        /// Serde-default + omitted-when-None keeps every legacy wire form
+        /// byte-identical; a legacy daemon ignores it and cannot echo it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
     /// Force journal recovery + legacy migration + reconcile.
     Sync,
     /// Remove every Hearth-written channel file (manifest-tracked, exact-hash).
@@ -140,12 +153,25 @@ pub struct PhpTargetRow {
     pub coverage: String,
     /// Configured value from the canonical store (Show/Set/Unset with a key).
     pub configured: Option<String>,
-    /// Observed value. In this release only `materialized` observation exists;
-    /// launch-probed and live-observed values arrive with todos #2321-C/#2343.
+    /// Observed value: `materialized` (channel-file state) or `launch-probed`
+    /// (binary executed under the exact launch env). Live observation of a
+    /// running FPM worker arrives with todo #2343.
     pub observed: Option<String>,
     /// Observation vocabulary state: `configured` | `materialized` |
     /// `launch-probed` | `live-observed` | `n/a`.
     pub observed_state: String,
+    /// True only when a Hearth-written manifest timestamp is newer than the
+    /// supervisor's own spawn time for the running FPM service — the running
+    /// process may not yet load `observed`. Never inferred from ambient
+    /// process evidence. `#[serde(default)]` keeps the legacy protocol
+    /// window parseable.
+    #[serde(default)]
+    pub pending_restart: bool,
+    /// Supervised-FPM run state for the `launched` row (`running` |
+    /// `not running`), from the supervisor's own state table. `None` for
+    /// every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_state: Option<String>,
 }
 
 /// Typed per-file reconcile result (wire form of the library's WriteOutcome).
@@ -173,10 +199,29 @@ pub struct FileOutcome {
 #[serde(tag = "outcome")]
 pub enum FpmRestartOutcome {
     Restarted,
-    NotRegistered { herd_hint: bool },
-    LaunchBlocked { reason: String },
-    Failed { message: String },
+    NotRegistered {
+        herd_hint: bool,
+    },
+    LaunchBlocked {
+        reason: String,
+    },
+    Failed {
+        message: String,
+    },
     NotAttempted,
+    /// C2-1: a REGISTERED Hearth FPM whose restart was skipped because live
+    /// Herd owns PHP-FPM — the registration and any running process were
+    /// left untouched. Emitted only by post-round-2 daemons; a legacy CLI
+    /// that cannot parse it fails into the actionable version-mismatch
+    /// remediation instead of rendering a false state.
+    SkippedHerdOwned,
+    /// C4-2: the restart was skipped because current Herd ownership could
+    /// not be determined (probe failure) — FPM activation fails CLOSED and
+    /// the report says why. Same legacy-CLI consequence as
+    /// `SkippedHerdOwned`.
+    SkippedOwnershipUnknown {
+        reason: String,
+    },
 }
 
 /// Full report for a V2 php-config action. `persisted` is `Some` only for
@@ -188,6 +233,19 @@ pub struct PhpConfigOutcome {
     pub rows: Vec<PhpTargetRow>,
     pub files: Vec<FileOutcome>,
     pub fpm: FpmRestartOutcome,
+    /// C2-2 capability echo: present iff the daemon UNDERSTOOD a keyed
+    /// Status request (it echoes the key it applied). A legacy daemon
+    /// deserializes the keyed request as keyless and cannot echo — clients
+    /// treat the missing echo on a keyed Status as an actionable version
+    /// mismatch. Absent on Set/Unset/Show/keyless-Status responses, so
+    /// legacy wire forms stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_key: Option<String>,
+    /// C3-2: echo of the keyed-Status correlation token this daemon actually
+    /// applied — binds the certification to the exact request instead of a
+    /// coincidentally matching key. Absent everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_token: Option<String>,
 }
 
 impl PhpConfigOutcome {
@@ -398,7 +456,14 @@ mod tests {
         cases.push(PhpConfigAction::Show {
             key: Some("memory_limit".to_string()),
         });
-        cases.push(PhpConfigAction::Status);
+        cases.push(PhpConfigAction::Status {
+            key: None,
+            token: None,
+        });
+        cases.push(PhpConfigAction::Status {
+            key: Some("memory_limit".to_string()),
+            token: None,
+        });
         cases.push(PhpConfigAction::Sync);
         cases.push(PhpConfigAction::Unmanage);
 
@@ -407,6 +472,71 @@ mod tests {
             let back: PhpConfigAction = serde_json::from_str(&json).unwrap();
             assert_eq!(action, back, "round-trip mismatch for {json}");
         }
+    }
+
+    /// C1-3 protocol window: a keyless Status keeps the LEGACY wire form
+    /// byte-for-byte (`{"action":"Status"}`), and the legacy form parses to
+    /// `key: None` — old CLI ↔ new daemon and vice versa stay compatible.
+    #[test]
+    fn status_keyless_wire_form_is_legacy_byte_identical() {
+        let json = serde_json::to_string(&PhpConfigAction::Status {
+            key: None,
+            token: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"action":"Status"}"#);
+        let back: PhpConfigAction = serde_json::from_str(r#"{"action":"Status"}"#).unwrap();
+        assert_eq!(
+            back,
+            PhpConfigAction::Status {
+                key: None,
+                token: None,
+            }
+        );
+    }
+
+    /// C2-2 cross-version wire shapes, using the EXACT serialized forms of
+    /// the pre-round-2 protocol:
+    /// - a legacy report (no `status_key`) parses with `status_key: None`
+    ///   — precisely what a new keyed client uses to detect the mismatch;
+    /// - a new report WITHOUT an echo serializes byte-compatible with the
+    ///   legacy shape (old clients parse it unchanged);
+    /// - a keyed echo round-trips for new client + new daemon.
+    #[test]
+    fn status_capability_echo_cross_version_wire_shapes() {
+        // Exact legacy response shape (head b899ff04 daemon): no status_key.
+        let legacy_response =
+            r#"{"persisted":null,"rows":[],"files":[],"fpm":{"outcome":"NotAttempted"}}"#;
+        let outcome: PhpConfigOutcome = serde_json::from_str(legacy_response).unwrap();
+        assert_eq!(
+            outcome.status_key, None,
+            "legacy daemon cannot certify a keyed Status"
+        );
+
+        // New daemon, keyless Status: serialized form contains no status_key
+        // field — an old client parses it exactly like its own shape.
+        let keyless = PhpConfigOutcome {
+            persisted: None,
+            rows: vec![],
+            files: vec![],
+            fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
+            status_token: None,
+        };
+        let json = serde_json::to_string(&keyless).unwrap();
+        assert!(
+            !json.contains("status_key"),
+            "keyless responses stay legacy-byte-compatible: {json}"
+        );
+
+        // New daemon, keyed Status: the echo round-trips.
+        let keyed = PhpConfigOutcome {
+            status_key: Some("memory_limit".to_string()),
+            ..keyless
+        };
+        let json = serde_json::to_string(&keyed).unwrap();
+        let back: PhpConfigOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status_key.as_deref(), Some("memory_limit"));
     }
 
     #[test]
@@ -430,6 +560,10 @@ mod tests {
             FpmRestartOutcome::Restarted,
             FpmRestartOutcome::NotRegistered { herd_hint: true },
             FpmRestartOutcome::NotRegistered { herd_hint: false },
+            FpmRestartOutcome::SkippedHerdOwned,
+            FpmRestartOutcome::SkippedOwnershipUnknown {
+                reason: "ownership probe (pgrep) failed with status signal".to_string(),
+            },
             FpmRestartOutcome::LaunchBlocked {
                 reason: "missing fpm config — see todo #2343".to_string(),
             },
@@ -484,12 +618,16 @@ mod tests {
                     configured: Some("1G".to_string()),
                     observed: Some("1G".to_string()),
                     observed_state: "materialized".to_string(),
+                    pending_restart: true,
+                    run_state: Some("running".to_string()),
                 }],
                 files: vec![FileOutcome {
                     path: "/opt/homebrew/etc/php/8.5/conf.d/zz-hearth.ini".to_string(),
                     result: FileWriteResult::Written,
                 }],
                 fpm,
+                status_key: None,
+                status_token: None,
             };
             let response = DaemonResponse::PhpConfigReport(outcome.clone());
             let json = serde_json::to_string(&response).unwrap();
@@ -502,6 +640,27 @@ mod tests {
         }
     }
 
+    /// Task 8 protocol-window guard: rows serialized by a pre-Task-8 daemon
+    /// (no `pending_restart`/`run_state` fields) must still parse, with the
+    /// truthful defaults (no pending-restart claim, no run state).
+    #[test]
+    fn php_target_row_without_new_fields_parses_with_defaults() {
+        let legacy = r#"{
+            "provider": "homebrew",
+            "version": "8.5",
+            "sapi": "cli",
+            "context": "normal",
+            "channel": null,
+            "coverage": "managed (channel+env)",
+            "configured": "1G",
+            "observed": "1G",
+            "observed_state": "materialized"
+        }"#;
+        let row: PhpTargetRow = serde_json::from_str(legacy).unwrap();
+        assert!(!row.pending_restart, "default: never claim pending restart");
+        assert_eq!(row.run_state, None, "default: no run state");
+    }
+
     #[test]
     fn php_config_outcome_none_persisted_round_trips() {
         let outcome = PhpConfigOutcome {
@@ -509,6 +668,8 @@ mod tests {
             rows: vec![],
             files: vec![],
             fpm: FpmRestartOutcome::NotAttempted,
+            status_key: None,
+            status_token: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         let back: PhpConfigOutcome = serde_json::from_str(&json).unwrap();

@@ -67,6 +67,15 @@ pub struct PhpConfigParams {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PhpConfigStatusParams {
+    /// Optional INI key (e.g., "memory_limit"): when set, each eligible row
+    /// also reports the configured and launch-probed value — the same
+    /// contract as `hearth php config --status [key]`
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct DbActionParams {
     /// Engine name: `mysql`, `postgres`, `redis`. Omit to target all DB engines.
     #[serde(default)]
@@ -402,6 +411,13 @@ impl HearthMcpServer {
             FpmRestartOutcome::LaunchBlocked { reason } => {
                 format!("php-fpm not restarted: launch-blocked ({reason})")
             }
+            FpmRestartOutcome::SkippedHerdOwned => {
+                "php-fpm restart skipped: Herd owns PHP-FPM (registered service untouched)"
+                    .to_string()
+            }
+            FpmRestartOutcome::SkippedOwnershipUnknown { reason } => format!(
+                "php-fpm restart skipped: ownership unknown ({reason}) — activation fails closed"
+            ),
             FpmRestartOutcome::Failed { message } => {
                 return Err(format!(
                     "Set {}={} persisted, but php-fpm restart failed: {message}",
@@ -416,19 +432,61 @@ impl HearthMcpServer {
         ))
     }
 
-    /// Per-target PHP configuration coverage table.
+    /// Per-target PHP configuration coverage table, optionally keyed.
     #[tool(
         name = "hearth_php_config_status",
-        description = "Report per-target PHP configuration coverage (provider/version/sapi/context) with truthful managed/UNMANAGED/LAUNCH-BLOCKED labels"
+        description = "Report per-target PHP configuration coverage (provider/version/sapi/context) with truthful managed/UNMANAGED/LAUNCH-BLOCKED labels; pass `key` to include each target's configured and launch-probed value"
     )]
-    async fn hearth_php_config_status(&self) -> Result<String, String> {
-        let outcome = self.engine.apply(PhpConfigAction::Status).await?;
+    async fn hearth_php_config_status(
+        &self,
+        Parameters(params): Parameters<PhpConfigStatusParams>,
+    ) -> Result<String, String> {
+        // C2-4: same validation choke point as the CLI — an invalid key is a
+        // stable actionable error, never a silent keyless degradation.
+        if let Some(key) = &params.key {
+            crate::php::ini_guard::validate_key(key)
+                .map_err(|e| format!("invalid status key: {e}"))?;
+        }
+        // C3-2 parity with the CLI: bind a keyed Status to this exact
+        // request with a per-request correlation token and require BOTH
+        // echoes (in-process this always holds; the check keeps MCP and CLI
+        // on identical certification semantics).
+        let token = params.key.as_ref().map(|_| {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::time::{SystemTime, UNIX_EPOCH};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!(
+                "mcp-{}-{nanos:x}-{:x}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            )
+        });
+        let outcome = self
+            .engine
+            .apply(PhpConfigAction::Status {
+                key: params.key.clone(),
+                token: token.clone(),
+            })
+            .await?;
+        if params.key.is_some()
+            && (outcome.status_key != params.key || outcome.status_token != token)
+        {
+            return Err(format!(
+                "the daemon did not certify the keyed status request (key `{}`) — hearth \
+                 versions differ; run 'hearth daemon stop && hearth daemon start' and retry.",
+                params.key.as_deref().unwrap_or_default()
+            ));
+        }
         if outcome.rows.is_empty() {
             return Ok("No PHP targets discovered.".to_string());
         }
         let mut lines = Vec::with_capacity(outcome.rows.len() + 1);
         for row in &outcome.rows {
-            lines.push(format!(
+            let mut line = format!(
                 "{} {} {} [{}] {} — {}",
                 row.provider,
                 row.version,
@@ -436,7 +494,14 @@ impl HearthMcpServer {
                 row.context,
                 row.channel.as_deref().unwrap_or("—"),
                 row.coverage,
-            ));
+            );
+            if let Some(configured) = &row.configured {
+                line.push_str(&format!(" configured={configured}"));
+            }
+            if let Some(observed) = &row.observed {
+                line.push_str(&format!(" observed={observed} ({})", row.observed_state));
+            }
+            lines.push(line);
         }
         lines.push(
             "Coverage: Hearth guarantees Hearth-launched processes (env-honoring binaries) \
@@ -504,20 +569,27 @@ impl ServerHandler for HearthMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::supervisor::ManagedService;
+    use crate::service::supervisor::{FpmOwnership, ManagedService};
 
     fn make_server() -> HearthMcpServer {
         let mut sup = ServiceSupervisor::new();
+        // C6-1: probe-less supervisors refuse FPM registration fail-closed;
+        // the fixture supplies explicit isolated Unowned evidence.
+        sup.set_fpm_ownership_probe(Arc::new(|| {
+            crate::service::supervisor::FpmOwnership::Unowned
+        }));
         sup.register(ManagedService::new(
             ServiceKind::Nginx,
             "true".to_string(),
             vec![],
-        ));
+        ))
+        .unwrap();
         sup.register(ManagedService::new(
             ServiceKind::PhpFpm,
             "true".to_string(),
             vec![],
-        ));
+        ))
+        .unwrap();
 
         let tmp_valet = tempfile::TempDir::new().expect("tempdir");
         let sm = SiteManager::new(tmp_valet.path().to_path_buf(), "test".to_string());
@@ -540,7 +612,7 @@ mod tests {
                 base.join("homebrew"),
             )
             .unwrap(),
-            Arc::new(|| false),
+            Arc::new(|| FpmOwnership::Unowned),
             std::time::Duration::from_millis(50),
         ));
 
@@ -580,11 +652,15 @@ mod tests {
     async fn php_list_tool_works() {
         // Create a server with a mock PHP version in the cache
         let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(Arc::new(|| {
+            crate::service::supervisor::FpmOwnership::Unowned
+        }));
         sup.register(ManagedService::new(
             ServiceKind::PhpFpm,
             "true".to_string(),
             vec![],
-        ));
+        ))
+        .unwrap();
 
         let tmp_php = tempfile::TempDir::new().expect("tempdir");
         let php_dir = tmp_php.path().join("php/8.3");
@@ -607,7 +683,7 @@ mod tests {
                 tmp_php.path().join("homebrew"),
             )
             .unwrap(),
-            Arc::new(|| false),
+            Arc::new(|| FpmOwnership::Unowned),
             std::time::Duration::from_millis(50),
         ));
         let server = HearthMcpServer::new(
@@ -718,5 +794,163 @@ mod tests {
             .await;
         let err = result.expect_err("unknown engine errors");
         assert!(err.to_lowercase().contains("unknown"), "got: {err}");
+    }
+
+    // ---- C2-1/C2-4 (review 5650 r2): MCP config-write guard + keyed status ----
+
+    /// Isolated MCP fixture with a held tempdir (engine paths stay alive), a
+    /// flippable Herd probe, and a registered spawnable fake FPM.
+    fn make_config_server() -> (
+        tempfile::TempDir,
+        HearthMcpServer,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let base = tmp.path().canonicalize().unwrap();
+        let config_dir = base.join("hearth");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let fake_fpm = config_dir.join("php/8.4/php-fpm");
+        std::fs::create_dir_all(fake_fpm.parent().unwrap()).unwrap();
+        std::fs::write(&fake_fpm, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&fake_fpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let herd_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_flag = Arc::clone(&herd_live);
+
+        let mut sup = ServiceSupervisor::new();
+        // C6-1: the fixture supervisor shares the flip-aware probe so
+        // registration succeeds under Unowned and later flips are observed.
+        let sup_flag = Arc::clone(&herd_live);
+        sup.set_fpm_ownership_probe(Arc::new(move || {
+            if sup_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                crate::service::supervisor::FpmOwnership::Owned
+            } else {
+                crate::service::supervisor::FpmOwnership::Unowned
+            }
+        }));
+        sup.register(ManagedService::new(
+            ServiceKind::PhpFpm,
+            fake_fpm.to_string_lossy().to_string(),
+            vec![],
+        ))
+        .unwrap();
+        let config = Arc::new(Mutex::new(HearthConfig::default()));
+        let engine = Arc::new(PhpConfigEngine::new(
+            Arc::clone(&config),
+            base.join("config.toml"),
+            config_dir.clone(),
+            crate::php::targets::ProviderRoots::isolated(
+                &base,
+                config_dir.clone(),
+                base.join("herd"),
+                base.join("homebrew"),
+            )
+            .unwrap(),
+            Arc::new(move || {
+                if probe_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    FpmOwnership::Owned
+                } else {
+                    FpmOwnership::Unowned
+                }
+            }),
+            std::time::Duration::from_millis(50),
+        ));
+        let server = HearthMcpServer::new(
+            Arc::new(Mutex::new(sup)),
+            Arc::new(Mutex::new(SiteManager::with_homes(
+                vec![base.join("valet")],
+                "test".to_string(),
+            ))),
+            Arc::new(Mutex::new(PhpManager::new(config_dir))),
+            config,
+            engine,
+        );
+        (tmp, server, herd_live)
+    }
+
+    /// C2-1: the MCP config write shares the centralized restart policy — a
+    /// registered running FPM is untouched once Herd becomes live, with the
+    /// truthful skip in the tool output.
+    #[tokio::test]
+    async fn mcp_config_write_skips_registered_running_fpm_under_live_herd() {
+        let (_tmp, server, herd_live) = make_config_server();
+        {
+            let mut sup = server.supervisor.lock().await;
+            sup.start_service(ServiceKind::PhpFpm).unwrap();
+        }
+        let started_before = server
+            .supervisor
+            .lock()
+            .await
+            .service(ServiceKind::PhpFpm)
+            .unwrap()
+            .started_at()
+            .expect("running");
+
+        herd_live.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let note = server
+            .hearth_php_config(Parameters(PhpConfigParams {
+                key: "memory_limit".to_string(),
+                value: "1G".to_string(),
+                global: Some(true),
+                version: None,
+            }))
+            .await
+            .expect("persistence succeeds under Herd");
+        assert!(
+            note.contains("php-fpm restart skipped: Herd owns PHP-FPM"),
+            "got: {note}"
+        );
+
+        let sup = server.supervisor.lock().await;
+        let svc = sup.service(ServiceKind::PhpFpm).expect("still registered");
+        assert!(matches!(
+            svc.state,
+            crate::service::ServiceState::Running { .. }
+        ));
+        assert_eq!(
+            svc.started_at(),
+            Some(started_before),
+            "zero stop/start/restart"
+        );
+        drop(sup);
+        server
+            .supervisor
+            .lock()
+            .await
+            .stop_service(ServiceKind::PhpFpm)
+            .unwrap();
+    }
+
+    /// C2-4: MCP status accepts the same optional key as the CLI, rejects
+    /// invalid keys actionably, and keeps the keyless form working.
+    #[tokio::test]
+    async fn mcp_status_key_parity_valid_invalid_omitted() {
+        let (_tmp, server, _herd) = make_config_server();
+
+        let keyless = server
+            .hearth_php_config_status(Parameters(PhpConfigStatusParams { key: None }))
+            .await
+            .expect("keyless status works");
+        assert!(!keyless.is_empty());
+
+        let keyed = server
+            .hearth_php_config_status(Parameters(PhpConfigStatusParams {
+                key: Some("memory_limit".to_string()),
+            }))
+            .await
+            .expect("keyed status works in-process");
+        assert!(!keyed.is_empty());
+
+        let err = server
+            .hearth_php_config_status(Parameters(PhpConfigStatusParams {
+                key: Some("bad key".to_string()),
+            }))
+            .await
+            .expect_err("invalid key must error");
+        assert!(err.contains("invalid status key"), "got: {err}");
     }
 }

@@ -22,7 +22,8 @@ hearth link / unlink / park / sites       — site management
 hearth secure / unsecure                  — SSL certificates (trusted locally)
 hearth php use 8.3                        — switch PHP version instantly
 hearth php list                           — show installed versions
-hearth php config memory_limit 512M       — edit php.ini + restart FPM
+hearth php config --global memory_limit 1G — set a PHP INI value across versions
+hearth php config --status [key]          — per-target coverage (+values with a key)
 hearth dump                               — stream VarDumper output with timestamps
 hearth mail                               — open Mailpit UI in browser
 hearth db status [--json]                 — show DB engine state, ports, data dirs
@@ -131,6 +132,100 @@ Hearth finds PHP binaries in this order:
 1. `~/Library/Application Support/hearth/php/{version}/php` — own cached binaries
 2. `~/Library/Application Support/Herd/bin/php{version}` — reuse existing binaries
 3. `/opt/homebrew/opt/php@{version}/bin/php` — Homebrew fallback
+
+## PHP configuration
+
+Hearth keeps one canonical PHP INI store in `config.toml` and materializes it
+into per-version `zz-hearth.ini` channel files that PHP's scan-dir mechanism
+loads. You never edit `php.ini` files by hand.
+
+```bash
+hearth php config --global memory_limit 1G     # applies to every version
+hearth php config --php 8.3 memory_limit 512M  # one version's override
+hearth php config memory_limit 512M            # shorthand: the active version
+hearth php config --show [key]                 # configured + observed values
+hearth php config --status [key]               # coverage table; a key adds
+                                               # per-target configured/observed
+hearth php config --unset [--global|--php V] <key>
+hearth php config --sync                       # force re-reconcile
+hearth php config --unmanage                   # remove every Hearth-written file
+```
+
+**Precedence** is deterministic: a per-version override always beats the
+global value for that version.
+
+**Manual edits**: the store lives in `config.toml` under `[php_ini.global]`
+and `[php_ini.overrides."X.Y"]`. Directive keys that contain dots MUST be
+quoted in TOML (`"date.timezone" = "Europe/Berlin"`), otherwise TOML splits
+the key into nested tables and Hearth rejects the file with an actionable
+error.
+
+**Restart semantics**: `set`/`unset` persist first, then reconcile channel
+files, then restart the supervised php-fpm only when it is actually
+registered. An unregistered or launch-blocked FPM is reported informationally
+and never fails the command; a failed restart of a registered FPM does.
+While Herd owns PHP-FPM, configuration changes still persist and reconcile,
+but Hearth never starts or restarts its FPM — config output states that the
+restart was skipped because Herd owns PHP-FPM, generic `hearth start`/
+`hearth restart` skip or refuse the FPM slot, and health supervision never
+respawns it. Two distinct rules: Hearth **never controls Herd's own FPM
+process**, and Hearth **may stop its own supervised FPM child** during an
+ownership handoff (when Herd appears while Hearth's FPM is still running).
+A handoff stop that cannot positively confirm termination is reported as a
+failure with the child kept fully supervised, and is retried on later
+health ticks — Hearth never records a false "stopped". If the Herd
+ownership probe itself fails, ownership is treated as **unknown** and every
+FPM activation fails closed (skipped with an actionable "ownership
+unknown" message) until the probe recovers.
+When the running FPM predates the newest materialized config, status shows a
+truthful `pending restart` marker.
+
+**Observation labels** are exact about what was verified:
+
+- `configured` — the value in the canonical store
+- `materialized` — the channel file on disk carries it
+- `launch-probed` — the binary was executed under the exact launch
+  environment (`php -r 'echo ini_get(...)'` for CLI; `php-fpm -i` under the
+  service env for Hearth's supervised FPM) and reported it
+- `live-observed` — reserved for a running FPM worker (lands with the
+  FastCGI observation work in todo #2343; nothing is labeled this today)
+
+A value read from a file is never presented as the effective value of a
+running process.
+
+**Coverage scope (exact)**: Hearth hard-guarantees only
+
+1. Hearth-launched processes whose binaries honor `PHP_INI_SCAN_DIR`
+   (verified per binary by a canary probe), and
+2. verified user-owned, version-exclusive scan-dir channels
+   (`~/Library/Application Support/Herd/config/php/{XY}`,
+   `/opt/homebrew/etc/php/{v}/conf.d`, and Hearth's own `conf.d` dirs).
+
+Everything else renders loudly as UNMANAGED/LAUNCH-BLOCKED/unverified.
+There is no universal guarantee, and `--status` never claims one.
+
+Known limits, stated plainly:
+
+- **Sanitized Herd binaries** (env-clearing launchers running Herd's
+  absolute PHP path): their only scan channel is the root-owned
+  `/usr/local/etc/php/conf.d`, which Hearth never writes. The row renders
+  `UNMANAGED: privileged-dir` with remediation: use
+  `hearth php exec -- <cmd>` for env-clearing launchers, or a
+  Hearth/Homebrew build.
+- **`hearth php exec` shim limit**: the shim covers a launcher that invokes
+  the shim as its final PHP launch boundary. A *descendant* process that
+  clears the environment and re-execs the absolute `PHP_BINARY` bypasses it —
+  for that case use a Homebrew/Hearth build (verified compiled-in channel).
+- **Ambient Herd/Homebrew FPM** (not launched by Hearth): its launch context
+  cannot be authenticated, so it stays an unverified row and Hearth never
+  writes on its behalf until authoritative FPM ownership lands (todo #2343).
+
+**Downgrade warning**: older Hearth binaries read this config but their next
+`config.save()` silently drops the `[php_ini]` tables — downgrading is
+write-destructive. Back up `config.toml` before downgrading.
+
+If the CLI reports a version mismatch with the daemon, run
+`hearth daemon stop && hearth daemon start` and retry.
 
 ## Roadmap
 

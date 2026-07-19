@@ -1,15 +1,101 @@
 use tracing::{info, warn};
 
-use super::supervisor::ManagedService;
 use super::ServiceKind;
+use super::supervisor::{FpmOwnership, ManagedService};
 use crate::config::{AddedPackage, HearthConfig};
 
-/// Detect whether Laravel Herd is running by checking for its process.
+/// Current Herd ownership of the web/PHP services, as TYPED evidence
+/// (C4-2, review 5650 r4): a failed probe is `Unknown`, never a silent
+/// "not owned". Every activation policy treats `Unknown` fail-CLOSED.
+///
+/// Production detection is the Herd.app process check:
+/// - exit 0 → `Owned` (a Herd.app process matched)
+/// - exit 1 → `Unowned` (pgrep's documented "no processes matched")
+/// - spawn error, death by signal, exit > 1 → `Unknown` with a
+///   non-sensitive diagnostic (status/IO error class only).
+///
+/// A deterministic override seam exists for the isolated smoke gate ONLY:
+/// honored exclusively while `HEARTH_ISOLATED_ROOT` (the typed isolated
+/// runtime) is set, so no ambient environment variable can flip
+/// Herd-coexistence behavior of a production daemon.
+pub fn current_fpm_ownership() -> FpmOwnership {
+    if let Some(state) = isolated_herd_ownership_override() {
+        return state;
+    }
+    classify_pgrep_result(
+        std::process::Command::new("pgrep")
+            .args(["-q", "-f", "Herd\\.app"])
+            .status(),
+    )
+}
+
+/// Pure classification of the pgrep evidence (C4-2, unit-testable):
+/// success → Owned; documented no-match exit 1 → Unowned; anything else —
+/// spawn error, death by signal (no exit code), exit codes > 1 — is
+/// `Unknown` with a non-sensitive diagnostic.
+fn classify_pgrep_result(result: std::io::Result<std::process::ExitStatus>) -> FpmOwnership {
+    match result {
+        Ok(status) if status.success() => FpmOwnership::Owned,
+        Ok(status) if status.code() == Some(1) => FpmOwnership::Unowned,
+        Ok(status) => FpmOwnership::Unknown(format!(
+            "ownership probe (pgrep) failed with status {status}"
+        )),
+        Err(e) => FpmOwnership::Unknown(format!(
+            "ownership probe (pgrep) could not be spawned: {}",
+            e.kind()
+        )),
+    }
+}
+
+/// Boolean convenience for paths that only need "is Herd PROVEN live":
+/// `Owned` → true; `Unowned`/`Unknown` → false. Activation decisions must
+/// NOT use this — they consume [`current_fpm_ownership`] and fail closed on
+/// `Unknown`.
 pub fn is_herd_running() -> bool {
-    std::process::Command::new("pgrep")
-        .args(["-q", "-f", "Herd\\.app"])
-        .status()
-        .is_ok_and(|s| s.success())
+    matches!(current_fpm_ownership(), FpmOwnership::Owned)
+}
+
+/// `HEARTH_HERD_OWNERSHIP=1|0|file:<path>` — deterministic Herd-ownership
+/// answer for the isolated smoke daemon. `None` (ignored) unless the process
+/// runs in the typed isolated runtime; unparseable env values are ignored,
+/// never guessed. The `file:` form reads the flag file's CURRENT content on
+/// every probe: exact `1` → Owned, exact `0` → Unowned, and anything else —
+/// missing, unreadable, empty, invalid content — is `Unknown` (fail-closed,
+/// C4-2), so the smoke can exercise the unknown-ownership policy too.
+fn isolated_herd_ownership_override() -> Option<FpmOwnership> {
+    std::env::var_os("HEARTH_ISOLATED_ROOT")?;
+    let value = std::env::var("HEARTH_HERD_OWNERSHIP").ok()?;
+    match value.as_str() {
+        "1" => Some(FpmOwnership::Owned),
+        "0" => Some(FpmOwnership::Unowned),
+        other => {
+            let path = other.strip_prefix("file:")?;
+            Some(classify_flag_read(std::fs::read(path)))
+        }
+    }
+}
+
+/// Pure classification of the isolated flag-file evidence (C5-1A): the
+/// EXACT single byte `1` → Owned, the exact single byte `0` → Unowned —
+/// no trimming, ever. Any newline, surrounding or internal whitespace,
+/// BOM, extra bytes, empty file, invalid UTF-8, or read failure
+/// (missing/unreadable/racing) is `Unknown` (fail-closed) with a
+/// non-sensitive diagnostic. Malformed evidence must never become
+/// authoritative.
+fn classify_flag_read(result: std::io::Result<Vec<u8>>) -> FpmOwnership {
+    match result {
+        Ok(bytes) => match bytes.as_slice() {
+            b"1" => FpmOwnership::Owned,
+            b"0" => FpmOwnership::Unowned,
+            _ => FpmOwnership::Unknown(
+                "isolated ownership flag content is not exactly `1` or `0`".to_string(),
+            ),
+        },
+        Err(e) => FpmOwnership::Unknown(format!(
+            "isolated ownership flag unreadable: {}",
+            e.kind()
+        )),
+    }
 }
 
 /// Filter `added_packages` to only entries whose `<site_path>/vendor/<vendor>/<pkg>`
@@ -75,8 +161,16 @@ pub fn default_services(
 ) -> Vec<ManagedService> {
     let mut services = Vec::new();
 
-    if is_herd_running() {
+    // C4-2: boot registration consumes TYPED ownership and fails closed —
+    // unknown evidence must never register the Herd-conflicting trio.
+    let ownership = current_fpm_ownership();
+    if ownership == FpmOwnership::Owned {
         info!("Herd detected — skipping nginx, php-fpm, dnsmasq (managed by Herd)");
+    } else if let FpmOwnership::Unknown(diag) = &ownership {
+        warn!(
+            "Herd ownership unknown ({diag}) — skipping nginx, php-fpm, dnsmasq \
+             fail-closed until the ownership probe recovers"
+        );
     } else {
         services.push(ManagedService::new(
             ServiceKind::Nginx,
@@ -759,5 +853,90 @@ mod tests {
             )]
         );
         drop(guard);
+    }
+
+    // ---- C4-2 (review 5650 r4): typed ownership evidence ----
+
+    /// pgrep evidence matrix: 0→Owned, documented 1→Unowned, everything
+    /// else (exit >1, death by signal, spawn error) → Unknown.
+    #[test]
+    fn pgrep_classification_matrix() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        let exit = |code: i32| Ok(ExitStatus::from_raw(code << 8));
+        assert_eq!(classify_pgrep_result(exit(0)), FpmOwnership::Owned);
+        assert_eq!(classify_pgrep_result(exit(1)), FpmOwnership::Unowned);
+        assert!(matches!(
+            classify_pgrep_result(exit(2)),
+            FpmOwnership::Unknown(_)
+        ));
+        // Death by signal: no exit code.
+        let signaled: std::io::Result<ExitStatus> = Ok(ExitStatus::from_raw(15));
+        assert!(matches!(
+            classify_pgrep_result(signaled),
+            FpmOwnership::Unknown(_)
+        ));
+        let spawn_err: std::io::Result<ExitStatus> =
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        match classify_pgrep_result(spawn_err) {
+            FpmOwnership::Unknown(diag) => {
+                assert!(diag.contains("could not be spawned"), "{diag}");
+                // Non-sensitive: error-kind only, no environment contents.
+                assert!(!diag.contains("HEARTH_"), "{diag}");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    /// Isolated flag-file evidence matrix (C5-1A): the EXACT bytes `1`/`0`
+    /// only — trailing newlines, whitespace, BOM, extra bytes, empty
+    /// content, invalid UTF-8, and read failures are all Unknown.
+    #[test]
+    fn flag_file_classification_matrix() {
+        assert_eq!(
+            classify_flag_read(Ok(b"1".to_vec())),
+            FpmOwnership::Owned,
+            "exact byte 1"
+        );
+        assert_eq!(
+            classify_flag_read(Ok(b"0".to_vec())),
+            FpmOwnership::Unowned,
+            "exact byte 0"
+        );
+        let invalid_cases: &[&[u8]] = &[
+            b"",
+            b"1\n",
+            b"0\n",
+            b" 0 ",
+            b"\t1",
+            b"1 ",
+            b"0 0",
+            b"\xef\xbb\xbf1", // BOM + 1
+            b"10",
+            b"01",
+            b"yes",
+            b"2",
+            b"\xff\x31", // invalid UTF-8 followed by '1'
+        ];
+        for invalid in invalid_cases {
+            assert!(
+                matches!(
+                    classify_flag_read(Ok(invalid.to_vec())),
+                    FpmOwnership::Unknown(_)
+                ),
+                "bytes {invalid:?} must be Unknown"
+            );
+        }
+        assert!(matches!(
+            classify_flag_read(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            FpmOwnership::Unknown(_)
+        ));
+        assert!(matches!(
+            classify_flag_read(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            ))),
+            FpmOwnership::Unknown(_)
+        ));
     }
 }

@@ -219,6 +219,16 @@ case "${1:-}" in
     esac
     ;;
   --nodaemonize*)
+    # Validate the supplied FPM config like real php-fpm: refuse to run
+    # without a readable config, so a missing-config restart can never be
+    # masked by a blindly-succeeding fake (C1-4, review 5650).
+    CONF=""
+    for a in "$@"; do
+      case "$a" in
+        --fpm-config=*) CONF="${a#--fpm-config=}" ;;
+      esac
+    done
+    [ -n "$CONF" ] && [ -r "$CONF" ] || exit 78
     exec sleep 300
     ;;
 esac
@@ -284,7 +294,7 @@ redis_port = $REDIS_PORT
 parked_paths = []
 EOF
     : > "$SMOKE_ROOT/daemon.log"
-    $DAEMON 2>"$SMOKE_ROOT/daemon.log" &
+    $DAEMON >"$SMOKE_ROOT/daemon.log" 2>&1 &
     DAEMON_PID=$!
     sleep 2
     if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
@@ -299,21 +309,114 @@ EOF
     [ -S "$ISOLATED_SOCK" ]
 }
 
-info "Starting isolated daemon (bounded port-collision retry)..."
-STARTED=0
-for attempt in 1 2 3 4 5; do
-    if start_daemon; then
-        STARTED=1
-        pass "Daemon started (attempt $attempt, PID $DAEMON_PID, dump:$DUMP_PORT mcp:$MCP_PORT)"
-        break
+stop_daemon() {
+    [ -n "${DAEMON_PID:-}" ] || return 0
+    kill "$DAEMON_PID" 2>/dev/null
+    wait "$DAEMON_PID" 2>/dev/null
+    DAEMON_PID=""
+}
+
+boot_daemon() {
+    # $1 = deterministic Herd-ownership answer for this daemon run (1|0).
+    # The seam is honored only because HEARTH_ISOLATED_ROOT is set (typed
+    # isolated runtime) — a production daemon ignores it.
+    export HEARTH_HERD_OWNERSHIP="$1"
+    STARTED=0
+    for attempt in 1 2 3 4 5; do
+        if start_daemon; then
+            STARTED=1
+            pass "Daemon started (herd=$1, attempt $attempt, PID $DAEMON_PID, dump:$DUMP_PORT mcp:$MCP_PORT)"
+            break
+        fi
+        echo "  attempt $attempt failed — reallocating ports"
+    done
+    if [ "$STARTED" -ne 1 ]; then
+        fail "Daemon failed to start after 5 attempts"
+        sed 's/^/    /' "$SMOKE_ROOT/daemon.log" | tail -5
+        exit 1
     fi
-    echo "  attempt $attempt failed — reallocating ports"
-done
-if [ "$STARTED" -ne 1 ]; then
-    fail "Daemon failed to start after 5 attempts"
-    sed 's/^/    /' "$SMOKE_ROOT/daemon.log" | tail -5
-    exit 1
+}
+
+# ── SH. Simulated Herd ownership: boot skip + `php use` takes no FPM ─
+info "SH: simulated Herd ownership — boot skip and ownership-free php use..."
+boot_daemon 1
+if grep -q "Herd detected — skipping" "$SMOKE_ROOT/daemon.log"; then
+    pass "SH: boot skipped nginx/php-fpm/dnsmasq under simulated Herd"
+else
+    fail "SH: expected Herd boot skip in daemon log"
 fi
+if $CLI status 2>&1 | grep -q "php-fpm"; then
+    fail "SH: php-fpm must not be registered under Herd ownership"
+else
+    pass "SH: no php-fpm registration at boot"
+fi
+OUTPUT=$($CLI php use 8.3 2>&1)
+if echo "$OUTPUT" | grep -q "php-fpm untouched (Herd manages PHP-FPM)"; then
+    pass "SH: ordinary php use is a truthful FPM skip under Herd"
+else
+    fail "SH: got: $OUTPUT"
+fi
+if $CLI status 2>&1 | grep -q "php-fpm"; then
+    fail "SH: php use must not register FPM under Herd"
+else
+    pass "SH: still no php-fpm registration after php use"
+fi
+if pgrep -f "$HEARTH_CONFIG_DIR/php" >/dev/null 2>&1; then
+    fail "SH: a Hearth FPM process is running — switch took ownership"
+else
+    pass "SH: zero Hearth FPM processes under simulated Herd"
+fi
+stop_daemon
+
+# ── SH2. Runtime ownership flip: relinquish + generic control (C3-1) ─
+info "SH2: Herd ownership appears at runtime — relinquish, no restarts..."
+# Single-service control only: a generic `hearth start` would also launch
+# real nginx/DB engine binaries against the isolated root (heavyweight and
+# orphan-prone) — the generic start_all/health skip paths are covered by
+# supervisor unit tests. The fake FPM `exec`s sleep, so run-state assertions
+# use the supervisor's own truthful `hearth status` line, not pgrep.
+HERD_FLAG="$SMOKE_ROOT/herd-flag"
+# C5-1A: the seam accepts EXACT bytes only — write with printf, never echo.
+printf '0' > "$HERD_FLAG"
+boot_daemon "file:$HERD_FLAG"
+$CLI restart php-fpm >/dev/null 2>&1
+if $CLI status 2>&1 | grep -i "php-fpm" | grep -qi "running"; then
+    pass "SH2: herd-absent restart launched Hearth FPM"
+else
+    fail "SH2: expected a running Hearth FPM before the flip"
+fi
+printf '1' > "$HERD_FLAG"
+sleep 7   # > health interval (5s): one ownership-aware health tick
+if $CLI status 2>&1 | grep -i "php-fpm" | grep -qi "running"; then
+    fail "SH2: Hearth FPM child must be relinquished after Herd appears"
+else
+    pass "SH2: health tick relinquished Hearth's own FPM child"
+fi
+OUTPUT=$($CLI restart php-fpm 2>&1)
+if echo "$OUTPUT" | grep -qi "owned by Herd"; then
+    pass "SH2: explicit php-fpm restart names the Herd ownership"
+else
+    fail "SH2: got: $OUTPUT"
+fi
+# C4-2: invalid flag content = UNKNOWN ownership → activation fails closed.
+printf 'garbage' > "$HERD_FLAG"
+OUTPUT=$($CLI restart php-fpm 2>&1)
+if echo "$OUTPUT" | grep -qi "ownership is unknown"; then
+    pass "SH2: unknown ownership refuses FPM activation fail-closed"
+else
+    fail "SH2: got: $OUTPUT"
+fi
+printf '1' > "$HERD_FLAG"
+if $CLI status 2>&1 | grep -i "php-fpm" | grep -qi "running"; then
+    fail "SH2: restart must not revive FPM under Herd"
+else
+    pass "SH2: no FPM revival under Herd ownership"
+fi
+stop_daemon
+
+# ── Main phase: deterministic Herd-absent daemon ─────────────────
+info "Starting isolated daemon (herd-absent, bounded port-collision retry)..."
+boot_daemon 0
 
 # ── Isolated daemon identity ─────────────────────────────────────
 DAEMON_CMD="$(ps -o command= -p "$DAEMON_PID" | tr -d ' ')"
@@ -342,6 +445,13 @@ elif echo "$OUTPUT" | grep -q "hearth" && echo "$OUTPUT" | grep -q "8.3" \
 else
     fail "S1: expected hearth 8.3/8.4 rows, got: $OUTPUT"
 fi
+if echo "$OUTPUT" | grep -q "Coverage: Hearth guarantees" \
+    && echo "$OUTPUT" | grep -q "outside that guarantee" \
+    && ! echo "$OUTPUT" | grep -qi "universal"; then
+    pass "S1: coverage footer states the guarantee boundary (never universal)"
+else
+    fail "S1: coverage footer missing or overclaiming: $OUTPUT"
+fi
 
 # ── S2. Set + actual materialization ─────────────────────────────
 info "S2: --global set materializes channel files..."
@@ -366,6 +476,20 @@ if echo "$OUTPUT" | grep -q "configured=1G"; then
     pass "S3: show reports configured=1G"
 else
     fail "S3: got: $OUTPUT"
+fi
+if echo "$OUTPUT" | grep -q "observed=1G (launch-probed)"; then
+    pass "S3: CLI targets report the launch-probed effective value"
+else
+    fail "S3: expected observed=1G (launch-probed), got: $OUTPUT"
+fi
+# C1-3: keyed --status carries per-target configured + launch-probed values.
+OUTPUT=$($CLI php config --status memory_limit 2>&1)
+if echo "$OUTPUT" | grep -q "configured=1G" \
+    && echo "$OUTPUT" | grep -q "observed=1G (launch-probed)" \
+    && echo "$OUTPUT" | grep -q "Coverage: Hearth guarantees"; then
+    pass "S3b: keyed --status shows configured + launch-probed values with the footer"
+else
+    fail "S3b: got: $OUTPUT"
 fi
 
 # ── S4. Sync idempotent ──────────────────────────────────────────
@@ -400,10 +524,11 @@ if echo "$OUTPUT" | grep -q "Switched to PHP 8.3; php-fpm restarted"; then
 else
     fail "S7: got: $OUTPUT"
 fi
-if $CLI status 2>&1 | grep -q "php-fpm"; then
+STATUS_OUT=$($CLI status 2>&1)
+if echo "$STATUS_OUT" | grep -q "php-fpm"; then
     pass "S7: php-fpm registered after switch"
 else
-    fail "S7: php-fpm missing from status"
+    fail "S7: php-fpm missing from status: $STATUS_OUT"
 fi
 OUTPUT=$($CLI php exec -- -r 'echo getenv("PHP_INI_SCAN_DIR");' 2>/dev/null)
 if [ "$OUTPUT" = ":$HEARTH_CONFIG_DIR/php/8.3/conf.d" ]; then
@@ -454,6 +579,41 @@ if [ "$LEFT" -eq 0 ]; then
 else
     fail "S9: leftover channel files"
 fi
+
+# ── S9b. Missing FPM config on a FRESH boot: unconditional gate ──
+# stop → remove config → fresh Herd-absent daemon: no stale registration
+# can mask the failure, and the LAUNCH-BLOCKED assertions are deterministic
+# on every host (C1-4, review 5650).
+info "S9b: conf-missing fresh boot — unconditional LAUNCH-BLOCKED + set exit 0..."
+stop_daemon
+mv "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf" "$SMOKE_ROOT/php-fpm.conf.bak"
+boot_daemon 0
+if $CLI status 2>&1 | grep -q "php-fpm"; then
+    fail "S9b: FPM must not register at boot without its config"
+else
+    pass "S9b: no stale FPM registration to mask the missing config"
+fi
+OUTPUT=$($CLI php config --status 2>&1)
+if echo "$OUTPUT" | grep -q "LAUNCH-BLOCKED" && echo "$OUTPUT" | grep -q "#2343"; then
+    pass "S9b: --status renders the LAUNCH-BLOCKED row citing todo #2343 (unconditional)"
+else
+    fail "S9b: expected LAUNCH-BLOCKED row, got: $OUTPUT"
+fi
+if echo "$OUTPUT" | grep -q "Coverage: Hearth guarantees"; then
+    pass "S9b: coverage footer present with FPM config missing"
+else
+    fail "S9b: footer missing: $OUTPUT"
+fi
+OUTPUT=$($CLI php config --global memory_limit 1G 2>&1)
+STATUS=$?
+if [ "$STATUS" -eq 0 ] && echo "$OUTPUT" | grep -q "LAUNCH-BLOCKED"; then
+    pass "S9b: --global set exits 0 and truthfully reports the launch-blocked FPM"
+else
+    fail "S9b: exit=$STATUS output: $OUTPUT"
+fi
+$CLI php config --global --unset memory_limit >/dev/null 2>&1
+$CLI php config --unmanage >/dev/null 2>&1
+mv "$SMOKE_ROOT/php-fpm.conf.bak" "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf"
 
 # ── S10. No privileged paths in any scenario output ──────────────
 info "S10: no privileged-path writes..."
