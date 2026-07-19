@@ -5,10 +5,12 @@ use tracing::info;
 /// PHP binary resolution chain.
 ///
 /// Searches for a PHP binary in this order:
-/// 1. Hearth's own cached binaries (~/.config/hearth/php/{version}/php)
+/// 1. Hearth cache (~/.config/hearth/php/{version}/php)
 /// 2. Herd binaries (~/Library/Application Support/Herd/bin/php{version})
 /// 3. Homebrew (/opt/homebrew/opt/php@{version}/bin/php)
-/// 4. System PATH (fallback)
+///
+/// If none of those paths exists, the resolver returns `None`; it never runs a
+/// bare `php` command.
 ///
 /// ```text
 /// resolve("8.4")
@@ -50,15 +52,18 @@ pub fn resolve_php_binary(version: &str, config_dir: &PathBuf) -> Option<PathBuf
         return Some(brew_path);
     }
 
-    // 4. Not found
+    // Not found
     None
 }
 
-/// Resolve the PHP-FPM binary for a given version.
+/// Resolve the PHP-FPM binary through the same three-provider chain.
+///
+/// Returns `None` rather than running a bare `php-fpm` command when no
+/// provider-specific binary exists.
 pub fn resolve_phpfpm_binary(version: &str, config_dir: &PathBuf) -> Option<PathBuf> {
     let version_compact = version.replace('.', "");
 
-    // Same resolution chain but for php-fpm
+    // Same three-provider resolution chain but for php-fpm
     let hearth_path = config_dir.join("php").join(version).join("php-fpm");
     if hearth_path.exists() {
         return Some(hearth_path);
@@ -109,5 +114,36 @@ mod tests {
         let result = resolve_php_binary("9.9", &tmp.path().to_path_buf());
         // May find Herd/Homebrew on the host, so we just check it doesn't panic
         let _ = result;
+    }
+
+    #[test]
+    fn resolver_docs_match_implemented_tiers() {
+        let source = include_str!("resolver.rs");
+        let (docs, remainder) = source
+            .split_once("pub fn resolve_php_binary")
+            .expect("resolver source should contain resolve_php_binary");
+        let implementation = remainder
+            .split("/// Resolve the PHP-FPM binary")
+            .next()
+            .expect("resolver source should contain the PHP binary implementation");
+
+        for tier in ["Hearth cache", "Herd", "Homebrew"] {
+            assert!(docs.contains(tier), "resolver docs omit {tier}");
+            assert!(
+                implementation.contains(tier),
+                "resolver implementation omits {tier}"
+            );
+        }
+
+        let documented_tier_count = docs
+            .lines()
+            .filter(|line| {
+                ["/// 1.", "/// 2.", "/// 3."]
+                    .iter()
+                    .any(|prefix| line.starts_with(prefix))
+            })
+            .count();
+        assert_eq!(documented_tier_count, 3);
+        assert!(!docs.lines().any(|line| line.starts_with("/// 4.")));
     }
 }
