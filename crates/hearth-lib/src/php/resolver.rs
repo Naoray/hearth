@@ -219,6 +219,7 @@ pub fn all_phpfpm_candidates(roots: &super::targets::ProviderRoots) -> FpmCandid
     set
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct FpmServeChoice<'a> {
     pub candidate: &'a FpmCandidate,
@@ -227,6 +228,7 @@ pub(crate) struct FpmServeChoice<'a> {
 
 /// Choose the real-proof serve candidate without allowing the exists-only
 /// production resolver to recover an identity-rejected provider alias.
+#[cfg(test)]
 pub(crate) fn choose_phpfpm_serve_candidate<'a>(
     version: &str,
     resolver_pick: Option<&std::path::Path>,

@@ -1494,16 +1494,46 @@ mod tests {
 
     const GROUP_DIAGNOSTIC_BYTES: usize = 4096;
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum GroupAbsenceEvidence {
+        NoSuchProcessGroup,
+        #[cfg(target_os = "macos")]
+        ExitedUnreapedLeaderPermissionDenied,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct GroupCleanupCertificate {
+        pgid: i32,
+        leader_pid: i32,
+        launched_uid: u32,
+        evidence: GroupAbsenceEvidence,
+    }
+
+    #[derive(Default)]
+    struct GroupCleanupTelemetry {
+        certificate: std::sync::Mutex<Option<GroupCleanupCertificate>>,
+        post_reap_group_operations: std::sync::atomic::AtomicUsize,
+    }
+
     #[derive(Default)]
     struct GroupTestFaults {
         graceful_signal_error: bool,
         graceful_poll_error: bool,
+        #[cfg(target_os = "macos")]
+        eperm_after_os_absence: bool,
+        telemetry: Option<std::sync::Arc<GroupCleanupTelemetry>>,
     }
 
     enum GroupPollOutcome {
-        Absent,
-        LeaderExited,
+        Certified(GroupCleanupCertificate),
         TimedOut,
+    }
+
+    struct GuardedProcessGroupRun {
+        pgid: i32,
+        certificate: Option<GroupCleanupCertificate>,
+        post_reap_group_operations: usize,
+        result: Result<(), String>,
     }
 
     struct GuardedGroupChild {
@@ -1512,6 +1542,9 @@ mod tests {
         stderr: tempfile::NamedTempFile,
         status: Option<std::process::ExitStatus>,
         faults: GroupTestFaults,
+        launched_uid: u32,
+        cleanup_certificate: Option<GroupCleanupCertificate>,
+        telemetry: std::sync::Arc<GroupCleanupTelemetry>,
         cleaned: bool,
     }
 
@@ -1545,12 +1578,19 @@ mod tests {
                 .map_err(|error| format!("process-group spawn failed: {error}"))?;
             // Ownership is installed immediately after group_spawn. Every
             // fallible post-spawn step below therefore runs behind Drop.
+            let telemetry = faults
+                .telemetry
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::new(GroupCleanupTelemetry::default()));
             let owned = Self {
                 pgid: child.id() as i32,
                 child,
                 stderr,
                 status: None,
                 faults,
+                launched_uid: nix::unistd::Uid::current().as_raw(),
+                cleanup_certificate: None,
+                telemetry,
                 cleaned: false,
             };
             after_owned(owned.pgid)?;
@@ -1599,27 +1639,95 @@ mod tests {
             Ok(Some(summary))
         }
 
-        fn group_exists(&self) -> Result<bool, String> {
-            Self::group_exists_for_test(self.pgid)
+        fn ensure_unreaped_witness(&self, operation: &str) -> Result<(), String> {
+            if self.status.is_none() {
+                return Ok(());
+            }
+            self.telemetry
+                .post_reap_group_operations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(format!(
+                "refused {operation} for PGID {} after releasing its leader witness",
+                self.pgid
+            ))
         }
 
-        fn group_exists_for_test(pgid: i32) -> Result<bool, String> {
-            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pgid), None) {
-                Ok(()) => Ok(true),
-                Err(nix::errno::Errno::ESRCH) => Ok(false),
-                Err(error) => Err(format!("could not inspect PGID {pgid}: {error}")),
+        fn probe_group_signalability(
+            &self,
+            _leader_exited_unreaped: bool,
+        ) -> Result<Result<(), nix::errno::Errno>, String> {
+            self.ensure_unreaped_witness("group probe")?;
+            let result = nix::sys::signal::kill(nix::unistd::Pid::from_raw(-self.pgid), None);
+            #[cfg(target_os = "macos")]
+            if _leader_exited_unreaped
+                && self.faults.eperm_after_os_absence
+                && result == Err(nix::errno::Errno::ESRCH)
+            {
+                return Ok(Err(nix::errno::Errno::EPERM));
             }
+            Ok(result)
+        }
+
+        #[cfg(target_os = "macos")]
+        fn eperm_is_identity_bound_absence(&self) -> Result<bool, String> {
+            Ok(nix::unistd::Uid::current().as_raw() == self.launched_uid
+                && self.observe_leader_exit()?.is_some())
+        }
+
+        fn certify_group_absent_pre_reap(&self) -> Result<Option<GroupCleanupCertificate>, String> {
+            self.ensure_unreaped_witness("absence certification")?;
+            if nix::unistd::Uid::current().as_raw() != self.launched_uid {
+                return Err(format!(
+                    "refused PGID {} absence proof after launcher uid changed",
+                    self.pgid
+                ));
+            }
+            if self.observe_leader_exit()?.is_none() {
+                return Ok(None);
+            }
+            let evidence = match self.probe_group_signalability(true)? {
+                Err(nix::errno::Errno::ESRCH) => GroupAbsenceEvidence::NoSuchProcessGroup,
+                #[cfg(target_os = "macos")]
+                Err(nix::errno::Errno::EPERM) => {
+                    // The unreaped leader still binds this PID/PGID to the
+                    // same-uid group we launched. On macOS EPERM here means
+                    // that group has no signalable live member; it is never
+                    // treated as absence without that retained witness.
+                    GroupAbsenceEvidence::ExitedUnreapedLeaderPermissionDenied
+                }
+                Ok(()) => return Ok(None),
+                Err(error) => {
+                    return Err(format!("could not inspect PGID {}: {error}", self.pgid));
+                }
+            };
+            Ok(Some(GroupCleanupCertificate {
+                pgid: self.pgid,
+                leader_pid: self.pgid,
+                launched_uid: self.launched_uid,
+                evidence,
+            }))
+        }
+
+        fn record_cleanup_certificate(
+            &mut self,
+            certificate: GroupCleanupCertificate,
+        ) -> Result<(), String> {
+            self.cleanup_certificate = Some(certificate);
+            *self
+                .telemetry
+                .certificate
+                .lock()
+                .map_err(|_| "cleanup certificate telemetry lock poisoned".to_string())? =
+                Some(certificate);
+            Ok(())
         }
 
         fn signal_group(&self, signal: nix::sys::signal::Signal) -> Result<(), String> {
+            self.ensure_unreaped_witness("group signal")?;
             match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-self.pgid), signal) {
                 Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
-                Err(nix::errno::Errno::EPERM) if self.observe_leader_exit()?.is_some() => {
-                    // macOS reports EPERM for a group represented only by an
-                    // exited, unreaped leader. Keep that identity witness and
-                    // require the exact post-reap absence proof below.
-                    Ok(())
-                }
+                #[cfg(target_os = "macos")]
+                Err(nix::errno::Errno::EPERM) if self.eperm_is_identity_bound_absence()? => Ok(()),
                 Err(error) => Err(format!(
                     "could not send {signal:?} to validated PGID {}: {error}",
                     self.pgid
@@ -1627,20 +1735,11 @@ mod tests {
             }
         }
 
-        fn poll_group_exit(&self, timeout: Duration) -> Result<GroupPollOutcome, String> {
+        fn poll_group_absence(&self, timeout: Duration) -> Result<GroupPollOutcome, String> {
             let deadline = std::time::Instant::now() + timeout;
             loop {
-                match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-self.pgid), None) {
-                    Err(nix::errno::Errno::ESRCH) => return Ok(GroupPollOutcome::Absent),
-                    Ok(()) | Err(nix::errno::Errno::EPERM)
-                        if self.observe_leader_exit()?.is_some() =>
-                    {
-                        return Ok(GroupPollOutcome::LeaderExited);
-                    }
-                    Ok(()) => {}
-                    Err(error) => {
-                        return Err(format!("could not inspect PGID {}: {error}", self.pgid));
-                    }
+                if let Some(certificate) = self.certify_group_absent_pre_reap()? {
+                    return Ok(GroupPollOutcome::Certified(certificate));
                 }
                 if std::time::Instant::now() >= deadline {
                     return Ok(GroupPollOutcome::TimedOut);
@@ -1669,22 +1768,26 @@ mod tests {
             let graceful_poll = if self.faults.graceful_poll_error {
                 Err("injected graceful poll error".to_string())
             } else {
-                self.poll_group_exit(graceful_timeout)
+                self.poll_group_absence(graceful_timeout)
             };
-            let graceful_absent = match graceful_poll {
-                Ok(GroupPollOutcome::Absent) => true,
-                Ok(GroupPollOutcome::LeaderExited | GroupPollOutcome::TimedOut) => false,
+            let graceful_certificate = match graceful_poll {
+                Ok(GroupPollOutcome::Certified(certificate)) => Some(certificate),
+                Ok(GroupPollOutcome::TimedOut) => None,
                 Err(error) => {
                     errors.push(error);
-                    false
+                    None
                 }
             };
-            if graceful_signal.is_err() || !graceful_absent {
+            let mut final_certificate = graceful_certificate;
+            if graceful_signal.is_err() || final_certificate.is_none() {
+                final_certificate = None;
                 if let Err(error) = self.signal_group(nix::sys::signal::Signal::SIGKILL) {
                     errors.push(error);
                 }
-                match self.poll_group_exit(force_timeout) {
-                    Ok(GroupPollOutcome::Absent | GroupPollOutcome::LeaderExited) => {}
+                match self.poll_group_absence(force_timeout) {
+                    Ok(GroupPollOutcome::Certified(certificate)) => {
+                        final_certificate = Some(certificate);
+                    }
                     Ok(GroupPollOutcome::TimedOut) => errors.push(format!(
                         "validated PGID {} survived bounded SIGKILL polling",
                         self.pgid
@@ -1692,26 +1795,30 @@ mod tests {
                     Err(error) => errors.push(error),
                 }
             }
-            match self.child.try_wait() {
-                Ok(Some(status)) => self.status = Some(status),
-                Ok(None) => {
-                    errors.push("leader was not reapable after bounded teardown".to_string())
-                }
-                Err(error) => errors.push(format!("leader reap failed: {error}")),
-            }
-            let absent_after_reap = match self.group_exists() {
-                Ok(false) => true,
-                Ok(true) => {
-                    errors.push(format!("validated PGID {} survived teardown", self.pgid));
-                    false
-                }
-                Err(error) => {
+
+            if let Some(certificate) = final_certificate {
+                if let Err(error) = self.record_cleanup_certificate(certificate) {
                     errors.push(error);
-                    false
+                } else {
+                    // This is the only reap point. The exact launched group was
+                    // certified absent while the leader witness was still held;
+                    // no negative-PGID operation is permitted after this call.
+                    match self.child.try_wait() {
+                        Ok(Some(status)) => {
+                            self.status = Some(status);
+                            self.cleaned = true;
+                        }
+                        Ok(None) => errors.push(
+                            "leader was not reapable after pre-reap absence proof".to_string(),
+                        ),
+                        Err(error) => errors.push(format!("leader reap failed: {error}")),
+                    }
                 }
-            };
-            if absent_after_reap && self.status.is_some() {
-                self.cleaned = true;
+            } else {
+                errors.push(format!(
+                    "validated PGID {} absence was not proven before leader reap",
+                    self.pgid
+                ));
             }
             if errors.is_empty() {
                 Ok(())
@@ -1761,7 +1868,7 @@ mod tests {
         log_path: &Path,
         mut ready: impl FnMut() -> Result<bool, String>,
         validate: impl FnOnce() -> Result<(), String>,
-    ) -> Result<(i32, Result<(), String>), String> {
+    ) -> Result<GuardedProcessGroupRun, String> {
         let mut group = GuardedGroupChild::spawn(command)?;
         let pgid = group.pgid;
         let operation = (|| {
@@ -1791,7 +1898,47 @@ mod tests {
                 "{operation}; cleanup failed: {cleanup}; {diagnostics}; log tail: {log}"
             )),
         };
-        Ok((pgid, result))
+        let telemetry = std::sync::Arc::clone(&group.telemetry);
+        drop(group);
+        let certificate = *telemetry
+            .certificate
+            .lock()
+            .map_err(|_| "cleanup certificate telemetry lock poisoned".to_string())?;
+        let post_reap_group_operations = telemetry
+            .post_reap_group_operations
+            .load(std::sync::atomic::Ordering::SeqCst);
+        Ok(GuardedProcessGroupRun {
+            pgid,
+            certificate,
+            post_reap_group_operations,
+            result,
+        })
+    }
+
+    fn assert_cleanup_proof(
+        pgid: i32,
+        certificate: Option<GroupCleanupCertificate>,
+        post_reap_group_operations: usize,
+    ) {
+        let certificate = certificate.expect("cleanup must produce a pre-reap certificate");
+        assert_eq!(certificate.pgid, pgid);
+        assert_eq!(certificate.leader_pid, pgid);
+        assert_eq!(
+            certificate.launched_uid,
+            nix::unistd::Uid::current().as_raw()
+        );
+        assert_eq!(
+            post_reap_group_operations, 0,
+            "PGID {pgid} was operated on after its leader was reaped"
+        );
+    }
+
+    fn assert_cleanup_telemetry(pgid: i32, telemetry: &std::sync::Arc<GroupCleanupTelemetry>) {
+        let certificate = *telemetry.certificate.lock().unwrap();
+        let post_reap_group_operations = telemetry
+            .post_reap_group_operations
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_cleanup_proof(pgid, certificate, post_reap_group_operations);
     }
 
     #[test]
@@ -1804,11 +1951,11 @@ mod tests {
 
         let mut timeout = std::process::Command::new("/bin/sh");
         timeout.arg("-c").arg(
-            "i=0; while [ $i -lt 6000 ]; do printf x >&2; i=$((i + 1)); done; \
-             printf 'TIMEOUT-DIAGNOSTIC-END\\n' >&2; trap '' QUIT; \
+            "trap '' QUIT; yes x | head -c 6000 >&2; \
+             printf 'TIMEOUT-DIAGNOSTIC-END\\n' >&2; \
              (trap '' QUIT; while :; do sleep 1; done) & while :; do sleep 1; done",
         );
-        let (timeout_pgid, timeout_result) = run_process_group_guarded(
+        let timeout_run = run_process_group_guarded(
             &mut timeout,
             Duration::from_millis(150),
             Duration::from_millis(150),
@@ -1818,7 +1965,7 @@ mod tests {
             || Err("validation unexpectedly ran".to_string()),
         )
         .unwrap();
-        let timeout_error = timeout_result.unwrap_err();
+        let timeout_error = timeout_run.result.unwrap_err();
         assert!(
             timeout_error.contains("readiness timed out"),
             "{timeout_error}"
@@ -1827,10 +1974,11 @@ mod tests {
             timeout_error.contains("TIMEOUT-DIAGNOSTIC-END"),
             "{timeout_error}"
         );
-        assert!(!timeout_error.contains(&"x".repeat(GROUP_DIAGNOSTIC_BYTES + 1)));
-        assert!(
-            !GuardedGroupChild::group_exists_for_test(timeout_pgid).unwrap(),
-            "timeout PGID {timeout_pgid} survived"
+        assert!(timeout_error.len() <= GROUP_DIAGNOSTIC_BYTES + 512);
+        assert_cleanup_proof(
+            timeout_run.pgid,
+            timeout_run.certificate,
+            timeout_run.post_reap_group_operations,
         );
 
         let mut early = std::process::Command::new("/bin/sh");
@@ -1838,7 +1986,7 @@ mod tests {
             "trap '' QUIT; (trap '' QUIT; while :; do sleep 1; done) & \
              printf 'EARLY-DIAGNOSTIC\\n' >&2; sleep 0.05; exit 23",
         );
-        let (early_pgid, early_result) = run_process_group_guarded(
+        let early_run = run_process_group_guarded(
             &mut early,
             Duration::from_secs(1),
             Duration::from_millis(150),
@@ -1848,16 +1996,17 @@ mod tests {
             || Err("validation unexpectedly ran".to_string()),
         )
         .unwrap();
-        let early_error = early_result.unwrap_err();
+        let early_error = early_run.result.unwrap_err();
         assert!(
             early_error.contains("exited before readiness")
                 && early_error.contains("exit status: 23")
                 && early_error.contains("EARLY-DIAGNOSTIC"),
             "{early_error}"
         );
-        assert!(
-            !GuardedGroupChild::group_exists_for_test(early_pgid).unwrap(),
-            "early-exit PGID {early_pgid} survived"
+        assert_cleanup_proof(
+            early_run.pgid,
+            early_run.certificate,
+            early_run.post_reap_group_operations,
         );
     }
 
@@ -1877,11 +2026,15 @@ mod tests {
 
         let post_spawn_pgid = Arc::new(AtomicI32::new(0));
         let recorded_pgid = Arc::clone(&post_spawn_pgid);
+        let post_spawn_telemetry = Arc::new(GroupCleanupTelemetry::default());
         let mut post_spawn = holding_stderr();
         let started = std::time::Instant::now();
         let post_spawn_error = match GuardedGroupChild::spawn_after_owned(
             &mut post_spawn,
-            GroupTestFaults::default(),
+            GroupTestFaults {
+                telemetry: Some(Arc::clone(&post_spawn_telemetry)),
+                ..GroupTestFaults::default()
+            },
             move |pgid| {
                 recorded_pgid.store(pgid, Ordering::SeqCst);
                 Err("injected immediate post-spawn failure".to_string())
@@ -1893,12 +2046,9 @@ mod tests {
         let pgid = post_spawn_pgid.load(Ordering::SeqCst);
         assert!(post_spawn_error.contains("immediate post-spawn failure"));
         assert!(started.elapsed() < Duration::from_secs(4));
-        assert!(
-            !GuardedGroupChild::group_exists_for_test(pgid).unwrap(),
-            "post-spawn-fault PGID {pgid} survived"
-        );
+        assert_cleanup_telemetry(pgid, &post_spawn_telemetry);
 
-        for faults in [
+        for mut faults in [
             GroupTestFaults {
                 graceful_signal_error: true,
                 ..GroupTestFaults::default()
@@ -1908,6 +2058,8 @@ mod tests {
                 ..GroupTestFaults::default()
             },
         ] {
+            let telemetry = Arc::new(GroupCleanupTelemetry::default());
+            faults.telemetry = Some(Arc::clone(&telemetry));
             let mut command = holding_stderr();
             let mut group = GuardedGroupChild::spawn_with_faults(&mut command, faults).unwrap();
             let pgid = group.pgid;
@@ -1919,28 +2071,110 @@ mod tests {
             assert!(error.contains("injected graceful"), "{error}");
             assert!(diagnostics.len() <= GROUP_DIAGNOSTIC_BYTES + 256);
             assert!(started.elapsed() < Duration::from_secs(4));
-            assert!(
-                !GuardedGroupChild::group_exists_for_test(pgid).unwrap(),
-                "fault-injected PGID {pgid} survived"
-            );
+            drop(group);
+            assert_cleanup_telemetry(pgid, &telemetry);
         }
 
         let panic_pgid = Arc::new(AtomicI32::new(0));
         let recorded_pgid = Arc::clone(&panic_pgid);
+        let panic_telemetry = Arc::new(GroupCleanupTelemetry::default());
+        let recorded_telemetry = Arc::clone(&panic_telemetry);
         let started = std::time::Instant::now();
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut command = holding_stderr();
-            let group = GuardedGroupChild::spawn(&mut command).unwrap();
+            let group = GuardedGroupChild::spawn_with_faults(
+                &mut command,
+                GroupTestFaults {
+                    telemetry: Some(recorded_telemetry),
+                    ..GroupTestFaults::default()
+                },
+            )
+            .unwrap();
             recorded_pgid.store(group.pgid, Ordering::SeqCst);
             panic!("injected panic with owned process group");
         }));
         assert!(panic_result.is_err());
         let pgid = panic_pgid.load(Ordering::SeqCst);
         assert!(started.elapsed() < Duration::from_secs(4));
-        assert!(
-            !GuardedGroupChild::group_exists_for_test(pgid).unwrap(),
-            "panic/Drop PGID {pgid} survived"
-        );
+        assert_cleanup_telemetry(pgid, &panic_telemetry);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_exited_unreaped_eperm_cleanup_is_identity_bound_and_repeatable() {
+        let tmp = tempfile::Builder::new()
+            .prefix("hearth fpm proof eperm")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+
+        for iteration in 0..20 {
+            let signal_marker = tmp.path().join(format!("unrelated-{iteration}.signal"));
+            let ready_marker = tmp.path().join(format!("unrelated-{iteration}.ready"));
+            let mut unrelated = std::process::Command::new("/bin/sh");
+            unrelated
+                .arg("-c")
+                .arg(
+                    "trap 'printf signaled > \"$HEARTH_SIGNAL_MARKER\"' QUIT; \
+                     : > \"$HEARTH_READY_MARKER\"; while :; do sleep 1; done",
+                )
+                .env("HEARTH_SIGNAL_MARKER", &signal_marker)
+                .env("HEARTH_READY_MARKER", &ready_marker)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let mut unrelated = unrelated.spawn().unwrap();
+            let unrelated_deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while !ready_marker.exists() {
+                assert!(
+                    std::time::Instant::now() < unrelated_deadline,
+                    "unrelated sentinel did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            let telemetry = std::sync::Arc::new(GroupCleanupTelemetry::default());
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("trap '' QUIT; (trap '' QUIT; while :; do sleep 1; done) & exit 0");
+            let mut group = GuardedGroupChild::spawn_with_faults(
+                &mut command,
+                GroupTestFaults {
+                    eperm_after_os_absence: true,
+                    telemetry: Some(std::sync::Arc::clone(&telemetry)),
+                    ..GroupTestFaults::default()
+                },
+            )
+            .unwrap();
+            let leader_deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while group.observe_leader_exit().unwrap().is_none() {
+                assert!(
+                    std::time::Instant::now() < leader_deadline,
+                    "leader did not reach exited-unreaped state"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            let pgid = group.pgid;
+            group
+                .shutdown(Duration::from_millis(25), Duration::from_secs(2))
+                .unwrap();
+            drop(group);
+            assert_cleanup_telemetry(pgid, &telemetry);
+            assert_eq!(
+                telemetry.certificate.lock().unwrap().unwrap().evidence,
+                GroupAbsenceEvidence::ExitedUnreapedLeaderPermissionDenied
+            );
+            assert!(
+                !signal_marker.exists(),
+                "unrelated process received SIGQUIT"
+            );
+            assert!(
+                unrelated.try_wait().unwrap().is_none(),
+                "unrelated process was terminated"
+            );
+            unrelated.kill().unwrap();
+            unrelated.wait().unwrap();
+        }
     }
 
     #[test]
@@ -2025,7 +2259,7 @@ mod tests {
             .env(key, value)
             .stdout(std::process::Stdio::null());
         let log_path = config_dir.join("log/php-fpm.log");
-        let (pgid, result) = run_process_group_guarded(
+        let run = run_process_group_guarded(
             &mut command,
             Duration::from_secs(5),
             Duration::from_secs(5),
@@ -2048,15 +2282,12 @@ mod tests {
             },
         )
         .unwrap_or_else(|error| panic!("real php-fpm group launch failed: {error}"));
-        result.unwrap_or_else(|error| {
+        run.result.unwrap_or_else(|error| {
             panic!(
                 "real php-fpm {} {:?} proof failed: {error}",
                 candidate.version, candidate.tier
             )
         });
-        assert!(
-            !GuardedGroupChild::group_exists_for_test(pgid).unwrap(),
-            "real php-fpm PGID {pgid} survived proof teardown"
-        );
+        assert_cleanup_proof(run.pgid, run.certificate, run.post_reap_group_operations);
     }
 }
