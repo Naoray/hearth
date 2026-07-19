@@ -102,6 +102,11 @@ impl PhpConfigEngine {
         &self.config_dir
     }
 
+    /// Whole-operation deadline used by bounded PHP probes.
+    pub fn probe_timeout(&self) -> Duration {
+        self.probe_timeout
+    }
+
     pub fn provider_roots(&self) -> &ProviderRoots {
         &self.provider_roots
     }

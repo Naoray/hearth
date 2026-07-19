@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use hearth_lib::php::engine::restart_fpm_conditionally;
+use hearth_lib::php::fpm::{FpmConfState, probe_live_effective};
 use hearth_lib::php::reconcile::{CHANNEL_FILE_NAME, Manifest};
+use hearth_lib::service::supervisor::{FpmLaunchConf, FpmLaunchSnapshot, FpmOwnership};
 use hearth_lib::service::{ServiceKind, ServiceState};
 use hearth_lib::socket::{
     DaemonResponse, FpmRestartOutcome, PhpConfigAction, PhpConfigOutcome, PhpScope,
@@ -17,6 +19,11 @@ use crate::DaemonState;
 /// Handle a V2 php-config action: engine (persist → reconcile), then a
 /// conditional FPM restart for mutating actions only.
 pub async fn php_config(state: &Arc<DaemonState>, action: PhpConfigAction) -> DaemonResponse {
+    let live_key = match &action {
+        PhpConfigAction::Show { key: Some(key) }
+        | PhpConfigAction::Status { key: Some(key), .. } => Some(key.clone()),
+        _ => None,
+    };
     let restart = matches!(
         action,
         PhpConfigAction::Set { .. } | PhpConfigAction::Unset { .. }
@@ -31,6 +38,9 @@ pub async fn php_config(state: &Arc<DaemonState>, action: PhpConfigAction) -> Da
                 outcome.fpm = restart_fpm_conditionally(&state.supervisor, &state.php_engine).await;
             }
             annotate_fpm_runtime(state, &mut outcome).await;
+            if let Some(key) = live_key {
+                annotate_fpm_live(state, &mut outcome, &key).await;
+            }
             DaemonResponse::PhpConfigReport(outcome)
         }
     }
@@ -85,6 +95,202 @@ async fn annotate_fpm_runtime(state: &Arc<DaemonState>, outcome: &mut PhpConfigO
             row.run_state = Some("not running".to_string());
         }
     }
+}
+
+#[derive(Debug)]
+struct FpmLiveGate {
+    generation: u64,
+    conf: std::path::PathBuf,
+    conf_sha256: String,
+    probe_sha256: String,
+    listen: std::path::PathBuf,
+    socket_identity: (u64, u64),
+}
+
+/// Upgrade the single launched FPM row only after the complete launch-
+/// provenance evidence gate succeeds. Every failure is intentionally soft:
+/// the existing launch-probed/n-a row and all unrelated fields remain exact.
+async fn annotate_fpm_live(state: &Arc<DaemonState>, outcome: &mut PhpConfigOutcome, key: &str) {
+    let Some(pos) = outcome
+        .rows
+        .iter()
+        .position(|row| row.sapi == "fpm" && row.context == "launched")
+    else {
+        return;
+    };
+
+    let gate = match pre_live_probe_gate(state, key).await {
+        Ok(gate) => gate,
+        Err(reason) => {
+            debug_live_probe_miss(&reason);
+            return;
+        }
+    };
+    let reply = match probe_live_effective(
+        state.php_engine.config_dir(),
+        key,
+        &gate.conf_sha256,
+        &gate.probe_sha256,
+        state.php_engine.probe_timeout(),
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(reason) => {
+            debug_live_probe_miss(&reason);
+            return;
+        }
+    };
+    if let Err(reason) = post_live_probe_gate(state, &gate, reply.worker_pid).await {
+        debug_live_probe_miss(&reason);
+        return;
+    }
+    let Some(value) = reply.value else {
+        debug_live_probe_miss("valid live response reported the directive unavailable");
+        return;
+    };
+
+    outcome.rows[pos].observed = Some(value);
+    outcome.rows[pos].observed_state = "live-observed".to_string();
+}
+
+async fn pre_live_probe_gate(state: &Arc<DaemonState>, key: &str) -> Result<FpmLiveGate, String> {
+    if !matches!(state.php_engine.fpm_ownership(), FpmOwnership::Unowned) {
+        return Err("external FPM ownership is not proven absent".to_string());
+    }
+    let launch = {
+        let supervisor = state.supervisor.lock().await;
+        supervisor.fpm_launch_snapshot()
+    }
+    .ok_or_else(|| "supervised FPM has no complete launch snapshot".to_string())?;
+    if !launch.running {
+        return Err("supervised FPM is not running".to_string());
+    }
+    hearth_lib::php::ini_guard::validate_key(key)
+        .map_err(|_| "live FPM key failed INI safety validation".to_string())?;
+
+    let (conf, conf_sha256, probe_sha256, listen) = hearth_launch_conf(&launch)?;
+    let gate = FpmLiveGate {
+        generation: launch.generation,
+        conf,
+        conf_sha256,
+        probe_sha256,
+        listen,
+        socket_identity: (0, 0),
+    };
+    require_current_conf(state.php_engine.config_dir(), &gate)?;
+    let applied_at =
+        hearth_lib::php::fpm::conf_applied_at_unix_ms(state.php_engine.config_dir())
+            .ok_or_else(|| "Hearth FPM manifest has no applied conf timestamp".to_string())?;
+    let started_at = unix_ms(launch.started_at)
+        .ok_or_else(|| "supervised FPM launch time is not representable".to_string())?;
+    if applied_at > started_at {
+        return Err("Hearth FPM conf was applied after this launch".to_string());
+    }
+    let socket_identity = owned_socket_identity(&gate.listen)?;
+    Ok(FpmLiveGate {
+        socket_identity,
+        ..gate
+    })
+}
+
+async fn post_live_probe_gate(
+    state: &Arc<DaemonState>,
+    gate: &FpmLiveGate,
+    worker_pid: i32,
+) -> Result<(), String> {
+    if !matches!(state.php_engine.fpm_ownership(), FpmOwnership::Unowned) {
+        return Err("external FPM ownership changed during the live probe".to_string());
+    }
+    let launch = {
+        let supervisor = state.supervisor.lock().await;
+        supervisor.fpm_launch_snapshot()
+    }
+    .ok_or_else(|| "supervised FPM launch disappeared during the live probe".to_string())?;
+    if !launch.running || launch.generation != gate.generation {
+        return Err("supervised FPM generation changed during the live probe".to_string());
+    }
+    let (conf, conf_sha256, probe_sha256, listen) = hearth_launch_conf(&launch)?;
+    if conf != gate.conf
+        || conf_sha256 != gate.conf_sha256
+        || probe_sha256 != gate.probe_sha256
+        || listen != gate.listen
+    {
+        return Err("supervised FPM launch provenance changed during the live probe".to_string());
+    }
+    require_current_conf(state.php_engine.config_dir(), gate)?;
+    if owned_socket_identity(&gate.listen)? != gate.socket_identity {
+        return Err("FPM listener socket changed during the live probe".to_string());
+    }
+    let group_id = launch
+        .group_id
+        .and_then(|id| i32::try_from(id).ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| "supervised FPM has no valid process-group identity".to_string())?;
+    let responder_group = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(worker_pid)))
+        .map_err(|error| format!("could not verify live FPM responder group: {error}"))?;
+    if responder_group.as_raw() != group_id {
+        return Err("live FPM responder is outside the supervised process group".to_string());
+    }
+    Ok(())
+}
+
+fn hearth_launch_conf(
+    launch: &FpmLaunchSnapshot,
+) -> Result<(std::path::PathBuf, String, String, std::path::PathBuf), String> {
+    match &launch.conf {
+        FpmLaunchConf::HearthOwned {
+            conf,
+            conf_sha256,
+            probe_sha256,
+            listen,
+        } => Ok((
+            conf.clone(),
+            conf_sha256.clone(),
+            probe_sha256.clone(),
+            listen.clone(),
+        )),
+        FpmLaunchConf::UserManaged { .. } => {
+            Err("supervised FPM was launched from user-managed config".to_string())
+        }
+    }
+}
+
+fn require_current_conf(config_dir: &std::path::Path, gate: &FpmLiveGate) -> Result<(), String> {
+    match hearth_lib::php::fpm::conf_state(config_dir) {
+        FpmConfState::HearthOwned {
+            conf,
+            conf_sha256,
+            probe_sha256,
+            listen,
+        } if conf == gate.conf
+            && conf_sha256 == gate.conf_sha256
+            && probe_sha256 == gate.probe_sha256
+            && listen == gate.listen =>
+        {
+            Ok(())
+        }
+        _ => Err("current FPM config does not match launch provenance".to_string()),
+    }
+}
+
+fn owned_socket_identity(path: &std::path::Path) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect FPM listener socket: {error}"))?;
+    if !metadata.file_type().is_socket() {
+        return Err("FPM listener path is not a Unix socket".to_string());
+    }
+    if metadata.uid() != nix::unistd::geteuid().as_raw() {
+        return Err("FPM listener socket is not owned by the current user".to_string());
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn debug_live_probe_miss(reason: &str) {
+    let bounded: String = reason.chars().take(240).collect();
+    tracing::debug!(reason = %bounded, "live FPM observation gate declined");
 }
 
 /// `pending restart` is truthful only with BOTH timestamps present and the
@@ -1015,7 +1221,16 @@ mod tests {
     fn write_spawnable(path: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::write(
+            path,
+            "#!/bin/sh\n\
+             if [ \"${1-}\" = \"-i\" ]; then\n\
+               printf 'Scan this dir for additional .ini files => %s\\nAdditional .ini files parsed => (none)\\nmemory_limit => 1G => 1G\\n' \"${PHP_INI_SCAN_DIR-}\"\n\
+               exit 0\n\
+             fi\n\
+             sleep 30\n",
+        )
+        .unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -1821,5 +2036,642 @@ mod tests {
 
         herd_live.store(false, Ordering::SeqCst);
         state.supervisor.lock().await.stop_all().unwrap();
+    }
+
+    enum FakeReplyControl {
+        Immediate,
+        Wait {
+            accepted: tokio::sync::oneshot::Sender<()>,
+            release: tokio::sync::oneshot::Receiver<()>,
+        },
+        ReplaceSocket,
+        Close,
+        Delay(Duration),
+    }
+
+    fn spawn_fake_fpm(
+        socket: &std::path::Path,
+        worker_pid: i32,
+        control: FakeReplyControl,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let _ = std::fs::remove_file(socket);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let socket = socket.to_path_buf();
+        let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_connects = Arc::clone(&connects);
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            task_connects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let params = read_fcgi_params(&mut stream).await.unwrap();
+            let mut replacement = None;
+            match control {
+                FakeReplyControl::Immediate => {}
+                FakeReplyControl::Wait { accepted, release } => {
+                    let _ = accepted.send(());
+                    let _ = release.await;
+                }
+                FakeReplyControl::ReplaceSocket => {
+                    drop(listener);
+                    std::fs::remove_file(&socket).unwrap();
+                    replacement = Some(tokio::net::UnixListener::bind(&socket).unwrap());
+                }
+                FakeReplyControl::Close => return,
+                FakeReplyControl::Delay(duration) => tokio::time::sleep(duration).await,
+            }
+            let nonce = params.get("HEARTH_PROBE_NONCE").unwrap();
+            let key = params.get("HEARTH_PROBE_KEY").unwrap();
+            let body = serde_json::json!({
+                "hearth_probe": 1,
+                "nonce": nonce,
+                "key": key,
+                "pid": worker_pid,
+                "available": true,
+                "value": "1G"
+            });
+            let stdout = format!(
+                "Content-Type: application/json\r\n\r\n{}",
+                serde_json::to_string(&body).unwrap()
+            );
+            if write_fcgi_record(&mut stream, 6, stdout.as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if write_fcgi_record(&mut stream, 6, &[]).await.is_err() {
+                return;
+            }
+            let _ = write_fcgi_record(&mut stream, 3, &[0; 8]).await;
+            drop(replacement);
+        });
+        (task, connects)
+    }
+
+    async fn read_fcgi_params(
+        stream: &mut tokio::net::UnixStream,
+    ) -> std::io::Result<std::collections::HashMap<String, String>> {
+        use tokio::io::AsyncReadExt;
+
+        let mut encoded = Vec::new();
+        loop {
+            let mut header = [0_u8; 8];
+            stream.read_exact(&mut header).await?;
+            let content_len = u16::from_be_bytes([header[4], header[5]]) as usize;
+            let padding_len = header[6] as usize;
+            let mut content = vec![0_u8; content_len];
+            stream.read_exact(&mut content).await?;
+            if padding_len != 0 {
+                let mut padding = vec![0_u8; padding_len];
+                stream.read_exact(&mut padding).await?;
+            }
+            if header[1] == 4 && !content.is_empty() {
+                encoded.extend_from_slice(&content);
+            }
+            if header[1] == 5 && content.is_empty() {
+                break;
+            }
+        }
+
+        let mut params = std::collections::HashMap::new();
+        let mut offset = 0;
+        while offset < encoded.len() {
+            let name_len = decode_fcgi_len(&encoded, &mut offset)?;
+            let value_len = decode_fcgi_len(&encoded, &mut offset)?;
+            if name_len + value_len > encoded.len().saturating_sub(offset) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "truncated FastCGI name/value pair",
+                ));
+            }
+            let name = String::from_utf8(encoded[offset..offset + name_len].to_vec())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            offset += name_len;
+            let value = String::from_utf8(encoded[offset..offset + value_len].to_vec())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            offset += value_len;
+            params.insert(name, value);
+        }
+        Ok(params)
+    }
+
+    fn decode_fcgi_len(bytes: &[u8], offset: &mut usize) -> std::io::Result<usize> {
+        let first = *bytes.get(*offset).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "missing FastCGI length")
+        })?;
+        *offset += 1;
+        if first & 0x80 == 0 {
+            return Ok(first as usize);
+        }
+        let tail = bytes.get(*offset..*offset + 3).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated FastCGI length")
+        })?;
+        *offset += 3;
+        Ok(u32::from_be_bytes([first & 0x7f, tail[0], tail[1], tail[2]]) as usize)
+    }
+
+    async fn write_fcgi_record(
+        stream: &mut tokio::net::UnixStream,
+        record_type: u8,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let len = u16::try_from(content.len()).unwrap();
+        let header = [1, record_type, 0, 1, (len >> 8) as u8, len as u8, 0, 0];
+        stream.write_all(&header).await?;
+        stream.write_all(content).await?;
+        stream.flush().await
+    }
+
+    async fn fpm_group(state: &Arc<DaemonState>) -> i32 {
+        state
+            .supervisor
+            .lock()
+            .await
+            .fpm_launch_snapshot()
+            .unwrap()
+            .group_id
+            .and_then(|pid| i32::try_from(pid).ok())
+            .unwrap()
+    }
+
+    async fn annotated_live_outcome(state: &Arc<DaemonState>, version: &str) -> PhpConfigOutcome {
+        let mut outcome = outcome_with(vec![launched_row(version)]);
+        annotate_fpm_runtime(state, &mut outcome).await;
+        annotate_fpm_live(state, &mut outcome, "memory_limit").await;
+        outcome
+    }
+
+    fn report(response: DaemonResponse) -> PhpConfigOutcome {
+        match response {
+            DaemonResponse::PhpConfigReport(outcome) => outcome,
+            other => panic!("expected PhpConfigReport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_status_upgrades_running_hearth_launched_fpm_to_live_observed() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = start_owned_fpm(&state).await;
+        let pid = fpm_group(&state).await;
+        let (server, connects) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+            pid,
+            FakeReplyControl::Immediate,
+        );
+        let outcome = report(
+            php_config(
+                &state,
+                PhpConfigAction::Status {
+                    key: Some("memory_limit".to_string()),
+                    token: Some("status-token".to_string()),
+                },
+            )
+            .await,
+        );
+        server.await.unwrap();
+        stop_fpm(&state).await;
+
+        let row = outcome
+            .rows
+            .iter()
+            .find(|row| row.sapi == "fpm" && row.context == "launched")
+            .unwrap_or_else(|| panic!("missing launched FPM row for {version}"));
+        assert_eq!(row.observed.as_deref(), Some("1G"));
+        assert_eq!(row.observed_state, "live-observed");
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn user_managed_launched_child_never_live_observed_even_after_adoption() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = state.config.lock().await.default_php.clone();
+        let config_dir = state.php_engine.config_dir();
+        let conf = hearth_lib::php::fpm::conf_path(config_dir);
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "; user managed\n").unwrap();
+        write_spawnable(&config_dir.join("php").join(&version).join("php-fpm"));
+        let service = hearth_lib::service::manager::hearth_fpm_service(&version, config_dir)
+            .expect("user-managed config remains launchable");
+        {
+            let mut supervisor = state.supervisor.lock().await;
+            supervisor.register(service).unwrap();
+            supervisor.start_service(ServiceKind::PhpFpm).unwrap();
+        }
+        std::fs::remove_file(&conf).unwrap();
+        assert!(matches!(
+            hearth_lib::php::fpm::materialize(config_dir, config_dir).state,
+            FpmConfState::HearthOwned { .. }
+        ));
+        let (server, connects) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(config_dir),
+            fpm_group(&state).await,
+            FakeReplyControl::Immediate,
+        );
+        let outcome = annotated_live_outcome(&state, &version).await;
+        server.abort();
+        stop_fpm(&state).await;
+
+        assert_eq!(outcome.rows[0].observed_state, "launch-probed");
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn conf_applied_after_launch_caps_at_launch_probed_plus_pending_restart() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = start_owned_fpm(&state).await;
+        std::thread::sleep(Duration::from_millis(3));
+        hearth_lib::php::fpm::unmanage_fpm(
+            state.php_engine.config_dir(),
+            state.php_engine.config_dir(),
+        )
+        .unwrap();
+        assert!(matches!(
+            hearth_lib::php::fpm::materialize(
+                state.php_engine.config_dir(),
+                state.php_engine.config_dir(),
+            )
+            .state,
+            FpmConfState::HearthOwned { .. }
+        ));
+        let (server, connects) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+            fpm_group(&state).await,
+            FakeReplyControl::Immediate,
+        );
+        let outcome = annotated_live_outcome(&state, &version).await;
+        server.abort();
+        stop_fpm(&state).await;
+
+        assert_eq!(outcome.rows[0].observed_state, "launch-probed");
+        assert!(outcome.rows[0].pending_restart);
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn generation_change_during_await_discards_response() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = start_owned_fpm(&state).await;
+        let old_generation = state
+            .supervisor
+            .lock()
+            .await
+            .fpm_launch_snapshot()
+            .unwrap()
+            .generation;
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (server, _) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+            fpm_group(&state).await,
+            FakeReplyControl::Wait {
+                accepted: accepted_tx,
+                release: release_rx,
+            },
+        );
+        let probe_state = Arc::clone(&state);
+        let probe_version = version.clone();
+        let probe =
+            tokio::spawn(async move { annotated_live_outcome(&probe_state, &probe_version).await });
+        accepted_rx.await.unwrap();
+        let restarted = state.supervisor.lock().await.restart_fpm_service();
+        assert!(matches!(
+            restarted,
+            hearth_lib::service::supervisor::FpmRestartTxOutcome::Restarted
+        ));
+        let new_generation = state
+            .supervisor
+            .lock()
+            .await
+            .fpm_launch_snapshot()
+            .unwrap()
+            .generation;
+        assert_ne!(old_generation, new_generation);
+        release_tx.send(()).unwrap();
+        let outcome = probe.await.unwrap();
+        server.await.unwrap();
+        stop_fpm(&state).await;
+        assert_eq!(outcome.rows[0].observed_state, "launch-probed");
+    }
+
+    #[tokio::test]
+    async fn crash_respawn_generation_invalidates_in_flight_probe() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = start_owned_fpm(&state).await;
+        let old = state.supervisor.lock().await.fpm_launch_snapshot().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (server, _) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+            i32::try_from(old.group_id.unwrap()).unwrap(),
+            FakeReplyControl::Wait {
+                accepted: accepted_tx,
+                release: release_rx,
+            },
+        );
+        let probe_state = Arc::clone(&state);
+        let probe_version = version.clone();
+        let probe =
+            tokio::spawn(async move { annotated_live_outcome(&probe_state, &probe_version).await });
+        accepted_rx.await.unwrap();
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(i32::try_from(old.group_id.unwrap()).unwrap()),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        let mut new_generation = old.generation;
+        for _ in 0..30 {
+            {
+                let mut supervisor = state.supervisor.lock().await;
+                supervisor.health_check();
+                if let Some(snapshot) = supervisor.fpm_launch_snapshot() {
+                    new_generation = snapshot.generation;
+                }
+            }
+            if new_generation != old.generation {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_ne!(old.generation, new_generation, "health tick must respawn");
+        release_tx.send(()).unwrap();
+        let outcome = probe.await.unwrap();
+        server.await.unwrap();
+        stop_fpm(&state).await;
+        assert_eq!(outcome.rows[0].observed_state, "launch-probed");
+    }
+
+    #[tokio::test]
+    async fn ownership_flip_or_stop_during_await_discards_response() {
+        let (_tmp, _config_path, state, owned) = state_fixture_with_herd_flag();
+        let version = start_owned_fpm(&state).await;
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (server, _) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+            fpm_group(&state).await,
+            FakeReplyControl::Wait {
+                accepted: accepted_tx,
+                release: release_rx,
+            },
+        );
+        let probe_state = Arc::clone(&state);
+        let probe_version = version.clone();
+        let probe =
+            tokio::spawn(async move { annotated_live_outcome(&probe_state, &probe_version).await });
+        accepted_rx.await.unwrap();
+        owned.store(true, std::sync::atomic::Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        let outcome = probe.await.unwrap();
+        server.await.unwrap();
+        owned.store(false, std::sync::atomic::Ordering::SeqCst);
+        stop_fpm(&state).await;
+        assert_eq!(outcome.rows[0].observed_state, "launch-probed");
+
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = start_owned_fpm(&state).await;
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (server, _) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+            fpm_group(&state).await,
+            FakeReplyControl::Wait {
+                accepted: accepted_tx,
+                release: release_rx,
+            },
+        );
+        let probe_state = Arc::clone(&state);
+        let probe =
+            tokio::spawn(async move { annotated_live_outcome(&probe_state, &version).await });
+        accepted_rx.await.unwrap();
+        stop_fpm(&state).await;
+        release_tx.send(()).unwrap();
+        let outcome = probe.await.unwrap();
+        server.await.unwrap();
+        assert_eq!(outcome.rows[0].observed_state, "launch-probed");
+    }
+
+    #[tokio::test]
+    async fn socket_replacement_during_await_discards_response() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = start_owned_fpm(&state).await;
+        let (server, _) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+            fpm_group(&state).await,
+            FakeReplyControl::ReplaceSocket,
+        );
+        let outcome = annotated_live_outcome(&state, &version).await;
+        server.await.unwrap();
+        stop_fpm(&state).await;
+        assert_eq!(outcome.rows[0].observed_state, "launch-probed");
+    }
+
+    #[tokio::test]
+    async fn wrong_or_foreign_responder_pid_discards_response() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = start_owned_fpm(&state).await;
+        let (server, _) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+            i32::try_from(std::process::id()).unwrap(),
+            FakeReplyControl::Immediate,
+        );
+        let outcome = annotated_live_outcome(&state, &version).await;
+        server.await.unwrap();
+        stop_fpm(&state).await;
+        assert_eq!(outcome.rows[0].observed_state, "launch-probed");
+    }
+
+    #[tokio::test]
+    async fn stopped_or_unregistered_fpm_never_live_probed_zero_connect() {
+        for registered in [false, true] {
+            let (_tmp, _config_path, state) = state_fixture();
+            let version = state.config.lock().await.default_php.clone();
+            let config_dir = state.php_engine.config_dir();
+            assert!(matches!(
+                hearth_lib::php::fpm::materialize(config_dir, config_dir).state,
+                FpmConfState::HearthOwned { .. }
+            ));
+            write_spawnable(&config_dir.join("php").join(&version).join("php-fpm"));
+            if registered {
+                let service =
+                    hearth_lib::service::manager::hearth_fpm_service(&version, config_dir).unwrap();
+                state.supervisor.lock().await.register(service).unwrap();
+            }
+            let (server, connects) = spawn_fake_fpm(
+                &hearth_lib::php::fpm::socket_path(config_dir),
+                i32::try_from(std::process::id()).unwrap(),
+                FakeReplyControl::Immediate,
+            );
+            let outcome = annotated_live_outcome(&state, &version).await;
+            server.abort();
+            assert_eq!(outcome.rows[0].observed_state, "launch-probed");
+            assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_and_unknown_ownership_never_live_probed() {
+        for final_state in [1_u8, 2_u8] {
+            let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+            let probe_mode = Arc::clone(&mode);
+            let (_tmp, _config_path, state) = state_fixture_with_probe(Arc::new(move || {
+                match probe_mode.load(std::sync::atomic::Ordering::SeqCst) {
+                    0 => FpmOwnership::Unowned,
+                    1 => FpmOwnership::Owned,
+                    _ => FpmOwnership::Unknown("injected ownership uncertainty".to_string()),
+                }
+            }));
+            let version = start_owned_fpm(&state).await;
+            mode.store(final_state, std::sync::atomic::Ordering::SeqCst);
+            let (server, connects) = spawn_fake_fpm(
+                &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+                fpm_group(&state).await,
+                FakeReplyControl::Immediate,
+            );
+            let outcome = annotated_live_outcome(&state, &version).await;
+            server.abort();
+            mode.store(0, std::sync::atomic::Ordering::SeqCst);
+            stop_fpm(&state).await;
+            assert_eq!(outcome.rows[0].observed_state, "launch-probed");
+            assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_probe_failure_leaves_launch_probed_row_and_exit_zero() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = start_owned_fpm(&state).await;
+        let (server, connects) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+            fpm_group(&state).await,
+            FakeReplyControl::Close,
+        );
+        let outcome = annotated_live_outcome(&state, &version).await;
+        server.await.unwrap();
+        stop_fpm(&state).await;
+        let outcome = report(DaemonResponse::PhpConfigReport(outcome));
+        assert_eq!(outcome.rows[0].observed_state, "launch-probed");
+        assert!(
+            outcome.hard_failures().is_empty(),
+            "probe miss stays exit-zero"
+        );
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn live_observed_row_passes_key_and_token_certification() {
+        let (_tmp, _config_path, state) = state_fixture();
+        start_owned_fpm(&state).await;
+        let (server, _) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+            fpm_group(&state).await,
+            FakeReplyControl::Immediate,
+        );
+        let outcome = report(
+            php_config(
+                &state,
+                PhpConfigAction::Status {
+                    key: Some("memory_limit".to_string()),
+                    token: Some("exact-correlation-token".to_string()),
+                },
+            )
+            .await,
+        );
+        server.await.unwrap();
+        stop_fpm(&state).await;
+        assert_eq!(outcome.status_key.as_deref(), Some("memory_limit"));
+        assert_eq!(
+            outcome.status_token.as_deref(),
+            Some("exact-correlation-token")
+        );
+        assert!(
+            outcome
+                .rows
+                .iter()
+                .any(|row| { row.context == "launched" && row.observed_state == "live-observed" })
+        );
+    }
+
+    #[tokio::test]
+    async fn row_and_certification_exact_under_concurrent_set_sync_switch_and_probe_timeout() {
+        let (_tmp, _config_path, state) = state_fixture();
+        start_owned_fpm(&state).await;
+        let (server, connects) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+            fpm_group(&state).await,
+            FakeReplyControl::Delay(Duration::from_millis(150)),
+        );
+        let request_state = Arc::clone(&state);
+        let request = tokio::spawn(async move {
+            php_config(
+                &request_state,
+                PhpConfigAction::Status {
+                    key: Some("memory_limit".to_string()),
+                    token: Some("concurrent-token".to_string()),
+                },
+            )
+            .await
+        });
+        while connects.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        state
+            .php_engine
+            .apply(PhpConfigAction::Set {
+                scope: PhpScope::Global,
+                key: "memory_limit".to_string(),
+                value: "2G".to_string(),
+            })
+            .await
+            .unwrap();
+        state.php_engine.apply(PhpConfigAction::Sync).await.unwrap();
+        let _ = state.supervisor.lock().await.restart_fpm_service();
+        let outcome = report(request.await.unwrap());
+        server.await.unwrap();
+        stop_fpm(&state).await;
+
+        assert_eq!(outcome.status_key.as_deref(), Some("memory_limit"));
+        assert_eq!(outcome.status_token.as_deref(), Some("concurrent-token"));
+        let row = outcome
+            .rows
+            .iter()
+            .find(|row| row.sapi == "fpm" && row.context == "launched")
+            .unwrap();
+        assert_ne!(row.observed_state, "live-observed");
+        assert!(!row.pending_restart || row.run_state.as_deref() == Some("running"));
+    }
+
+    #[tokio::test]
+    async fn live_observed_vocabulary_requires_all_gates_and_never_file_parse() {
+        let (_tmp, _config_path, state) = state_fixture();
+        let version = start_owned_fpm(&state).await;
+        let mut file_row = launched_row(&version);
+        file_row.context = "normal".to_string();
+        file_row.observed_state = "materialized".to_string();
+        let mut outcome = outcome_with(vec![file_row, launched_row(&version)]);
+        annotate_fpm_runtime(&state, &mut outcome).await;
+        let (server, _) = spawn_fake_fpm(
+            &hearth_lib::php::fpm::socket_path(state.php_engine.config_dir()),
+            fpm_group(&state).await,
+            FakeReplyControl::Immediate,
+        );
+        annotate_fpm_live(&state, &mut outcome, "memory_limit").await;
+        server.await.unwrap();
+        stop_fpm(&state).await;
+
+        assert_eq!(outcome.rows[0].observed_state, "materialized");
+        assert_eq!(outcome.rows[1].observed_state, "live-observed");
+        assert_eq!(
+            outcome
+                .rows
+                .iter()
+                .filter(|row| row.observed_state == "live-observed")
+                .count(),
+            1
+        );
     }
 }
