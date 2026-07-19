@@ -110,6 +110,8 @@ async fn request_inner(
     let mut total_inbound = 0_usize;
     let mut stdout = Vec::new();
     let mut stdout_terminated = false;
+    let mut stdout_records = 0_usize;
+    let mut saw_nonempty_stdout = false;
     let mut stderr_len = 0_usize;
     let mut stderr_excerpt = Vec::new();
     let mut stderr_terminated = false;
@@ -121,12 +123,14 @@ async fn request_inner(
 
         match record.record_type {
             FCGI_STDOUT => {
+                stdout_records = stdout_records.saturating_add(1);
                 if stdout_terminated {
                     return Err("FastCGI rejection: STDOUT record after terminator".to_string());
                 }
                 if record.content.is_empty() {
                     stdout_terminated = true;
                 } else {
+                    saw_nonempty_stdout = true;
                     stdout.extend_from_slice(&record.content);
                 }
             }
@@ -147,11 +151,6 @@ async fn request_inner(
             }
             FCGI_END_REQUEST => {
                 validate_end_request(&record.content)?;
-                if !stdout_terminated {
-                    return Err(
-                        "FastCGI rejection: END_REQUEST before empty STDOUT terminator".to_string(),
-                    );
-                }
                 break;
             }
             _ => unreachable!("record type was validated while reading"),
@@ -164,6 +163,12 @@ async fn request_inner(
         return Err(format!(
             "FastCGI rejection: non-empty STDERR ({stderr_len} bytes): {}",
             sanitize_excerpt(&stderr_excerpt)
+        ));
+    }
+    if !stdout_terminated && !saw_nonempty_stdout {
+        return Err(format!(
+            "FastCGI rejection: END_REQUEST before any nonempty STDOUT or explicit empty terminator ({} bytes in {stdout_records} records)",
+            stdout.len()
         ));
     }
 
@@ -642,9 +647,76 @@ mod tests {
         trailing.push(0xff);
         assert_rejected(trailing, "after END_REQUEST").await;
 
-        let mut no_stdout_end = record(6, 1, b"Content-Type: text/plain\r\n\r\nok", 0);
-        no_stdout_end.extend(end_request(0, 0));
-        assert_rejected(no_stdout_end, "before empty STDOUT terminator").await;
+        assert_rejected(
+            end_request(0, 0),
+            "before any nonempty STDOUT or explicit empty terminator",
+        )
+        .await;
+
+        let mut only_empty_stdout = record(6, 1, b"", 0);
+        only_empty_stdout.extend(end_request(0, 0));
+        assert_rejected(only_empty_stdout, "lacks CRLFCRLF").await;
+    }
+
+    #[tokio::test]
+    async fn php_fpm_implicit_stdout_termination_is_accepted_only_after_nonempty_output() {
+        let mut response = record(
+            6,
+            1,
+            b"Content-Type: text/plain\r\nStatus: 200 OK\r\n\r\nphp-fpm",
+            0,
+        );
+        response.extend(end_request(0, 0));
+
+        let result = scripted_request(response, &[]).await.unwrap();
+        assert_eq!(result.body, b"php-fpm");
+        assert_eq!(result.stderr_len, 0);
+    }
+
+    #[tokio::test]
+    async fn implicit_termination_rejects_stderr_status_cgi_and_post_end_violations() {
+        let mut stderr = record(6, 1, b"Content-Type: text/plain\r\n\r\nok", 0);
+        stderr.extend(record(7, 1, b"worker warning", 0));
+        stderr.extend(end_request(0, 0));
+        assert_rejected(stderr, "non-empty STDERR").await;
+
+        let mut bad_end = record(6, 1, b"Content-Type: text/plain\r\n\r\nok", 0);
+        bad_end.extend(end_request(37, 0));
+        assert_rejected(bad_end, "appStatus is 37").await;
+
+        let mut bad_status = record(6, 1, b"Status: 500 Failed\r\n\r\nno", 0);
+        bad_status.extend(end_request(0, 0));
+        assert_rejected(bad_status, "not successful").await;
+
+        let mut malformed = record(6, 1, b"Missing-colon\r\n\r\nno", 0);
+        malformed.extend(end_request(0, 0));
+        assert_rejected(malformed, "without colon").await;
+
+        let mut post_end = record(6, 1, b"Content-Type: text/plain\r\n\r\nok", 0);
+        post_end.extend(end_request(0, 0));
+        post_end.push(0xff);
+        assert_rejected(post_end, "after END_REQUEST").await;
+    }
+
+    #[tokio::test]
+    async fn implicit_termination_requires_clean_eof_within_whole_timeout() {
+        let fixture = tempfile::tempdir_in("/private/tmp").unwrap();
+        let socket = fixture.path().join("f.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut stream).await;
+            let mut response = record(6, 1, b"Content-Type: text/plain\r\n\r\nok", 0);
+            response.extend(end_request(0, 0));
+            stream.write_all(&response).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        });
+
+        let error = request(&socket, &[], Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(error.contains("clean EOF after END_REQUEST"), "{error}");
+        server.await.unwrap();
     }
 
     #[tokio::test]
