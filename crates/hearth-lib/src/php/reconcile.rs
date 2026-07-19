@@ -8,12 +8,18 @@
 //! a collision and is refused, never adopted.
 
 use crate::config::{HearthConfig, PhpIniSettings};
-use crate::php::targets::{PhpProvider, PhpTarget, ProviderRoots, verify_user_channel};
+use crate::php::targets::{
+    PhpProvider, PhpTarget, ProviderRoots, ensure_hearth_channel_dir, verify_user_channel,
+};
+use nix::fcntl::{OFlag, openat};
+use nix::sys::stat::Mode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -252,6 +258,69 @@ pub struct RecoveryAction {
 #[derive(Debug)]
 pub(crate) struct ManifestLock {
     file: File,
+    directory: GuardedManifestDir,
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(Debug)]
+struct GuardedManifestDir {
+    file: File,
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl GuardedManifestDir {
+    fn verify_identity(&self) -> Result<(), LockError> {
+        let path_metadata = std::fs::symlink_metadata(&self.path)
+            .map_err(|error| LockError::Io(error.to_string()))?;
+        let fd_metadata = self
+            .file
+            .metadata()
+            .map_err(|error| LockError::Io(error.to_string()))?;
+        if path_metadata.file_type().is_symlink()
+            || !path_metadata.file_type().is_dir()
+            || path_metadata.dev() != self.dev
+            || path_metadata.ino() != self.ino
+            || fd_metadata.dev() != self.dev
+            || fd_metadata.ino() != self.ino
+        {
+            return Err(LockError::Io(format!(
+                "guarded manifest directory {} was replaced",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl ManifestLock {
+    fn verify_identity(&self) -> Result<(), LockError> {
+        self.directory.verify_identity()?;
+        let path_metadata = std::fs::symlink_metadata(&self.path)
+            .map_err(|error| LockError::Io(error.to_string()))?;
+        let fd_metadata = self
+            .file
+            .metadata()
+            .map_err(|error| LockError::Io(error.to_string()))?;
+        if path_metadata.file_type().is_symlink()
+            || !path_metadata.file_type().is_file()
+            || path_metadata.dev() != self.dev
+            || path_metadata.ino() != self.ino
+            || fd_metadata.dev() != self.dev
+            || fd_metadata.ino() != self.ino
+            || fd_metadata.nlink() != 1
+            || fd_metadata.len() != 0
+        {
+            return Err(LockError::Io(format!(
+                "manifest lock {} has unsafe or replaced identity",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -283,25 +352,112 @@ impl fmt::Display for LockError {
 impl std::error::Error for LockError {}
 
 pub(crate) fn acquire_manifest_lock(
+    hearth_root: &Path,
     manifest_dir: &Path,
     wait: Duration,
 ) -> Result<ManifestLock, LockError> {
-    use std::os::unix::fs::OpenOptionsExt;
+    let verified = ensure_hearth_channel_dir(hearth_root, manifest_dir)
+        .map_err(|error| LockError::Io(error.to_string()))?;
+    let directory_file =
+        File::open(&verified.path).map_err(|error| LockError::Io(error.to_string()))?;
+    let directory = GuardedManifestDir {
+        file: directory_file,
+        path: verified.path,
+        dev: verified.dev,
+        ino: verified.ino,
+    };
+    directory.verify_identity()?;
 
-    std::fs::create_dir_all(manifest_dir).map_err(|e| LockError::Io(e.to_string()))?;
-    let lock_path = manifest_dir.join(".manifest.lock");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&lock_path)
-        .map_err(|e| LockError::Io(e.to_string()))?;
+    let lock_path = directory.path.join(".manifest.lock");
+    if let Ok(metadata) = std::fs::symlink_metadata(&lock_path)
+        && (metadata.file_type().is_symlink()
+            || !metadata.file_type().is_file()
+            || metadata.nlink() != 1)
+    {
+        return Err(LockError::Io(format!(
+            "manifest lock {} must be a single-link regular file",
+            lock_path.display()
+        )));
+    }
+    let existed = std::fs::symlink_metadata(&lock_path).is_ok();
+    let raw_fd = openat(
+        Some(directory.file.as_raw_fd()),
+        Path::new(".manifest.lock"),
+        OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_RDWR,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| LockError::Io(error.to_string()))?;
+    // SAFETY: `openat` returned a new owned descriptor on success.
+    let file = unsafe { File::from_raw_fd(raw_fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|error| LockError::Io(error.to_string()))?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.len() != 0
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+    {
+        return Err(LockError::Io(format!(
+            "manifest lock {} must be an owned, zero-byte, single-link regular file",
+            lock_path.display()
+        )));
+    }
+    let lock_dev = metadata.dev();
+    let lock_ino = metadata.ino();
+    let provisional = ManifestLock {
+        file,
+        directory,
+        path: lock_path,
+        dev: lock_dev,
+        ino: lock_ino,
+    };
+    provisional.verify_identity()?;
     let started = Instant::now();
     loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(ManifestLock { file }),
+        match provisional.file.try_lock() {
+            Ok(()) => {
+                provisional.verify_identity()?;
+                let mode = provisional
+                    .file
+                    .metadata()
+                    .map_err(|error| LockError::Io(error.to_string()))?
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                if mode != 0o600 {
+                    provisional
+                        .file
+                        .set_permissions(std::fs::Permissions::from_mode(0o600))
+                        .map_err(|error| LockError::Io(error.to_string()))?;
+                }
+                provisional
+                    .file
+                    .sync_all()
+                    .map_err(|error| LockError::Io(error.to_string()))?;
+                if !existed {
+                    provisional
+                        .directory
+                        .file
+                        .sync_all()
+                        .map_err(|error| LockError::Io(error.to_string()))?;
+                }
+                provisional.verify_identity()?;
+                let effective_mode = provisional
+                    .file
+                    .metadata()
+                    .map_err(|error| LockError::Io(error.to_string()))?
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                if effective_mode != 0o600 {
+                    return Err(LockError::Io(format!(
+                        "manifest lock {} mode is {:04o}, expected 0600",
+                        provisional.path.display(),
+                        effective_mode
+                    )));
+                }
+                return Ok(provisional);
+            }
             Err(std::fs::TryLockError::WouldBlock) => {
                 if started.elapsed() >= wait {
                     return Err(LockError::Busy {
@@ -603,6 +759,7 @@ impl ManifestTxn<'_> {
 }
 
 pub(crate) fn manifest_set_transaction<T>(
+    hearth_root: &Path,
     manifest_dir: &Path,
     manifest_path: &Path,
     lock_wait: Duration,
@@ -610,11 +767,15 @@ pub(crate) fn manifest_set_transaction<T>(
     finalize: FinalizeMode,
     body: impl FnOnce(&mut ManifestTxn<'_>) -> T,
 ) -> Result<T, TxnError> {
-    let lock = acquire_manifest_lock(manifest_dir, lock_wait).map_err(TxnError::Lock)?;
+    let lock =
+        acquire_manifest_lock(hearth_root, manifest_dir, lock_wait).map_err(TxnError::Lock)?;
     let _lock_file = &lock.file;
+    lock.verify_identity().map_err(TxnError::Lock)?;
     let mut manifest = loader(manifest_path).map_err(TxnError::Load)?;
+    lock.verify_identity().map_err(TxnError::Lock)?;
     let recovery_actions = recover_pending_manifest(&mut manifest, manifest_path)
         .map_err(|error| TxnError::Recovery(error.to_string()))?;
+    lock.verify_identity().map_err(TxnError::Lock)?;
     let mut txn = ManifestTxn {
         manifest: &mut manifest,
         manifest_path,
@@ -623,7 +784,9 @@ pub(crate) fn manifest_set_transaction<T>(
         recovery_actions: Some(recovery_actions),
     };
     let output = body(&mut txn);
+    lock.verify_identity().map_err(TxnError::Lock)?;
     txn.finish().map_err(TxnError::Finalize)?;
+    lock.verify_identity().map_err(TxnError::Lock)?;
     Ok(output)
 }
 
@@ -724,9 +887,13 @@ fn txn_test_pause(_manifest_path: &Path, _stage: &str) {}
 
 /// Resolve every pending journal entry deterministically. Idempotent; called
 /// on daemon boot (before any reconcile) and before unmanage.
-pub fn recover_pending(manifest_path: &Path) -> anyhow::Result<Vec<RecoveryAction>> {
+pub fn recover_pending(
+    manifest_path: &Path,
+    hearth_root: &Path,
+) -> anyhow::Result<Vec<RecoveryAction>> {
     let manifest_dir = manifest_path.parent().unwrap_or(Path::new("."));
     manifest_set_transaction(
+        hearth_root,
         manifest_dir,
         manifest_path,
         DEFAULT_MANIFEST_LOCK_WAIT,
@@ -826,6 +993,7 @@ pub fn reconcile(
 ) -> ReconcileReport {
     let manifest_dir = manifest_path.parent().unwrap_or(Path::new("."));
     match manifest_set_transaction(
+        &roots.hearth,
         manifest_dir,
         manifest_path,
         DEFAULT_MANIFEST_LOCK_WAIT,
@@ -924,9 +1092,10 @@ pub fn reconcile(
 
 /// Remove every Hearth-written channel file (journal-resolved, exact-hash
 /// deletions only). Hash-mismatched survivors are reported Refused.
-pub fn unmanage(manifest_path: &Path) -> anyhow::Result<Vec<FileAction>> {
+pub fn unmanage(manifest_path: &Path, hearth_root: &Path) -> anyhow::Result<Vec<FileAction>> {
     let manifest_dir = manifest_path.parent().unwrap_or(Path::new("."));
     manifest_set_transaction(
+        hearth_root,
         manifest_dir,
         manifest_path,
         DEFAULT_MANIFEST_LOCK_WAIT,
@@ -1094,7 +1263,7 @@ mod tests {
         expected_channel_dir,
     };
     use std::collections::BTreeMap;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     fn canon_tmp() -> (tempfile::TempDir, PathBuf) {
@@ -1104,13 +1273,15 @@ mod tests {
     }
 
     fn test_roots(base: &Path) -> ProviderRoots {
-        ProviderRoots::isolated(
+        let roots = ProviderRoots::isolated(
             base,
             base.join("hearth"),
             base.join("Herd"),
             base.join("homebrew"),
         )
-        .unwrap()
+        .unwrap();
+        std::fs::create_dir_all(&roots.hearth).unwrap();
+        roots
     }
 
     fn verified_target(
@@ -1385,7 +1556,7 @@ mod tests {
         let manifest_path = base.join("manifest.toml");
         pending_manifest(&manifest_path, &file, None, Some(&desired_sha));
 
-        let actions = recover_pending(&manifest_path).unwrap();
+        let actions = recover_pending(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0].outcome, RecoveryOutcome::Finalized));
 
@@ -1410,7 +1581,7 @@ mod tests {
         let manifest_path = base.join("manifest.toml");
         pending_manifest(&manifest_path, &file, Some(&old_sha), Some(&desired_sha));
 
-        let actions = recover_pending(&manifest_path).unwrap();
+        let actions = recover_pending(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         assert!(matches!(actions[0].outcome, RecoveryOutcome::Retry));
         let manifest = Manifest::load(&manifest_path).unwrap();
         assert_eq!(
@@ -1437,7 +1608,7 @@ mod tests {
             Some(&sha256_hex(b"new")),
         );
 
-        let actions = recover_pending(&manifest_path).unwrap();
+        let actions = recover_pending(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         assert!(matches!(
             actions[0].outcome,
             RecoveryOutcome::Refused { .. }
@@ -1687,7 +1858,7 @@ mod tests {
 
         // The durable pending journal must remain recoverable: with the
         // failpoint cleared, recovery finalizes from the on-disk state.
-        let actions = recover_pending(&manifest_path).unwrap();
+        let actions = recover_pending(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         assert!(matches!(actions[0].outcome, RecoveryOutcome::Finalized));
         let manifest = Manifest::load(&manifest_path).unwrap();
         assert_eq!(manifest.files[0].state, EntryState::Applied);
@@ -1778,7 +1949,7 @@ mod tests {
         );
 
         // Recovery (barrier restored) resolves the journaled delete.
-        recover_pending(&manifest_path).unwrap();
+        recover_pending(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         assert!(
             Manifest::load(&manifest_path).unwrap().files.is_empty(),
             "recovery finalizes the durable delete"
@@ -1807,7 +1978,7 @@ mod tests {
 
         barriers::reset();
         let failpoint = barriers::fail_sync_of(&dir);
-        let actions = unmanage(&manifest_path).unwrap();
+        let actions = unmanage(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         drop(failpoint);
 
         assert!(
@@ -2189,7 +2360,7 @@ mod tests {
         );
 
         let failpoint = barriers::fail_sync_of(&manifest_dir);
-        let result = unmanage(&manifest_path);
+        let result = unmanage(&manifest_path, manifest_path.parent().unwrap());
         drop(failpoint);
         assert!(
             result.is_err(),
@@ -2197,7 +2368,7 @@ mod tests {
         );
 
         // Clean retry converges (files already durably removed).
-        assert!(unmanage(&manifest_path).is_ok());
+        assert!(unmanage(&manifest_path, manifest_path.parent().unwrap()).is_ok());
         assert!(Manifest::load(&manifest_path).unwrap().files.is_empty());
     }
 
@@ -2216,7 +2387,7 @@ mod tests {
         pending_manifest(&manifest_path, &file, None, Some(&desired_sha));
 
         let failpoint = barriers::fail_sync_of(&manifest_dir);
-        let result = recover_pending(&manifest_path);
+        let result = recover_pending(&manifest_path, manifest_path.parent().unwrap());
         drop(failpoint);
         assert!(
             result.is_err(),
@@ -2225,7 +2396,7 @@ mod tests {
 
         // Clean retry converges: disk exposes pending (rename not landed —
         // recovery finalizes) or applied (rename landed — nothing pending).
-        let actions = recover_pending(&manifest_path).unwrap();
+        let actions = recover_pending(&manifest_path, manifest_path.parent().unwrap()).unwrap();
         assert!(
             actions.is_empty() || matches!(actions[0].outcome, RecoveryOutcome::Finalized),
             "{actions:?}"
@@ -2436,7 +2607,7 @@ mod tests {
         // Modified (no longer hash-matching) tracked file must survive.
         std::fs::write(&tracked, "user edited this\n").unwrap();
 
-        let actions = unmanage(&manifest_path).unwrap();
+        let actions = unmanage(&manifest_path, manifest_path.parent().unwrap()).unwrap();
 
         assert!(!pending_file.exists(), "journal-resolved file removed");
         assert!(tracked.exists(), "hash-mismatched file survives");
@@ -2482,7 +2653,7 @@ mod tests {
         let (_tmp, base) = canon_tmp();
         let roots = test_roots(&base);
         let dir = expected_channel_dir(PhpProvider::Hearth, "8.4", &roots);
-        let manifest_path = base.join("manifest-outside-hearth/manifest.toml");
+        let manifest_path = roots.hearth.join("manifest-store/manifest.toml");
         let ini = simple_ini("8.4", "memory_limit", "2G");
         let target = verified_target(PhpProvider::Hearth, "8.4", PhpSapi::Cli, &dir);
 
@@ -2565,6 +2736,7 @@ mod tests {
 
         let outcome = manifest_set_transaction(
             &manifest_dir,
+            &manifest_dir,
             &manifest_path,
             std::time::Duration::from_secs(1),
             |path| Manifest::load(path).map_err(|error| error.to_string()),
@@ -2584,6 +2756,7 @@ mod tests {
         std::fs::write(&artifact, "tampered\n").unwrap();
         let refused = manifest_set_transaction(
             &manifest_dir,
+            &manifest_dir,
             &manifest_path,
             std::time::Duration::from_secs(1),
             |path| Manifest::load(path).map_err(|error| error.to_string()),
@@ -2601,7 +2774,11 @@ mod tests {
             return;
         };
         let expect_busy = std::env::var_os("HEARTH_MANIFEST_LOCK_EXPECT_BUSY").is_some();
-        let result = acquire_manifest_lock(Path::new(&dir), std::time::Duration::from_millis(100));
+        let result = acquire_manifest_lock(
+            Path::new(&dir),
+            Path::new(&dir),
+            std::time::Duration::from_millis(100),
+        );
         if expect_busy {
             assert!(matches!(result, Err(LockError::Busy { .. })));
         } else {
@@ -2636,8 +2813,12 @@ mod tests {
         let (_tmp, base) = canon_tmp();
         let manifest_dir = base.join("locked");
         std::fs::create_dir_all(&manifest_dir).unwrap();
-        let first =
-            acquire_manifest_lock(&manifest_dir, std::time::Duration::from_secs(1)).unwrap();
+        let first = acquire_manifest_lock(
+            &manifest_dir,
+            &manifest_dir,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
         run_lock_child(&manifest_dir, true);
         drop(first);
         run_lock_child(&manifest_dir, false);
@@ -2649,6 +2830,80 @@ mod tests {
             std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn manifest_lock_rejects_ambiguous_identity_and_enforces_zero_byte_mode() {
+        let (_tmp, base) = canon_tmp();
+        let manifest_dir = base.join("locked");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        let lock_path = manifest_dir.join(".manifest.lock");
+        let sentinel = base.join("outside-sentinel");
+        std::fs::write(&sentinel, b"outside-bytes").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let sentinel_before = std::fs::metadata(&sentinel).unwrap();
+
+        std::os::unix::fs::symlink(&sentinel, &lock_path).unwrap();
+        assert!(acquire_manifest_lock(&base, &manifest_dir, Duration::ZERO).is_err());
+        std::fs::remove_file(&lock_path).unwrap();
+
+        std::fs::create_dir(&lock_path).unwrap();
+        assert!(acquire_manifest_lock(&base, &manifest_dir, Duration::ZERO).is_err());
+        std::fs::remove_dir(&lock_path).unwrap();
+
+        std::fs::hard_link(&sentinel, &lock_path).unwrap();
+        assert!(acquire_manifest_lock(&base, &manifest_dir, Duration::ZERO).is_err());
+        std::fs::remove_file(&lock_path).unwrap();
+
+        std::fs::write(&lock_path, []).unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let lock = acquire_manifest_lock(&base, &manifest_dir, Duration::ZERO).unwrap();
+        assert_eq!(
+            lock.file.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(lock);
+        std::fs::remove_file(&lock_path).unwrap();
+
+        std::fs::write(&lock_path, b"must-not-truncate").unwrap();
+        assert!(acquire_manifest_lock(&base, &manifest_dir, Duration::ZERO).is_err());
+        assert_eq!(std::fs::read(&lock_path).unwrap(), b"must-not-truncate");
+
+        let sentinel_after = std::fs::metadata(&sentinel).unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside-bytes");
+        assert_eq!(sentinel_after.ino(), sentinel_before.ino());
+        assert_eq!(sentinel_after.permissions().mode() & 0o777, 0o640);
+    }
+
+    #[test]
+    fn ini_recovery_and_reconcile_reject_symlinked_manifest_dir_zero_outside_mutation() {
+        let (_tmp, base) = canon_tmp();
+        let roots = test_roots(&base);
+        std::fs::create_dir_all(&roots.hearth).unwrap();
+        let outside = base.join("outside-ini");
+        std::fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        std::fs::write(&sentinel, b"outside-ini-bytes").unwrap();
+        let sentinel_before = std::fs::metadata(&sentinel).unwrap();
+        std::os::unix::fs::symlink(&outside, roots.hearth.join("php")).unwrap();
+        let manifest_path = roots.hearth.join("php/manifest.toml");
+
+        let recovery = recover_pending(&manifest_path, &roots.hearth);
+        assert!(recovery.is_err());
+        let report = reconcile(&PhpIniSettings::default(), &[], &manifest_path, &roots);
+        assert!(matches!(
+            report.files.as_slice(),
+            [FileAction {
+                outcome: WriteOutcome::Failed { .. },
+                ..
+            }]
+        ));
+
+        let sentinel_after = std::fs::metadata(&sentinel).unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside-ini-bytes");
+        assert_eq!(sentinel_after.ino(), sentinel_before.ino());
+        assert!(!outside.join(".manifest.lock").exists());
+        assert!(!outside.join("manifest.toml").exists());
     }
 
     fn wait_for_file(path: &Path) {
@@ -2708,7 +2963,7 @@ mod tests {
     fn finalize_mode_save_always_preserves_empty_ini_manifest() {
         let (_tmp, base) = canon_tmp();
         let manifest_path = base.join("php/manifest.toml");
-        let actions = unmanage(&manifest_path).unwrap();
+        let actions = unmanage(&manifest_path, &base).unwrap();
         assert!(actions.is_empty());
         assert!(manifest_path.is_file());
         assert!(Manifest::load(&manifest_path).unwrap().files.is_empty());

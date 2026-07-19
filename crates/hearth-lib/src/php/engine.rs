@@ -302,10 +302,13 @@ impl PhpConfigEngine {
         &self,
         materialize_static_fpm: bool,
     ) -> Result<PhpConfigOutcome, String> {
-        reconcile::recover_pending(&self.manifest_path())
+        let manifest_dir = self.config_dir.join("php");
+        crate::php::targets::ensure_hearth_channel_dir(&self.provider_roots.hearth, &manifest_dir)
+            .map_err(|error| format!("manifest directory guard failed: {error}"))?;
+        reconcile::recover_pending(&self.manifest_path(), &self.provider_roots.hearth)
             .map_err(|e| format!("journal recovery failed: {e}"))?;
         if materialize_static_fpm {
-            fpm::recover_pending_fpm(&self.config_dir)
+            fpm::recover_pending_fpm(&self.config_dir, &self.provider_roots.hearth)
                 .map_err(|e| format!("FPM journal recovery failed: {e}"))?;
         }
 
@@ -376,8 +379,12 @@ impl PhpConfigEngine {
     /// Remove every manifest-tracked channel file (journal-resolved,
     /// exact-hash only — survivors are reported Refused).
     fn unmanage_locked(&self) -> Result<PhpConfigOutcome, String> {
-        let mut actions = reconcile::unmanage(&self.manifest_path()).map_err(|e| e.to_string())?;
-        actions.extend(fpm::unmanage_fpm(&self.config_dir).map_err(|e| e.to_string())?);
+        let mut actions = reconcile::unmanage(&self.manifest_path(), &self.provider_roots.hearth)
+            .map_err(|e| e.to_string())?;
+        actions.extend(
+            fpm::unmanage_fpm(&self.config_dir, &self.provider_roots.hearth)
+                .map_err(|e| e.to_string())?,
+        );
         let files = actions
             .iter()
             .map(|action| FileOutcome {
@@ -1389,6 +1396,29 @@ mod tests {
             "got: {}",
             fpm_row.coverage
         );
+    }
+
+    #[tokio::test]
+    async fn pre_reconcile_recovery_rejects_symlinked_ini_manifest_dir() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let fx = fixture(false);
+        let outside = fx.config_dir.parent().unwrap().join("outside-ini-recovery");
+        std::fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        std::fs::write(&sentinel, b"pre-recovery-outside").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&sentinel).unwrap();
+        std::os::unix::fs::symlink(&outside, fx.config_dir.join("php")).unwrap();
+
+        let error = fx.engine.boot_sync().await.unwrap_err();
+        assert!(error.contains("manifest directory guard failed"), "{error}");
+        let after = std::fs::metadata(&sentinel).unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"pre-recovery-outside");
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.permissions().mode() & 0o777, 0o640);
+        assert!(!outside.join(".manifest.lock").exists());
+        assert!(!outside.join("manifest.toml").exists());
     }
 
     #[tokio::test]

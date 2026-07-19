@@ -626,13 +626,37 @@ $CLI php config --global --unset memory_limit >/dev/null 2>&1
 stop_daemon
 chmod 755 "$HEARTH_CONFIG_DIR/fpm"
 boot_daemon 0
-if [ -f "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf" ] \
-    && [ -f "$HEARTH_CONFIG_DIR/fpm/hearth-probe.php" ] \
-    && [ -f "$HEARTH_CONFIG_DIR/fpm/manifest.toml" ] \
-    && $CLI status 2>&1 | grep -q "php-fpm"; then
-    pass "S9b: writable fresh boot regenerates and registers FPM"
+if [ -f "$HEARTH_CONFIG_DIR/fpm/php-fpm.conf" ]; then
+    pass "S9b: writable fresh boot regenerates php-fpm.conf"
 else
-    fail "S9b: regeneration/registration did not recover"
+    fail "S9b: writable fresh boot did not regenerate php-fpm.conf"
+fi
+if [ -f "$HEARTH_CONFIG_DIR/fpm/hearth-probe.php" ]; then
+    pass "S9b: writable fresh boot regenerates hearth-probe.php"
+else
+    fail "S9b: writable fresh boot did not regenerate hearth-probe.php"
+fi
+if [ -f "$HEARTH_CONFIG_DIR/fpm/manifest.toml" ]; then
+    pass "S9b: writable fresh boot regenerates manifest.toml"
+else
+    fail "S9b: writable fresh boot did not regenerate manifest.toml"
+fi
+
+FPM_STATUS_READY=0
+FPM_STATUS_OUTPUT=""
+for attempt in {1..50}; do
+    FPM_STATUS_OUTPUT=$($CLI status 2>&1 || true)
+    if echo "$FPM_STATUS_OUTPUT" | grep -q "php-fpm"; then
+        FPM_STATUS_READY=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$FPM_STATUS_READY" -eq 1 ]; then
+    pass "S9b: FPM registration became ready after writable fresh boot (attempt $attempt)"
+else
+    FPM_STATUS_DIAGNOSTIC=${FPM_STATUS_OUTPUT:0:4096}
+    fail "S9b: FPM registration did not become ready after 50 attempts; status: $FPM_STATUS_DIAGNOSTIC"
 fi
 
 # ── S9c. Foreign config is a byte-stable user-managed escape hatch ─

@@ -1058,7 +1058,11 @@ mod tests {
         let (_tmp, _config_path, state) = state_fixture();
         let version = start_owned_fpm(&state).await;
         std::thread::sleep(std::time::Duration::from_millis(3));
-        hearth_lib::php::fpm::unmanage_fpm(state.php_engine.config_dir()).unwrap();
+        hearth_lib::php::fpm::unmanage_fpm(
+            state.php_engine.config_dir(),
+            state.php_engine.config_dir(),
+        )
+        .unwrap();
         assert!(matches!(
             hearth_lib::php::fpm::materialize(
                 state.php_engine.config_dir(),
@@ -1102,7 +1106,11 @@ mod tests {
         let (_tmp, _config_path, state) = state_fixture();
         let version = start_owned_fpm(&state).await;
         std::thread::sleep(std::time::Duration::from_millis(3));
-        hearth_lib::php::fpm::unmanage_fpm(state.php_engine.config_dir()).unwrap();
+        hearth_lib::php::fpm::unmanage_fpm(
+            state.php_engine.config_dir(),
+            state.php_engine.config_dir(),
+        )
+        .unwrap();
         hearth_lib::php::fpm::materialize(
             state.php_engine.config_dir(),
             state.php_engine.config_dir(),

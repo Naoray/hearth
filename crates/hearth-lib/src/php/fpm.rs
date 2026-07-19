@@ -547,6 +547,7 @@ fn materialize_with_options(
         dir: &manifest_dir,
     };
     let transaction = manifest_set_transaction(
+        hearth_root,
         &manifest_dir,
         &manifest_path,
         lock_wait,
@@ -608,13 +609,14 @@ pub fn materialize(config_dir: &Path, hearth_root: &Path) -> MaterializeReport {
     materialize_with_options(config_dir, hearth_root, 1, Duration::from_secs(5))
 }
 
-pub fn recover_pending_fpm(config_dir: &Path) -> anyhow::Result<()> {
+pub fn recover_pending_fpm(config_dir: &Path, hearth_root: &Path) -> anyhow::Result<()> {
     let manifest_dir = config_dir.join("fpm");
     if !manifest_dir.exists() {
         return Ok(());
     }
     let manifest_path = fpm_manifest_path(config_dir);
     manifest_set_transaction(
+        hearth_root,
         &manifest_dir,
         &manifest_path,
         Duration::from_secs(5),
@@ -632,13 +634,14 @@ pub fn recover_pending_fpm(config_dir: &Path) -> anyhow::Result<()> {
     .map_err(anyhow::Error::from)
 }
 
-pub fn unmanage_fpm(config_dir: &Path) -> anyhow::Result<Vec<FileAction>> {
+pub fn unmanage_fpm(config_dir: &Path, hearth_root: &Path) -> anyhow::Result<Vec<FileAction>> {
     let manifest_dir = config_dir.join("fpm");
     if !manifest_dir.exists() {
         return Ok(Vec::new());
     }
     let manifest_path = fpm_manifest_path(config_dir);
     manifest_set_transaction(
+        hearth_root,
         &manifest_dir,
         &manifest_path,
         Duration::from_secs(5),
@@ -674,7 +677,7 @@ pub fn unmanage_fpm(config_dir: &Path) -> anyhow::Result<Vec<FileAction>> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     use super::*;
@@ -793,6 +796,60 @@ mod tests {
             last_outcome: crate::php::reconcile::LastOutcome::Written,
             applied_at_unix_ms: Some(1),
         }
+    }
+
+    #[test]
+    fn fpm_lock_paths_are_guarded_and_existing_mode_is_enforced() {
+        let (_tmp, base, config_dir) = fpm_fixture();
+        let manifest_dir = config_dir.join("fpm");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        let lock_path = manifest_dir.join(".manifest.lock");
+        let sentinel = base.join("outside-lock-sentinel");
+        std::fs::write(&sentinel, b"outside-fpm-bytes").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let sentinel_before = std::fs::metadata(&sentinel).unwrap();
+
+        std::os::unix::fs::symlink(&sentinel, &lock_path).unwrap();
+        let blocked = materialize(&config_dir, &config_dir);
+        assert!(matches!(blocked.state, FpmConfState::Blocked { .. }));
+        assert!(!conf_path(&config_dir).exists());
+        assert!(!probe_script_path(&config_dir).exists());
+        assert!(!fpm_manifest_path(&config_dir).exists());
+        std::fs::remove_file(&lock_path).unwrap();
+
+        std::fs::write(&lock_path, []).unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let report = materialize(&config_dir, &config_dir);
+        assert!(matches!(report.state, FpmConfState::HearthOwned { .. }));
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let sentinel_after = std::fs::metadata(&sentinel).unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside-fpm-bytes");
+        assert_eq!(sentinel_after.ino(), sentinel_before.ino());
+        assert_eq!(sentinel_after.permissions().mode() & 0o777, 0o640);
+
+        let symlinked_config = base.join("symlinked-config");
+        let outside_dir = base.join("outside-fpm-dir");
+        std::fs::create_dir_all(&symlinked_config).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside_sentinel = outside_dir.join("sentinel");
+        std::fs::write(&outside_sentinel, b"outside-dir-bytes").unwrap();
+        let outside_before = std::fs::metadata(&outside_sentinel).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, symlinked_config.join("fpm")).unwrap();
+
+        assert!(recover_pending_fpm(&symlinked_config, &symlinked_config).is_err());
+        assert!(unmanage_fpm(&symlinked_config, &symlinked_config).is_err());
+        let outside_after = std::fs::metadata(&outside_sentinel).unwrap();
+        assert_eq!(
+            std::fs::read(&outside_sentinel).unwrap(),
+            b"outside-dir-bytes"
+        );
+        assert_eq!(outside_after.ino(), outside_before.ino());
+        assert!(!outside_dir.join(".manifest.lock").exists());
+        assert!(!outside_dir.join("manifest.toml").exists());
     }
 
     #[test]
@@ -1049,7 +1106,7 @@ mod tests {
         entry.desired_sha256 = Some(crate::php::reconcile::sha256_hex(desired.as_bytes()));
         manifest.save(&fpm_manifest_path(&config_dir)).unwrap();
 
-        recover_pending_fpm(&config_dir).unwrap();
+        recover_pending_fpm(&config_dir, &config_dir).unwrap();
         let still_pending = load_fpm_manifest_strict(&config_dir).unwrap().unwrap();
         assert_eq!(
             still_pending
@@ -1080,7 +1137,7 @@ mod tests {
         probe_entry.desired_sha256 = None;
         deleting.save(&fpm_manifest_path(&config_dir)).unwrap();
         std::fs::remove_file(&probe).unwrap();
-        recover_pending_fpm(&config_dir).unwrap();
+        recover_pending_fpm(&config_dir, &config_dir).unwrap();
         assert!(
             load_fpm_manifest_strict(&config_dir)
                 .unwrap()
@@ -1095,7 +1152,7 @@ mod tests {
     fn unmanage_fpm_removes_only_owned_exact_hash() {
         let (_tmp, _base, config_dir) = fpm_fixture();
         materialize(&config_dir, &config_dir);
-        let actions = unmanage_fpm(&config_dir).unwrap();
+        let actions = unmanage_fpm(&config_dir, &config_dir).unwrap();
         assert_eq!(actions.len(), 2);
         assert!(
             actions.iter().all(|action| matches!(
@@ -1109,7 +1166,7 @@ mod tests {
 
         let foreign = b"foreign\n";
         std::fs::write(conf_path(&config_dir), foreign).unwrap();
-        let actions = unmanage_fpm(&config_dir).unwrap();
+        let actions = unmanage_fpm(&config_dir, &config_dir).unwrap();
         assert!(actions.is_empty());
         assert_eq!(std::fs::read(conf_path(&config_dir)).unwrap(), foreign);
     }
@@ -1180,10 +1237,11 @@ mod tests {
                 }
             }
             "unmanage" => {
-                unmanage_fpm(&config_dir).unwrap();
+                unmanage_fpm(&config_dir, &config_dir).unwrap();
             }
             "hold_lock" => {
                 let lock = crate::php::reconcile::acquire_manifest_lock(
+                    &config_dir,
                     &config_dir.join("fpm"),
                     std::time::Duration::from_secs(1),
                 )
@@ -1323,9 +1381,9 @@ mod tests {
         assert!(!conf_path(&config_dir).exists());
         assert!(!probe_script_path(&config_dir).exists());
         assert!(fpm_manifest_path(&config_dir).exists());
-        assert!(unmanage_fpm(&config_dir).unwrap().is_empty());
+        assert!(unmanage_fpm(&config_dir, &config_dir).unwrap().is_empty());
         assert!(!fpm_manifest_path(&config_dir).exists());
-        assert!(unmanage_fpm(&config_dir).unwrap().is_empty());
+        assert!(unmanage_fpm(&config_dir, &config_dir).unwrap().is_empty());
     }
 
     #[test]
@@ -1434,9 +1492,298 @@ mod tests {
         );
     }
 
+    const GROUP_DIAGNOSTIC_BYTES: usize = 4096;
+
+    struct GuardedGroupChild {
+        child: command_group::GroupChild,
+        pgid: i32,
+        stderr_reader: Option<std::thread::JoinHandle<Vec<u8>>>,
+        status: Option<std::process::ExitStatus>,
+        cleaned: bool,
+    }
+
+    impl GuardedGroupChild {
+        fn spawn(command: &mut std::process::Command) -> Result<Self, String> {
+            use command_group::CommandGroup;
+            use std::io::Read;
+
+            command.stderr(std::process::Stdio::piped());
+            let mut child = command
+                .group_spawn()
+                .map_err(|error| format!("process-group spawn failed: {error}"))?;
+            let pgid = child.id() as i32;
+            let observed = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pgid)))
+                .map_err(|error| format!("could not validate launched PGID {pgid}: {error}"))?;
+            if observed.as_raw() != pgid {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "launched leader {pgid} belongs to unexpected PGID {}",
+                    observed.as_raw()
+                ));
+            }
+            let mut stderr = child
+                .inner()
+                .stderr
+                .take()
+                .ok_or_else(|| "launched process did not expose piped stderr".to_string())?;
+            let stderr_reader = std::thread::spawn(move || {
+                let mut tail = std::collections::VecDeque::with_capacity(GROUP_DIAGNOSTIC_BYTES);
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stderr.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            for byte in &buffer[..read] {
+                                if tail.len() == GROUP_DIAGNOSTIC_BYTES {
+                                    tail.pop_front();
+                                }
+                                tail.push_back(*byte);
+                            }
+                        }
+                    }
+                }
+                tail.into_iter().collect()
+            });
+            Ok(Self {
+                child,
+                pgid,
+                stderr_reader: Some(stderr_reader),
+                status: None,
+                cleaned: false,
+            })
+        }
+
+        fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+            if self.status.is_none() {
+                self.status = self
+                    .child
+                    .try_wait()
+                    .map_err(|error| format!("leader wait failed: {error}"))?;
+            }
+            Ok(self.status)
+        }
+
+        fn group_exists(&self) -> Result<bool, String> {
+            Self::group_exists_for_test(self.pgid)
+        }
+
+        fn group_exists_for_test(pgid: i32) -> Result<bool, String> {
+            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pgid), None) {
+                Ok(()) => Ok(true),
+                Err(nix::errno::Errno::ESRCH) => Ok(false),
+                Err(error) => Err(format!("could not inspect PGID {pgid}: {error}")),
+            }
+        }
+
+        fn signal_group(&self, signal: nix::sys::signal::Signal) -> Result<(), String> {
+            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-self.pgid), signal) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+                Err(error) => Err(format!(
+                    "could not send {signal:?} to validated PGID {}: {error}",
+                    self.pgid
+                )),
+            }
+        }
+
+        fn poll_group_exit(&mut self, timeout: Duration) -> Result<bool, String> {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let _ = self.try_wait()?;
+                if !self.group_exists()? {
+                    return Ok(true);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn shutdown(
+            &mut self,
+            graceful_timeout: Duration,
+            force_timeout: Duration,
+        ) -> Result<(), String> {
+            if self.cleaned {
+                return Ok(());
+            }
+            self.signal_group(nix::sys::signal::Signal::SIGQUIT)?;
+            if !self.poll_group_exit(graceful_timeout)? {
+                self.signal_group(nix::sys::signal::Signal::SIGKILL)?;
+                if !self.poll_group_exit(force_timeout)? {
+                    return Err(format!(
+                        "validated PGID {} survived SIGQUIT and SIGKILL",
+                        self.pgid
+                    ));
+                }
+            }
+            if self.status.is_none() {
+                self.status = Some(
+                    self.child
+                        .wait()
+                        .map_err(|error| format!("leader reap failed: {error}"))?,
+                );
+            }
+            if self.group_exists()? {
+                return Err(format!("validated PGID {} survived teardown", self.pgid));
+            }
+            self.cleaned = true;
+            Ok(())
+        }
+
+        fn diagnostics(&mut self) -> String {
+            let stderr = self
+                .stderr_reader
+                .take()
+                .and_then(|reader| reader.join().ok())
+                .unwrap_or_default();
+            format!(
+                "leader status: {:?}; stderr tail ({} bytes max): {}",
+                self.status,
+                GROUP_DIAGNOSTIC_BYTES,
+                String::from_utf8_lossy(&stderr)
+            )
+        }
+    }
+
+    impl Drop for GuardedGroupChild {
+        fn drop(&mut self) {
+            let _ = self.shutdown(Duration::from_millis(250), Duration::from_secs(2));
+            if let Some(reader) = self.stderr_reader.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+
+    fn bounded_file_tail(path: &Path) -> String {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return String::new();
+        };
+        let length = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        let start = length.saturating_sub(GROUP_DIAGNOSTIC_BYTES as u64);
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            return String::new();
+        }
+        let mut bytes = Vec::with_capacity(GROUP_DIAGNOSTIC_BYTES);
+        let _ = file
+            .take(GROUP_DIAGNOSTIC_BYTES as u64)
+            .read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn run_process_group_guarded(
+        command: &mut std::process::Command,
+        readiness_timeout: Duration,
+        graceful_timeout: Duration,
+        force_timeout: Duration,
+        log_path: &Path,
+        mut ready: impl FnMut() -> Result<bool, String>,
+        validate: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(i32, Result<(), String>), String> {
+        let mut group = GuardedGroupChild::spawn(command)?;
+        let pgid = group.pgid;
+        let operation = (|| {
+            let deadline = std::time::Instant::now() + readiness_timeout;
+            loop {
+                if ready()? {
+                    break;
+                }
+                if let Some(status) = group.try_wait()? {
+                    return Err(format!("leader exited before readiness: {status}"));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!("readiness timed out after {readiness_timeout:?}"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            validate()
+        })();
+        let cleanup = group.shutdown(graceful_timeout, force_timeout);
+        let diagnostics = group.diagnostics();
+        let log = bounded_file_tail(log_path);
+        let result = match (operation, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(format!("{error}; {diagnostics}; log tail: {log}")),
+            (Ok(()), Err(error)) => Err(format!("cleanup failed: {error}; {diagnostics}")),
+            (Err(operation), Err(cleanup)) => Err(format!(
+                "{operation}; cleanup failed: {cleanup}; {diagnostics}; log tail: {log}"
+            )),
+        };
+        Ok((pgid, result))
+    }
+
+    #[test]
+    fn real_fpm_group_cleanup_is_bounded_on_timeout_and_early_exit() {
+        let tmp = tempfile::Builder::new()
+            .prefix("hearth fpm proof cleanup")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let missing_log = tmp.path().join("missing.log");
+
+        let mut timeout = std::process::Command::new("/bin/sh");
+        timeout.arg("-c").arg(
+            "i=0; while [ $i -lt 6000 ]; do printf x >&2; i=$((i + 1)); done; \
+             printf 'TIMEOUT-DIAGNOSTIC-END\\n' >&2; trap '' QUIT; \
+             (trap '' QUIT; while :; do sleep 1; done) & while :; do sleep 1; done",
+        );
+        let (timeout_pgid, timeout_result) = run_process_group_guarded(
+            &mut timeout,
+            Duration::from_millis(150),
+            Duration::from_millis(150),
+            Duration::from_secs(2),
+            &missing_log,
+            || Ok(false),
+            || Err("validation unexpectedly ran".to_string()),
+        )
+        .unwrap();
+        let timeout_error = timeout_result.unwrap_err();
+        assert!(
+            timeout_error.contains("readiness timed out"),
+            "{timeout_error}"
+        );
+        assert!(
+            timeout_error.contains("TIMEOUT-DIAGNOSTIC-END"),
+            "{timeout_error}"
+        );
+        assert!(!timeout_error.contains(&"x".repeat(GROUP_DIAGNOSTIC_BYTES + 1)));
+        assert!(
+            !GuardedGroupChild::group_exists_for_test(timeout_pgid).unwrap(),
+            "timeout PGID {timeout_pgid} survived"
+        );
+
+        let mut early = std::process::Command::new("/bin/sh");
+        early.arg("-c").arg(
+            "trap '' QUIT; (trap '' QUIT; while :; do sleep 1; done) & \
+             printf 'EARLY-DIAGNOSTIC\\n' >&2; sleep 0.05; exit 23",
+        );
+        let (early_pgid, early_result) = run_process_group_guarded(
+            &mut early,
+            Duration::from_secs(1),
+            Duration::from_millis(150),
+            Duration::from_secs(2),
+            &missing_log,
+            || Ok(false),
+            || Err("validation unexpectedly ran".to_string()),
+        )
+        .unwrap();
+        let early_error = early_result.unwrap_err();
+        assert!(
+            early_error.contains("exited before readiness")
+                && early_error.contains("exit status: 23")
+                && early_error.contains("EARLY-DIAGNOSTIC"),
+            "{early_error}"
+        );
+        assert!(
+            !GuardedGroupChild::group_exists_for_test(early_pgid).unwrap(),
+            "early-exit PGID {early_pgid} survived"
+        );
+    }
+
     #[test]
     fn real_fpm_starts_and_serves_the_generated_config() {
-        use command_group::CommandGroup;
         use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
         use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -1521,49 +1868,40 @@ mod tests {
             .arg("--nodaemonize")
             .arg(format!("--fpm-config={}", conf.display()))
             .env(key, value)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let mut child = command.group_spawn().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if UnixStream::connect(&socket).is_ok() {
-                break;
-            }
-            if let Some(status) = child.try_wait().unwrap() {
-                panic!(
-                    "real php-fpm {} {:?} exited before readiness: {status}; log: {}",
-                    candidate.version,
-                    candidate.tier,
-                    std::fs::read_to_string(config_dir.join("log/php-fpm.log"))
-                        .unwrap_or_default()
-                        .chars()
-                        .take(4096)
-                        .collect::<String>()
-                );
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "real php-fpm readiness timeout"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        let metadata = std::fs::symlink_metadata(&socket).unwrap();
-        assert!(metadata.file_type().is_socket());
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        assert!(UnixStream::connect(&socket).is_ok());
-
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(-(child.id() as i32)),
-            nix::sys::signal::Signal::SIGQUIT,
+            .stdout(std::process::Stdio::null());
+        let log_path = config_dir.join("log/php-fpm.log");
+        let (pgid, result) = run_process_group_guarded(
+            &mut command,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            &log_path,
+            || Ok(UnixStream::connect(&socket).is_ok()),
+            || {
+                let metadata = std::fs::symlink_metadata(&socket)
+                    .map_err(|error| format!("listener metadata failed: {error}"))?;
+                if !metadata.file_type().is_socket() {
+                    return Err("listener path is not a Unix socket".to_string());
+                }
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode != 0o600 {
+                    return Err(format!("listener mode is {mode:04o}, expected 0600"));
+                }
+                UnixStream::connect(&socket)
+                    .map(|_| ())
+                    .map_err(|error| format!("listener connect failed: {error}"))
+            },
         )
-        .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        if child.try_wait().unwrap().is_none() {
-            let _ = child.kill();
-        }
-        child.wait().unwrap();
+        .unwrap_or_else(|error| panic!("real php-fpm group launch failed: {error}"));
+        result.unwrap_or_else(|error| {
+            panic!(
+                "real php-fpm {} {:?} proof failed: {error}",
+                candidate.version, candidate.tier
+            )
+        });
+        assert!(
+            !GuardedGroupChild::group_exists_for_test(pgid).unwrap(),
+            "real php-fpm PGID {pgid} survived proof teardown"
+        );
     }
 }
