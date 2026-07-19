@@ -576,20 +576,48 @@ async fn process_request(
         }
 
         DaemonRequest::Restart { service } => {
+            use hearth_lib::service::supervisor::FpmRestartTxOutcome;
             let mut sup = state.supervisor.lock().await;
             match service {
                 None => {
-                    if let Err(e) = sup.stop_all() {
+                    // C7-1: FPM is handled INSIDE the supervisor's atomic
+                    // ownership transaction; other services restart
+                    // normally with per-service failures aggregated. An
+                    // FPM skip/refusal must never read as "restarted".
+                    let (fpm, errors) = sup.restart_all();
+                    let mut failures: Vec<String> = errors
+                        .iter()
+                        .map(|(kind, e)| format!("{kind}: {e}"))
+                        .collect();
+                    let mut fpm_note: Option<String> = None;
+                    match fpm {
+                        None | Some(FpmRestartTxOutcome::Restarted) => {}
+                        Some(FpmRestartTxOutcome::SkippedOwned) => {
+                            fpm_note = Some("php-fpm untouched (owned by Herd)".to_string());
+                        }
+                        Some(FpmRestartTxOutcome::SkippedOwnershipUnknown(diag)) => {
+                            fpm_note =
+                                Some(format!("php-fpm untouched (ownership is unknown: {diag})"));
+                        }
+                        Some(FpmRestartTxOutcome::NotRegistered) => {}
+                        Some(FpmRestartTxOutcome::StopFailed { error }) => {
+                            failures.push(format!("php-fpm: stop failed: {error}"));
+                        }
+                        Some(FpmRestartTxOutcome::StartFailed { error }) => {
+                            failures.push(format!("php-fpm: start failed: {error}"));
+                        }
+                    }
+                    if !failures.is_empty() {
                         return DaemonResponse::Error {
-                            message: format!("stop failed: {e}"),
+                            message: format!("restart incomplete: {}", failures.join("; ")),
                         };
                     }
-                    match sup.start_all() {
-                        Ok(()) => DaemonResponse::Ok {
+                    match fpm_note {
+                        None => DaemonResponse::Ok {
                             message: Some("All services restarted".to_string()),
                         },
-                        Err(e) => DaemonResponse::Error {
-                            message: format!("start failed: {e}"),
+                        Some(note) => DaemonResponse::Ok {
+                            message: Some(format!("Services restarted; {note}")),
                         },
                     }
                 }
@@ -598,6 +626,40 @@ async fn process_request(
                         Ok(k) => k,
                         Err(e) => return DaemonResponse::Error { message: e },
                     };
+                    // C7-1: a named FPM restart is the atomic supervisor
+                    // transaction — never public stop then guarded start.
+                    if kind == hearth_lib::service::ServiceKind::PhpFpm {
+                        return match sup.restart_fpm_service() {
+                            FpmRestartTxOutcome::Restarted => DaemonResponse::Ok {
+                                message: Some(format!("Restarted {name}")),
+                            },
+                            FpmRestartTxOutcome::SkippedOwned => DaemonResponse::Error {
+                                message: "php-fpm restart refused: php-fpm is owned \
+                                          by Herd — registered service left untouched"
+                                    .to_string(),
+                            },
+                            FpmRestartTxOutcome::SkippedOwnershipUnknown(diag) => {
+                                DaemonResponse::Error {
+                                    message: format!(
+                                        "php-fpm restart refused: php-fpm ownership \
+                                         is unknown ({diag}); FPM activation skipped \
+                                         fail-closed"
+                                    ),
+                                }
+                            }
+                            FpmRestartTxOutcome::NotRegistered => DaemonResponse::Error {
+                                message: format!(
+                                    "stop {name} failed: service {name} is not registered"
+                                ),
+                            },
+                            FpmRestartTxOutcome::StopFailed { error } => DaemonResponse::Error {
+                                message: format!("stop {name} failed: {error}"),
+                            },
+                            FpmRestartTxOutcome::StartFailed { error } => DaemonResponse::Error {
+                                message: format!("start {name} failed: {error}"),
+                            },
+                        };
+                    }
                     if let Err(e) = sup.stop_service(kind) {
                         return DaemonResponse::Error {
                             message: format!("stop {name} failed: {e}"),

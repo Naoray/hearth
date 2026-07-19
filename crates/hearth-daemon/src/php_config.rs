@@ -1484,4 +1484,157 @@ mod tests {
             .stop_service(hearth_lib::service::ServiceKind::PhpFpm)
             .unwrap();
     }
+
+    /// C7-1 (review 5650 r8): named `Restart { php-fpm }` routes through
+    /// the supervisor's atomic transaction — Owned and Unknown ownership
+    /// refuse fail-closed with ZERO mutation of the running child. Fails at
+    /// head 8b06320 (the daemon called stop_service first: the child was
+    /// stopped, then the guarded start refused).
+    #[tokio::test]
+    async fn daemon_named_fpm_restart_refuses_zero_mutation_under_owned_and_unknown() {
+        use hearth_lib::service::ServiceKind;
+        use hearth_lib::service::supervisor::{FpmOwnership, ManagedService};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mode = Arc::new(AtomicUsize::new(0)); // 0=Unowned 1=Owned 2=Unknown
+        let probe_mode = Arc::clone(&mode);
+        let (_tmp, _config_path, state) =
+            state_fixture_with_probe(Arc::new(move || match probe_mode.load(Ordering::SeqCst) {
+                0 => FpmOwnership::Unowned,
+                1 => FpmOwnership::Owned,
+                _ => FpmOwnership::Unknown(
+                    "ownership probe (pgrep) failed with status 2".to_string(),
+                ),
+            }));
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.register(ManagedService::new(
+                ServiceKind::PhpFpm,
+                "/bin/sleep".to_string(),
+                vec!["30".to_string()],
+            ))
+            .unwrap();
+            sup.start_service(ServiceKind::PhpFpm).unwrap();
+        }
+        let started = state
+            .supervisor
+            .lock()
+            .await
+            .service(ServiceKind::PhpFpm)
+            .unwrap()
+            .started_at()
+            .expect("running");
+
+        for (m, needle) in [(1usize, "owned by Herd"), (2usize, "ownership is unknown")] {
+            mode.store(m, Ordering::SeqCst);
+            let resp = crate::process_request(
+                hearth_lib::socket::DaemonRequest::Restart {
+                    service: Some("php-fpm".to_string()),
+                },
+                &state,
+            )
+            .await;
+            match resp {
+                DaemonResponse::Error { message } => {
+                    assert!(message.contains(needle), "mode {m}: {message}")
+                }
+                other => panic!("expected refusal Error, got {other:?}"),
+            }
+            let sup = state.supervisor.lock().await;
+            let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+            assert!(
+                matches!(svc.state, hearth_lib::service::ServiceState::Running { .. }),
+                "zero mutation (mode {m}): {:?}",
+                svc.state
+            );
+            assert_eq!(svc.started_at(), Some(started), "same spawn (mode {m})");
+        }
+
+        mode.store(0, Ordering::SeqCst);
+        state
+            .supervisor
+            .lock()
+            .await
+            .stop_service(ServiceKind::PhpFpm)
+            .unwrap();
+    }
+
+    /// C7-1: all-services `Restart` handles FPM atomically — under live
+    /// Herd the FPM child is untouched, non-FPM services actually restart,
+    /// and the aggregate message reports the skip truthfully instead of
+    /// "All services restarted". Fails at head 8b06320 (stop_all stopped
+    /// FPM, start_all silently skipped it, response claimed full success).
+    #[tokio::test]
+    async fn daemon_all_services_restart_truthful_and_fpm_untouched_under_herd() {
+        use hearth_lib::service::ServiceKind;
+        use hearth_lib::service::supervisor::ManagedService;
+        use std::sync::atomic::Ordering;
+
+        let (_tmp, _config_path, state, herd_live) = state_fixture_with_herd_flag();
+        {
+            let mut sup = state.supervisor.lock().await;
+            sup.register(ManagedService::new(
+                ServiceKind::PhpFpm,
+                "/bin/sleep".to_string(),
+                vec!["30".to_string()],
+            ))
+            .unwrap();
+            sup.register(ManagedService::new(
+                ServiceKind::Mailpit,
+                "/bin/sleep".to_string(),
+                vec!["30".to_string()],
+            ))
+            .unwrap();
+            sup.start_service(ServiceKind::PhpFpm).unwrap();
+            sup.start_service(ServiceKind::Mailpit).unwrap();
+        }
+        let (fpm_started, mailpit_started) = {
+            let sup = state.supervisor.lock().await;
+            (
+                sup.service(ServiceKind::PhpFpm)
+                    .unwrap()
+                    .started_at()
+                    .unwrap(),
+                sup.service(ServiceKind::Mailpit)
+                    .unwrap()
+                    .started_at()
+                    .unwrap(),
+            )
+        };
+
+        herd_live.store(true, Ordering::SeqCst);
+        let resp = crate::process_request(
+            hearth_lib::socket::DaemonRequest::Restart { service: None },
+            &state,
+        )
+        .await;
+        match resp {
+            DaemonResponse::Ok { message: Some(msg) } => {
+                assert!(msg.contains("php-fpm untouched"), "{msg}");
+                assert!(msg.contains("owned by Herd"), "{msg}");
+                assert_ne!(msg, "All services restarted", "aggregate must be truthful");
+            }
+            other => panic!("expected truthful Ok, got {other:?}"),
+        }
+        {
+            let sup = state.supervisor.lock().await;
+            let fpm = sup.service(ServiceKind::PhpFpm).unwrap();
+            assert!(
+                matches!(fpm.state, hearth_lib::service::ServiceState::Running { .. }),
+                "FPM untouched: {:?}",
+                fpm.state
+            );
+            assert_eq!(fpm.started_at(), Some(fpm_started), "FPM same spawn");
+            let mp = sup.service(ServiceKind::Mailpit).unwrap();
+            assert!(mp.started_at().is_some());
+            assert_ne!(
+                mp.started_at(),
+                Some(mailpit_started),
+                "non-FPM service actually restarted"
+            );
+        }
+
+        herd_live.store(false, Ordering::SeqCst);
+        state.supervisor.lock().await.stop_all().unwrap();
+    }
 }

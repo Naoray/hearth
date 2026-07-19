@@ -74,6 +74,17 @@ All notable changes to Hearth will be documented in this file.
   child still supervised, a failed build never costs a running FPM, and a
   failed start reports the truthful partial state — no interleaving can
   report "untouched" after mutating.
+- EVERY restart that can touch PHP-FPM is that same kind of atomic
+  supervisor transaction: named `hearth restart php-fpm`, the all-services
+  `hearth restart`, and the config/MCP conditional FPM restart all take one
+  authoritative typed ownership snapshot immediately before any stop.
+  Owned/Unknown refuse or skip truthfully BEFORE the old child is touched
+  (the all-services aggregate reports the skip instead of claiming every
+  service restarted), Unowned performs one coherent stop/start with no
+  post-stop recheck, a failed stop keeps the old child fully supervised,
+  and a failed start leaves a truthful `Failed` registration with no
+  orphan. No restart path composes a public stop with the guarded start
+  anymore.
 - Provider roots are validated as a SET: equal, nested, or symlink-aliased
   Hearth/Herd/Homebrew roots are rejected at construction, and provider
   identity additionally requires membership in exactly one canonical root —

@@ -488,6 +488,28 @@ pub enum FpmReplaceOutcome {
     StartFailed { error: String },
 }
 
+/// C7-1 (review 5650 r8): outcome of the atomic in-place FPM restart
+/// transaction (`restart_fpm_service`). Skips and refusals happen BEFORE
+/// any mutation; failures report the exact retained/partial state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FpmRestartTxOutcome {
+    /// Old child stopped and started again — one coherent transaction.
+    Restarted,
+    /// Ownership snapshot said Herd owns FPM — zero mutation.
+    SkippedOwned,
+    /// Ownership snapshot was Unknown — zero mutation, fail-closed.
+    SkippedOwnershipUnknown(String),
+    /// No FPM registration exists — nothing to restart, zero mutation.
+    NotRegistered,
+    /// The old child could not be confirmed stopped — it remains fully
+    /// supervised (C4-1); no start was attempted.
+    StopFailed { error: String },
+    /// The stop succeeded but the restart's start failed — the
+    /// registration stays supervised in truthful `Failed` state; no child
+    /// is running and no orphan exists.
+    StartFailed { error: String },
+}
+
 impl Default for ServiceSupervisor {
     fn default() -> Self {
         Self::new()
@@ -738,6 +760,83 @@ impl ServiceSupervisor {
                 }
             }
         }
+    }
+
+    /// C7-1 (review 5650 r8): ATOMIC PHP-FPM restart — every restart that
+    /// can touch FPM is ONE supervisor-owned transaction under ONE
+    /// authoritative typed ownership snapshot taken immediately before any
+    /// mutation. Owned/Unknown refuse BEFORE the stop, leaving the old
+    /// registration, child handle, timestamp, and state untouched; Unowned
+    /// performs the coherent stop/start with NO post-stop ownership recheck
+    /// (a later flip is the health handoff's job). A failed stop keeps the
+    /// old child fully supervised (C4 semantics); a failed start after a
+    /// successful stop retains a truthful `Failed` registration and never
+    /// creates an orphan. Callers must NOT compose the public
+    /// `stop_service`/`stop_all` with the guarded starts for FPM.
+    pub fn restart_fpm_service(&mut self) -> FpmRestartTxOutcome {
+        // ONE authoritative snapshot immediately before mutation.
+        match self.current_fpm_ownership() {
+            FpmOwnership::Owned => return FpmRestartTxOutcome::SkippedOwned,
+            FpmOwnership::Unknown(diag) => {
+                return FpmRestartTxOutcome::SkippedOwnershipUnknown(diag);
+            }
+            FpmOwnership::Unowned => {}
+        }
+        let Some(svc) = self.services.get_mut(&ServiceKind::PhpFpm) else {
+            return FpmRestartTxOutcome::NotRegistered;
+        };
+        if let Err(e) = svc.stop() {
+            return FpmRestartTxOutcome::StopFailed {
+                error: e.to_string(),
+            };
+        }
+        svc.circuit_breaker.reset();
+        match svc.start() {
+            Ok(()) => FpmRestartTxOutcome::Restarted,
+            Err(e) => {
+                svc.state = ServiceState::Failed {
+                    reason: e.to_string(),
+                };
+                FpmRestartTxOutcome::StartFailed {
+                    error: e.to_string(),
+                }
+            }
+        }
+    }
+
+    /// C7-1: all-services restart. PHP-FPM goes through the atomic
+    /// ownership transaction above; every other registered service is
+    /// stopped and started normally, with per-service failures collected
+    /// instead of aborting the rest. The caller renders the aggregate
+    /// truthfully — an FPM skip/refusal must never read as "restarted".
+    pub fn restart_all(&mut self) -> (Option<FpmRestartTxOutcome>, Vec<(ServiceKind, String)>) {
+        let mut errors: Vec<(ServiceKind, String)> = Vec::new();
+        let kinds: Vec<ServiceKind> = self.services.keys().copied().collect();
+        for kind in kinds {
+            if kind == ServiceKind::PhpFpm {
+                continue;
+            }
+            let Some(svc) = self.services.get_mut(&kind) else {
+                continue;
+            };
+            if let Err(e) = svc.stop() {
+                errors.push((kind, format!("stop failed: {e}")));
+                continue;
+            }
+            svc.circuit_breaker.reset();
+            if let Err(e) = svc.start() {
+                svc.state = ServiceState::Failed {
+                    reason: e.to_string(),
+                };
+                errors.push((kind, format!("start failed: {e}")));
+            }
+        }
+        let fpm = if self.services.contains_key(&ServiceKind::PhpFpm) {
+            Some(self.restart_fpm_service())
+        } else {
+            None
+        };
+        (fpm, errors)
     }
 
     /// Read access to one registered service (command/args/env inspection).
@@ -1801,5 +1900,248 @@ mod tests {
             svc.state
         );
         assert!(svc.started_at().is_none(), "never recorded as running");
+    }
+
+    // ---- C7-1 (review 5650 r8): atomic FPM restart transaction ----
+
+    /// Owned or Unknown at the restart snapshot: truthful skip BEFORE any
+    /// stop — old registration, child, timestamp, and state untouched.
+    /// Fails at head 8b06320 (no transaction existed; restart composed
+    /// public stop with the guarded start and stopped the child first).
+    #[test]
+    fn restart_fpm_tx_skips_zero_mutation_under_owned_and_unknown() {
+        let (flag, probe) = owned_flag();
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(probe);
+        sup.register(sleeper(ServiceKind::PhpFpm)).unwrap();
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        let started = sup
+            .service(ServiceKind::PhpFpm)
+            .unwrap()
+            .started_at()
+            .expect("running");
+
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        match sup.restart_fpm_service() {
+            FpmRestartTxOutcome::SkippedOwned => {}
+            other => panic!("expected SkippedOwned, got {other:?}"),
+        }
+        {
+            let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+            assert_eq!(svc.started_at(), Some(started), "old child untouched");
+            assert!(
+                matches!(svc.state, ServiceState::Running { .. }),
+                "{:?}",
+                svc.state
+            );
+        }
+
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        sup.set_fpm_ownership_probe(std::sync::Arc::new(|| {
+            FpmOwnership::Unknown("ownership probe (pgrep) failed with status 2".to_string())
+        }));
+        match sup.restart_fpm_service() {
+            FpmRestartTxOutcome::SkippedOwnershipUnknown(diag) => {
+                assert!(diag.contains("pgrep"), "{diag}")
+            }
+            other => panic!("expected SkippedOwnershipUnknown, got {other:?}"),
+        }
+        {
+            let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+            assert_eq!(svc.started_at(), Some(started), "old child untouched");
+            assert!(
+                matches!(svc.state, ServiceState::Running { .. }),
+                "{:?}",
+                svc.state
+            );
+        }
+        sup.set_fpm_ownership_probe(unowned_probe());
+        sup.stop_all().unwrap();
+    }
+
+    /// An unconfigured (default-probe) supervisor refuses the restart
+    /// transaction fail-closed with zero mutation.
+    #[test]
+    fn restart_fpm_tx_unconfigured_supervisor_refuses_zero_mutation() {
+        let mut sup = ServiceSupervisor::new();
+        match sup.restart_fpm_service() {
+            FpmRestartTxOutcome::SkippedOwnershipUnknown(diag) => {
+                assert!(diag.contains("not configured"), "{diag}")
+            }
+            other => panic!("expected SkippedOwnershipUnknown, got {other:?}"),
+        }
+        assert!(sup.services.is_empty(), "zero mutation");
+    }
+
+    /// Unowned snapshot: one coherent stop/start of the SAME registration —
+    /// fresh spawn, same command, Running state.
+    #[test]
+    fn restart_fpm_tx_restarts_under_unowned() {
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(unowned_probe());
+        sup.register(sleeper(ServiceKind::PhpFpm)).unwrap();
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        let old_pid = match sup.service(ServiceKind::PhpFpm).unwrap().state {
+            ServiceState::Running { pid } => pid,
+            ref other => panic!("running expected, got {other:?}"),
+        };
+
+        match sup.restart_fpm_service() {
+            FpmRestartTxOutcome::Restarted => {}
+            other => panic!("expected Restarted, got {other:?}"),
+        }
+        let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+        match svc.state {
+            ServiceState::Running { pid } => assert_ne!(pid, old_pid, "fresh spawn"),
+            ref other => panic!("running expected, got {other:?}"),
+        }
+        assert!(svc.started_at().is_some());
+        sup.stop_all().unwrap();
+
+        // Nothing registered: truthful NotRegistered, zero mutation.
+        let mut empty = ServiceSupervisor::new();
+        empty.set_fpm_ownership_probe(unowned_probe());
+        match empty.restart_fpm_service() {
+            FpmRestartTxOutcome::NotRegistered => {}
+            other => panic!("expected NotRegistered, got {other:?}"),
+        }
+    }
+
+    /// A failing stop aborts the restart BEFORE any start: the old child
+    /// remains fully supervised with its truthful state (C4 semantics).
+    #[test]
+    fn restart_fpm_tx_stop_failure_keeps_old_child() {
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(unowned_probe());
+        sup.register(sleeper(ServiceKind::PhpFpm)).unwrap();
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        let started = sup
+            .service(ServiceKind::PhpFpm)
+            .unwrap()
+            .started_at()
+            .expect("running");
+
+        sup.inject_stop_failure(ServiceKind::PhpFpm, "sigterm denied");
+        match sup.restart_fpm_service() {
+            FpmRestartTxOutcome::StopFailed { error } => {
+                assert!(error.contains("injected stop failure"), "{error}")
+            }
+            other => panic!("expected StopFailed, got {other:?}"),
+        }
+        let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+        assert!(
+            matches!(svc.state, ServiceState::Running { .. }),
+            "no false Stopped: {:?}",
+            svc.state
+        );
+        assert_eq!(svc.started_at(), Some(started), "old child intact");
+        assert!(svc.child.is_some(), "child handle retained for retry");
+        sup.stop_all().unwrap();
+    }
+
+    /// Start failure after a successful stop: truthful `Failed`
+    /// registration remains supervised, no child, no orphan — never
+    /// reported as restarted or untouched.
+    #[test]
+    fn restart_fpm_tx_start_failure_reports_truthful_failed_state() {
+        // A binary that deletes itself on first run: initial start works,
+        // the restart's stop succeeds, the restart's start cannot spawn.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bin = tmp.path().join("self-deleting-fpm.sh");
+        std::fs::write(&bin, "#!/bin/sh\nrm -f \"$0\"\nexec sleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(unowned_probe());
+        sup.register(ManagedService::new(
+            ServiceKind::PhpFpm,
+            bin.to_string_lossy().to_string(),
+            vec![],
+        ))
+        .unwrap();
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        // Wait (bounded) until the script has consumed itself — a fixed
+        // sleep is racy under full-suite parallel load.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while bin.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(!bin.exists(), "fixture: binary must have deleted itself");
+
+        match sup.restart_fpm_service() {
+            FpmRestartTxOutcome::StartFailed { error } => {
+                assert!(!error.is_empty(), "diagnostic surfaced")
+            }
+            other => panic!("expected StartFailed, got {other:?}"),
+        }
+        let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+        assert!(
+            matches!(svc.state, ServiceState::Failed { .. }),
+            "truthful Failed state: {:?}",
+            svc.state
+        );
+        assert!(svc.child.is_none(), "no child, no orphan");
+        assert!(svc.started_at().is_none(), "never recorded as running");
+    }
+
+    /// All-services restart: FPM goes through the atomic transaction
+    /// (Owned/Unknown skip BEFORE any stop), non-FPM services restart
+    /// normally, and the aggregate reports the truth.
+    #[test]
+    fn restart_all_handles_fpm_atomically_and_non_fpm_normally() {
+        let (flag, probe) = owned_flag();
+        let mut sup = ServiceSupervisor::new();
+        sup.set_fpm_ownership_probe(probe);
+        sup.register(sleeper(ServiceKind::PhpFpm)).unwrap();
+        sup.register(sleeper(ServiceKind::Mailpit)).unwrap();
+        sup.start_service(ServiceKind::PhpFpm).unwrap();
+        sup.start_service(ServiceKind::Mailpit).unwrap();
+        let fpm_started = sup
+            .service(ServiceKind::PhpFpm)
+            .unwrap()
+            .started_at()
+            .expect("running");
+        let mailpit_started = sup
+            .service(ServiceKind::Mailpit)
+            .unwrap()
+            .started_at()
+            .expect("running");
+
+        // Herd takes ownership: FPM untouched, Mailpit restarts.
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (fpm, errors) = sup.restart_all();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            matches!(fpm, Some(FpmRestartTxOutcome::SkippedOwned)),
+            "{fpm:?}"
+        );
+        {
+            let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+            assert_eq!(svc.started_at(), Some(fpm_started), "FPM untouched");
+            assert!(matches!(svc.state, ServiceState::Running { .. }));
+            let mp = sup.service(ServiceKind::Mailpit).unwrap();
+            assert!(mp.started_at().is_some());
+            assert_ne!(
+                mp.started_at(),
+                Some(mailpit_started),
+                "non-FPM service actually restarted"
+            );
+        }
+
+        // Unowned again: FPM restarts coherently too.
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let (fpm, errors) = sup.restart_all();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            matches!(fpm, Some(FpmRestartTxOutcome::Restarted)),
+            "{fpm:?}"
+        );
+        assert_ne!(
+            sup.service(ServiceKind::PhpFpm).unwrap().started_at(),
+            Some(fpm_started),
+            "FPM restarted under Unowned"
+        );
+        sup.stop_all().unwrap();
     }
 }

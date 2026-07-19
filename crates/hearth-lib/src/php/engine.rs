@@ -835,15 +835,24 @@ pub async fn restart_fpm_conditionally(
         }
         return FpmRestartOutcome::NotRegistered { herd_hint: false };
     }
-    if let Err(e) = sup.stop_service(ServiceKind::PhpFpm) {
-        return FpmRestartOutcome::Failed {
-            message: format!("php-fpm stop failed: {e}"),
-        };
-    }
-    match sup.start_service(ServiceKind::PhpFpm) {
-        Ok(()) => FpmRestartOutcome::Restarted,
-        Err(e) => FpmRestartOutcome::Failed {
-            message: format!("php-fpm start failed: {e}"),
+    // C7-1 (review 5650 r8): the mutation itself is the supervisor's ONE
+    // atomic ownership-snapshot transaction — the engine reading above is a
+    // read-only fast path only. An Unowned→Owned/Unknown flip landing after
+    // that reading is refused HERE with zero mutation; the old split
+    // stop-then-guarded-start could stop the child before refusing.
+    use crate::service::supervisor::FpmRestartTxOutcome;
+    match sup.restart_fpm_service() {
+        FpmRestartTxOutcome::Restarted => FpmRestartOutcome::Restarted,
+        FpmRestartTxOutcome::SkippedOwned => FpmRestartOutcome::SkippedHerdOwned,
+        FpmRestartTxOutcome::SkippedOwnershipUnknown(diag) => {
+            FpmRestartOutcome::SkippedOwnershipUnknown { reason: diag }
+        }
+        FpmRestartTxOutcome::NotRegistered => FpmRestartOutcome::NotRegistered { herd_hint: false },
+        FpmRestartTxOutcome::StopFailed { error } => FpmRestartOutcome::Failed {
+            message: format!("php-fpm stop failed: {error}"),
+        },
+        FpmRestartTxOutcome::StartFailed { error } => FpmRestartOutcome::Failed {
+            message: format!("php-fpm start failed: {error}"),
         },
     }
 }
@@ -2790,5 +2799,73 @@ echo "Scan for additional .ini files in: {}"
         }
         let fpm = restart_fpm_conditionally(&supervisor, &fx.engine).await;
         assert_eq!(fpm, FpmRestartOutcome::NotRegistered { herd_hint: true });
+    }
+
+    // ---- C7-1 (review 5650 r8): atomic config/MCP restart boundary ----
+
+    /// The config/MCP restart's mutation is the supervisor's own atomic
+    /// snapshot transaction. An Unowned→Owned or Unowned→Unknown flip
+    /// landing AFTER the engine's read-only fast path is refused with ZERO
+    /// FPM mutation. Fails at head 8b06320 (the old split
+    /// stop-then-guarded-start stopped the child, then refused).
+    #[tokio::test]
+    async fn config_restart_flip_after_engine_check_performs_zero_fpm_mutation() {
+        use crate::service::supervisor::ManagedService;
+
+        for flip_to in ["owned", "unknown"] {
+            let fx = fixture(false); // engine fast path reads Unowned
+            let supervisor = Arc::new(Mutex::new(ServiceSupervisor::new()));
+            {
+                let mut sup = supervisor.lock().await;
+                sup.set_fpm_ownership_probe(Arc::new(|| FpmOwnership::Unowned));
+                sup.register(ManagedService::new(
+                    ServiceKind::PhpFpm,
+                    "/bin/sleep".to_string(),
+                    vec!["30".to_string()],
+                ))
+                .unwrap();
+                sup.start_service(ServiceKind::PhpFpm).unwrap();
+                // The flip lands before the supervisor transaction snapshot.
+                let flipped: crate::service::supervisor::ExternalFpmOwnership =
+                    if flip_to == "owned" {
+                        Arc::new(|| FpmOwnership::Owned)
+                    } else {
+                        Arc::new(|| {
+                            FpmOwnership::Unknown(
+                                "ownership probe (pgrep) failed with status 2".to_string(),
+                            )
+                        })
+                    };
+                sup.set_fpm_ownership_probe(flipped);
+            }
+            let started = supervisor
+                .lock()
+                .await
+                .service(ServiceKind::PhpFpm)
+                .unwrap()
+                .started_at()
+                .expect("running");
+
+            let outcome = restart_fpm_conditionally(&supervisor, &fx.engine).await;
+            match (flip_to, &outcome) {
+                ("owned", FpmRestartOutcome::SkippedHerdOwned) => {}
+                ("unknown", FpmRestartOutcome::SkippedOwnershipUnknown { reason }) => {
+                    assert!(reason.contains("pgrep"), "{reason}");
+                }
+                other => panic!("truthful zero-mutation skip expected, got {other:?}"),
+            }
+            let mut sup = supervisor.lock().await;
+            {
+                let svc = sup.service(ServiceKind::PhpFpm).unwrap();
+                assert!(
+                    matches!(svc.state, crate::service::ServiceState::Running { .. }),
+                    "zero mutation ({flip_to}): {:?}",
+                    svc.state
+                );
+                assert_eq!(svc.started_at(), Some(started), "same spawn ({flip_to})");
+            }
+            sup.set_fpm_ownership_probe(Arc::new(|| FpmOwnership::Unowned));
+            sup.stop_service(ServiceKind::PhpFpm).unwrap();
+        }
     }
 }
