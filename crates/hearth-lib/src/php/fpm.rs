@@ -1494,6 +1494,278 @@ mod tests {
 
     const GROUP_DIAGNOSTIC_BYTES: usize = 4096;
 
+    #[cfg(target_os = "macos")]
+    const MAX_GROUP_MEMBER_RECORDS: usize = 4096;
+
+    #[cfg(target_os = "macos")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum GroupMemberState {
+        Live,
+        ExitedZombie,
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct GroupMemberRecord {
+        pid: i32,
+        pgid: i32,
+        effective_uid: u32,
+        real_uid: u32,
+        saved_uid: u32,
+        state: GroupMemberState,
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum GroupMemberInspection {
+        NoLiveMembers {
+            member_count: usize,
+        },
+        LiveMembers {
+            member_count: usize,
+            changed_credential_members: usize,
+            diagnostic: String,
+        },
+    }
+
+    #[cfg(target_os = "macos")]
+    type GroupMemberSnapshotSeam =
+        std::sync::Arc<std::sync::Mutex<Result<Vec<GroupMemberRecord>, String>>>;
+
+    #[cfg(target_os = "macos")]
+    fn classify_group_member_snapshot(
+        pgid: i32,
+        leader_pid: i32,
+        launched_uid: u32,
+        mut members: Vec<GroupMemberRecord>,
+    ) -> Result<GroupMemberInspection, String> {
+        if members.is_empty() {
+            return Err(format!(
+                "process-table inspection returned no records for retained PGID {pgid}"
+            ));
+        }
+        members.sort_unstable_by_key(|member| member.pid);
+        for pair in members.windows(2) {
+            if pair[0].pid == pair[1].pid {
+                return Err(format!(
+                    "process-table inspection returned duplicate PID {} for PGID {pgid}",
+                    pair[0].pid
+                ));
+            }
+        }
+        for member in &members {
+            if member.pid <= 0 {
+                return Err(format!(
+                    "process-table inspection returned invalid PID {} for PGID {pgid}",
+                    member.pid
+                ));
+            }
+            if member.pgid != pgid {
+                return Err(format!(
+                    "process-table inspection returned PID {} with wrong PGID {} (expected {pgid})",
+                    member.pid, member.pgid
+                ));
+            }
+        }
+        let leader = members
+            .iter()
+            .find(|member| member.pid == leader_pid)
+            .ok_or_else(|| {
+                format!(
+                    "process-table inspection omitted retained leader PID {leader_pid} for PGID {pgid}"
+                )
+            })?;
+        if leader.state != GroupMemberState::ExitedZombie {
+            return Err(format!(
+                "process-table inspection reported retained leader PID {leader_pid} as live"
+            ));
+        }
+
+        let live_members = members
+            .iter()
+            .filter(|member| member.state == GroupMemberState::Live)
+            .collect::<Vec<_>>();
+        if live_members.is_empty() {
+            return Ok(GroupMemberInspection::NoLiveMembers {
+                member_count: members.len(),
+            });
+        }
+        let changed_credential_members = live_members
+            .iter()
+            .filter(|member| {
+                member.effective_uid != launched_uid
+                    || member.real_uid != launched_uid
+                    || member.saved_uid != launched_uid
+            })
+            .count();
+        let survivors = live_members
+            .iter()
+            .take(8)
+            .map(|member| {
+                let changed = member.effective_uid != launched_uid
+                    || member.real_uid != launched_uid
+                    || member.saved_uid != launched_uid;
+                format!(
+                    "pid={} pgid={} euid={} ruid={} svuid={}{}",
+                    member.pid,
+                    member.pgid,
+                    member.effective_uid,
+                    member.real_uid,
+                    member.saved_uid,
+                    if changed { " credentials-changed" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let omitted = live_members.len().saturating_sub(8);
+        let diagnostic = format!(
+            "PGID {pgid} retained {} live member(s), {changed_credential_members} with credentials changed: {survivors}{}",
+            live_members.len(),
+            if omitted == 0 {
+                String::new()
+            } else {
+                format!(", ... {omitted} more")
+            }
+        );
+        Ok(GroupMemberInspection::LiveMembers {
+            member_count: members.len(),
+            changed_credential_members,
+            diagnostic,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_process_group_pids(pgid: i32) -> Result<Vec<i32>, String> {
+        let mut raw_pids = vec![0 as nix::libc::pid_t; MAX_GROUP_MEMBER_RECORDS + 1];
+        let buffer_bytes = raw_pids
+            .len()
+            .checked_mul(std::mem::size_of::<nix::libc::pid_t>())
+            .and_then(|bytes| i32::try_from(bytes).ok())
+            .ok_or_else(|| "process-group member buffer size overflowed".to_string())?;
+        let returned_count = unsafe {
+            nix::libc::proc_listpgrppids(
+                pgid,
+                raw_pids.as_mut_ptr().cast::<nix::libc::c_void>(),
+                buffer_bytes,
+            )
+        };
+        if returned_count < 0 {
+            return Err(format!(
+                "proc_listpgrppids({pgid}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let count = returned_count as usize;
+        if count > MAX_GROUP_MEMBER_RECORDS {
+            return Err(format!(
+                "proc_listpgrppids({pgid}) reached the bounded {MAX_GROUP_MEMBER_RECORDS}-member limit; snapshot may be truncated"
+            ));
+        }
+        raw_pids.truncate(count);
+        let mut pids = raw_pids.into_iter().collect::<Vec<i32>>();
+        if pids.iter().any(|pid| *pid <= 0) {
+            return Err(format!(
+                "proc_listpgrppids({pgid}) returned an ambiguous non-positive PID"
+            ));
+        }
+        pids.sort_unstable();
+        if pids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(format!(
+                "proc_listpgrppids({pgid}) returned duplicate PID records"
+            ));
+        }
+        Ok(pids)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_process_group_members(
+        pgid: i32,
+        leader_pid: i32,
+        launched_uid: u32,
+    ) -> Result<Vec<GroupMemberRecord>, String> {
+        let before = macos_process_group_pids(pgid)?;
+        let mut members = Vec::with_capacity(before.len());
+        for pid in &before {
+            let mut info = std::mem::MaybeUninit::<nix::libc::proc_bsdinfo>::uninit();
+            let expected = i32::try_from(std::mem::size_of::<nix::libc::proc_bsdinfo>())
+                .map_err(|_| "proc_bsdinfo size overflowed".to_string())?;
+            let returned = unsafe {
+                nix::libc::proc_pidinfo(
+                    *pid,
+                    nix::libc::PROC_PIDTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast::<nix::libc::c_void>(),
+                    expected,
+                )
+            };
+            if returned != expected {
+                let error = std::io::Error::last_os_error();
+                if *pid == leader_pid
+                    && returned == 0
+                    && error.raw_os_error() == Some(nix::libc::ESRCH)
+                {
+                    members.push(GroupMemberRecord {
+                        pid: leader_pid,
+                        pgid,
+                        effective_uid: launched_uid,
+                        real_uid: launched_uid,
+                        saved_uid: launched_uid,
+                        state: GroupMemberState::ExitedZombie,
+                    });
+                    continue;
+                }
+                return Err(format!(
+                    "proc_pidinfo({pid}) returned {returned} bytes, expected {expected}: {}",
+                    error
+                ));
+            }
+            let info = unsafe { info.assume_init() };
+            let observed_pid = i32::try_from(info.pbi_pid).map_err(|_| {
+                format!(
+                    "proc_pidinfo({pid}) returned an out-of-range PID {}",
+                    info.pbi_pid
+                )
+            })?;
+            let observed_pgid = i32::try_from(info.pbi_pgid).map_err(|_| {
+                format!(
+                    "proc_pidinfo({pid}) returned an out-of-range PGID {}",
+                    info.pbi_pgid
+                )
+            })?;
+            if observed_pid != *pid {
+                return Err(format!(
+                    "proc_pidinfo({pid}) returned mismatched PID {observed_pid}"
+                ));
+            }
+            let state = match info.pbi_status {
+                nix::libc::SZOMB => GroupMemberState::ExitedZombie,
+                nix::libc::SIDL | nix::libc::SRUN | nix::libc::SSLEEP | nix::libc::SSTOP => {
+                    GroupMemberState::Live
+                }
+                status => {
+                    return Err(format!(
+                        "proc_pidinfo({pid}) returned ambiguous process status {status}"
+                    ));
+                }
+            };
+            members.push(GroupMemberRecord {
+                pid: observed_pid,
+                pgid: observed_pgid,
+                effective_uid: info.pbi_uid,
+                real_uid: info.pbi_ruid,
+                saved_uid: info.pbi_svuid,
+                state,
+            });
+        }
+        let after = macos_process_group_pids(pgid)?;
+        if before != after {
+            return Err(format!(
+                "process-group membership changed during PGID {pgid} inspection; refusing an unstable snapshot"
+            ));
+        }
+        Ok(members)
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum GroupAbsenceEvidence {
         NoSuchProcessGroup,
@@ -1507,6 +1779,7 @@ mod tests {
         leader_pid: i32,
         launched_uid: u32,
         evidence: GroupAbsenceEvidence,
+        inspected_members: usize,
     }
 
     #[derive(Default)]
@@ -1520,13 +1793,28 @@ mod tests {
         graceful_signal_error: bool,
         graceful_poll_error: bool,
         #[cfg(target_os = "macos")]
-        eperm_after_os_absence: bool,
+        force_group_operations_eperm: bool,
+        #[cfg(target_os = "macos")]
+        member_snapshot: Option<GroupMemberSnapshotSeam>,
         telemetry: Option<std::sync::Arc<GroupCleanupTelemetry>>,
+    }
+
+    enum GroupSignalOutcome {
+        DeliveredOrAbsent,
+        #[cfg(target_os = "macos")]
+        PermissionDenied,
+    }
+
+    enum GroupCertificationOutcome {
+        Certified(GroupCleanupCertificate),
+        Pending,
+        #[cfg(target_os = "macos")]
+        RetainedMembers(String),
     }
 
     enum GroupPollOutcome {
         Certified(GroupCleanupCertificate),
-        TimedOut,
+        TimedOut { diagnostic: Option<String> },
     }
 
     struct GuardedProcessGroupRun {
@@ -1657,24 +1945,28 @@ mod tests {
             _leader_exited_unreaped: bool,
         ) -> Result<Result<(), nix::errno::Errno>, String> {
             self.ensure_unreaped_witness("group probe")?;
-            let result = nix::sys::signal::kill(nix::unistd::Pid::from_raw(-self.pgid), None);
             #[cfg(target_os = "macos")]
-            if _leader_exited_unreaped
-                && self.faults.eperm_after_os_absence
-                && result == Err(nix::errno::Errno::ESRCH)
-            {
+            if _leader_exited_unreaped && self.faults.force_group_operations_eperm {
                 return Ok(Err(nix::errno::Errno::EPERM));
             }
+            let result = nix::sys::signal::kill(nix::unistd::Pid::from_raw(-self.pgid), None);
             Ok(result)
         }
 
         #[cfg(target_os = "macos")]
-        fn eperm_is_identity_bound_absence(&self) -> Result<bool, String> {
-            Ok(nix::unistd::Uid::current().as_raw() == self.launched_uid
-                && self.observe_leader_exit()?.is_some())
+        fn inspect_group_members(&self) -> Result<GroupMemberInspection, String> {
+            let members = if let Some(snapshot) = &self.faults.member_snapshot {
+                snapshot
+                    .lock()
+                    .map_err(|_| "member-snapshot seam lock poisoned".to_string())?
+                    .clone()?
+            } else {
+                macos_process_group_members(self.pgid, self.pgid, self.launched_uid)?
+            };
+            classify_group_member_snapshot(self.pgid, self.pgid, self.launched_uid, members)
         }
 
-        fn certify_group_absent_pre_reap(&self) -> Result<Option<GroupCleanupCertificate>, String> {
+        fn certify_group_absent_pre_reap(&self) -> Result<GroupCertificationOutcome, String> {
             self.ensure_unreaped_witness("absence certification")?;
             if nix::unistd::Uid::current().as_raw() != self.launched_uid {
                 return Err(format!(
@@ -1683,29 +1975,34 @@ mod tests {
                 ));
             }
             if self.observe_leader_exit()?.is_none() {
-                return Ok(None);
+                return Ok(GroupCertificationOutcome::Pending);
             }
-            let evidence = match self.probe_group_signalability(true)? {
-                Err(nix::errno::Errno::ESRCH) => GroupAbsenceEvidence::NoSuchProcessGroup,
+            let (evidence, inspected_members) = match self.probe_group_signalability(true)? {
+                Err(nix::errno::Errno::ESRCH) => (GroupAbsenceEvidence::NoSuchProcessGroup, 0),
                 #[cfg(target_os = "macos")]
-                Err(nix::errno::Errno::EPERM) => {
-                    // The unreaped leader still binds this PID/PGID to the
-                    // same-uid group we launched. On macOS EPERM here means
-                    // that group has no signalable live member; it is never
-                    // treated as absence without that retained witness.
-                    GroupAbsenceEvidence::ExitedUnreapedLeaderPermissionDenied
-                }
-                Ok(()) => return Ok(None),
+                Err(nix::errno::Errno::EPERM) => match self.inspect_group_members()? {
+                    GroupMemberInspection::NoLiveMembers { member_count } => (
+                        GroupAbsenceEvidence::ExitedUnreapedLeaderPermissionDenied,
+                        member_count,
+                    ),
+                    GroupMemberInspection::LiveMembers { diagnostic, .. } => {
+                        return Ok(GroupCertificationOutcome::RetainedMembers(diagnostic));
+                    }
+                },
+                Ok(()) => return Ok(GroupCertificationOutcome::Pending),
                 Err(error) => {
                     return Err(format!("could not inspect PGID {}: {error}", self.pgid));
                 }
             };
-            Ok(Some(GroupCleanupCertificate {
-                pgid: self.pgid,
-                leader_pid: self.pgid,
-                launched_uid: self.launched_uid,
-                evidence,
-            }))
+            Ok(GroupCertificationOutcome::Certified(
+                GroupCleanupCertificate {
+                    pgid: self.pgid,
+                    leader_pid: self.pgid,
+                    launched_uid: self.launched_uid,
+                    evidence,
+                    inspected_members,
+                },
+            ))
         }
 
         fn record_cleanup_certificate(
@@ -1722,12 +2019,19 @@ mod tests {
             Ok(())
         }
 
-        fn signal_group(&self, signal: nix::sys::signal::Signal) -> Result<(), String> {
+        fn signal_group(
+            &self,
+            signal: nix::sys::signal::Signal,
+        ) -> Result<GroupSignalOutcome, String> {
             self.ensure_unreaped_witness("group signal")?;
+            #[cfg(target_os = "macos")]
+            if self.faults.force_group_operations_eperm {
+                return Ok(GroupSignalOutcome::PermissionDenied);
+            }
             match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-self.pgid), signal) {
-                Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(GroupSignalOutcome::DeliveredOrAbsent),
                 #[cfg(target_os = "macos")]
-                Err(nix::errno::Errno::EPERM) if self.eperm_is_identity_bound_absence()? => Ok(()),
+                Err(nix::errno::Errno::EPERM) => Ok(GroupSignalOutcome::PermissionDenied),
                 Err(error) => Err(format!(
                     "could not send {signal:?} to validated PGID {}: {error}",
                     self.pgid
@@ -1737,12 +2041,20 @@ mod tests {
 
         fn poll_group_absence(&self, timeout: Duration) -> Result<GroupPollOutcome, String> {
             let deadline = std::time::Instant::now() + timeout;
+            let mut diagnostic = None;
             loop {
-                if let Some(certificate) = self.certify_group_absent_pre_reap()? {
-                    return Ok(GroupPollOutcome::Certified(certificate));
+                match self.certify_group_absent_pre_reap()? {
+                    GroupCertificationOutcome::Certified(certificate) => {
+                        return Ok(GroupPollOutcome::Certified(certificate));
+                    }
+                    GroupCertificationOutcome::Pending => {}
+                    #[cfg(target_os = "macos")]
+                    GroupCertificationOutcome::RetainedMembers(current) => {
+                        diagnostic = Some(current);
+                    }
                 }
                 if std::time::Instant::now() >= deadline {
-                    return Ok(GroupPollOutcome::TimedOut);
+                    return Ok(GroupPollOutcome::TimedOut { diagnostic });
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -1770,10 +2082,14 @@ mod tests {
             } else {
                 self.poll_group_absence(graceful_timeout)
             };
+            let mut certification_error = false;
             let graceful_certificate = match graceful_poll {
                 Ok(GroupPollOutcome::Certified(certificate)) => Some(certificate),
-                Ok(GroupPollOutcome::TimedOut) => None,
+                Ok(GroupPollOutcome::TimedOut { .. }) => None,
                 Err(error) => {
+                    if !self.faults.graceful_poll_error {
+                        certification_error = true;
+                    }
                     errors.push(error);
                     None
                 }
@@ -1786,14 +2102,36 @@ mod tests {
                 }
                 match self.poll_group_absence(force_timeout) {
                     Ok(GroupPollOutcome::Certified(certificate)) => {
-                        final_certificate = Some(certificate);
+                        if certification_error {
+                            errors.push(format!(
+                                "discarded PGID {} absence proof after an earlier inspection error",
+                                self.pgid
+                            ));
+                        } else {
+                            final_certificate = Some(certificate);
+                        }
                     }
-                    Ok(GroupPollOutcome::TimedOut) => errors.push(format!(
-                        "validated PGID {} survived bounded SIGKILL polling",
-                        self.pgid
-                    )),
-                    Err(error) => errors.push(error),
+                    Ok(GroupPollOutcome::TimedOut { diagnostic }) => {
+                        errors.push(match diagnostic {
+                            Some(diagnostic) => format!(
+                                "validated PGID {} survived bounded SIGKILL polling: {diagnostic}",
+                                self.pgid
+                            ),
+                            None => format!(
+                                "validated PGID {} survived bounded SIGKILL polling",
+                                self.pgid
+                            ),
+                        })
+                    }
+                    Err(error) => {
+                        certification_error = true;
+                        errors.push(error);
+                    }
                 }
+            }
+
+            if certification_error {
+                final_certificate = None;
             }
 
             if let Some(certificate) = final_certificate {
@@ -2133,13 +2471,11 @@ mod tests {
 
             let telemetry = std::sync::Arc::new(GroupCleanupTelemetry::default());
             let mut command = std::process::Command::new("/bin/sh");
-            command
-                .arg("-c")
-                .arg("trap '' QUIT; (trap '' QUIT; while :; do sleep 1; done) & exit 0");
+            command.arg("-c").arg("exit 0");
             let mut group = GuardedGroupChild::spawn_with_faults(
                 &mut command,
                 GroupTestFaults {
-                    eperm_after_os_absence: true,
+                    force_group_operations_eperm: true,
                     telemetry: Some(std::sync::Arc::clone(&telemetry)),
                     ..GroupTestFaults::default()
                 },
@@ -2164,6 +2500,16 @@ mod tests {
                 telemetry.certificate.lock().unwrap().unwrap().evidence,
                 GroupAbsenceEvidence::ExitedUnreapedLeaderPermissionDenied
             );
+            assert_eq!(
+                telemetry
+                    .certificate
+                    .lock()
+                    .unwrap()
+                    .unwrap()
+                    .inspected_members,
+                1,
+                "EPERM certificate did not prove the zombie-only member snapshot"
+            );
             assert!(
                 !signal_marker.exists(),
                 "unrelated process received SIGQUIT"
@@ -2175,6 +2521,306 @@ mod tests {
             unrelated.kill().unwrap();
             unrelated.wait().unwrap();
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn group_member(pid: i32, pgid: i32, uid: u32, state: GroupMemberState) -> GroupMemberRecord {
+        GroupMemberRecord {
+            pid,
+            pgid,
+            effective_uid: uid,
+            real_uid: uid,
+            saved_uid: uid,
+            state,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn eperm_member_snapshot_blocks_mixed_zombie_and_live_records() {
+        let pgid = 4100;
+        let uid = nix::unistd::Uid::current().as_raw();
+        let inspection = classify_group_member_snapshot(
+            pgid,
+            pgid,
+            uid,
+            vec![
+                group_member(pgid, pgid, uid, GroupMemberState::ExitedZombie),
+                group_member(pgid + 1, pgid, uid, GroupMemberState::Live),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            inspection,
+            GroupMemberInspection::LiveMembers {
+                member_count: 2,
+                changed_credential_members: 0,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn eperm_member_snapshot_rejects_wrong_pgid() {
+        let pgid = 4200;
+        let uid = nix::unistd::Uid::current().as_raw();
+        let error = classify_group_member_snapshot(
+            pgid,
+            pgid,
+            uid,
+            vec![group_member(
+                pgid,
+                pgid + 1,
+                uid,
+                GroupMemberState::ExitedZombie,
+            )],
+        )
+        .unwrap_err();
+        assert!(error.contains("wrong PGID"), "{error}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn eperm_member_snapshot_reports_changed_uid_live_member() {
+        let pgid = 4300;
+        let uid = nix::unistd::Uid::current().as_raw();
+        let changed_uid = uid.saturating_add(1);
+        let inspection = classify_group_member_snapshot(
+            pgid,
+            pgid,
+            uid,
+            vec![
+                group_member(pgid, pgid, uid, GroupMemberState::ExitedZombie),
+                group_member(pgid + 1, pgid, changed_uid, GroupMemberState::Live),
+            ],
+        )
+        .unwrap();
+        match inspection {
+            GroupMemberInspection::LiveMembers {
+                changed_credential_members,
+                diagnostic,
+                ..
+            } => {
+                assert_eq!(changed_credential_members, 1);
+                assert!(diagnostic.contains("credentials changed"), "{diagnostic}");
+                assert!(
+                    diagnostic.contains(&format!("pid={}", pgid + 1)),
+                    "{diagnostic}"
+                );
+            }
+            other => panic!("changed-uid live member was not retained: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn eperm_member_snapshot_accepts_positive_zombie_only_group() {
+        let pgid = 4400;
+        let uid = nix::unistd::Uid::current().as_raw();
+        assert_eq!(
+            classify_group_member_snapshot(
+                pgid,
+                pgid,
+                uid,
+                vec![group_member(
+                    pgid,
+                    pgid,
+                    uid,
+                    GroupMemberState::ExitedZombie,
+                )],
+            )
+            .unwrap(),
+            GroupMemberInspection::NoLiveMembers { member_count: 1 }
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn eperm_member_inspection_error_preserves_witness_for_bounded_retry() {
+        let telemetry = std::sync::Arc::new(GroupCleanupTelemetry::default());
+        let snapshot = std::sync::Arc::new(std::sync::Mutex::new(Err(
+            "injected process-table inspection failure".to_string(),
+        )));
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("exit 0");
+        let mut group = GuardedGroupChild::spawn_with_faults(
+            &mut command,
+            GroupTestFaults {
+                force_group_operations_eperm: true,
+                member_snapshot: Some(std::sync::Arc::clone(&snapshot)),
+                telemetry: Some(std::sync::Arc::clone(&telemetry)),
+                ..GroupTestFaults::default()
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while group.observe_leader_exit().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let error = group
+            .shutdown(Duration::from_millis(1), Duration::from_millis(1))
+            .unwrap_err();
+        assert!(
+            error.contains("injected process-table inspection failure"),
+            "{error}"
+        );
+        assert!(
+            group.status.is_none(),
+            "leader witness was reaped on inspection error"
+        );
+        assert!(telemetry.certificate.lock().unwrap().is_none());
+        assert_eq!(
+            telemetry
+                .post_reap_group_operations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        *snapshot.lock().unwrap() = Ok(vec![group_member(
+            group.pgid,
+            group.pgid,
+            group.launched_uid,
+            GroupMemberState::ExitedZombie,
+        )]);
+        group
+            .shutdown(Duration::from_millis(10), Duration::from_millis(10))
+            .unwrap();
+        assert_cleanup_telemetry(group.pgid, &telemetry);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn credential_changed_live_member_blocks_eperm_certificate_until_resolved() {
+        let tmp = tempfile::Builder::new()
+            .prefix("hearth fpm proof changed uid")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let member_pid_path = tmp.path().join("member.pid");
+        let unrelated_signal_marker = tmp.path().join("unrelated.signal");
+        let unrelated_ready_marker = tmp.path().join("unrelated.ready");
+
+        let mut unrelated = std::process::Command::new("/bin/sh");
+        unrelated
+            .arg("-c")
+            .arg(
+                "trap 'printf signaled > \"$HEARTH_SIGNAL_MARKER\"' QUIT TERM; \
+                 : > \"$HEARTH_READY_MARKER\"; while :; do sleep 1; done",
+            )
+            .env("HEARTH_SIGNAL_MARKER", &unrelated_signal_marker)
+            .env("HEARTH_READY_MARKER", &unrelated_ready_marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut unrelated = unrelated.spawn().unwrap();
+        let unrelated_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !unrelated_ready_marker.exists() {
+            assert!(std::time::Instant::now() < unrelated_deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let telemetry = std::sync::Arc::new(GroupCleanupTelemetry::default());
+        let snapshot = std::sync::Arc::new(std::sync::Mutex::new(Ok(Vec::new())));
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(
+                "(trap '' QUIT TERM; exec /bin/sleep 30) & \
+                 printf '%s' \"$!\" > \"$HEARTH_MEMBER_PID\"; exit 0",
+            )
+            .env("HEARTH_MEMBER_PID", &member_pid_path);
+        let mut group = GuardedGroupChild::spawn_with_faults(
+            &mut command,
+            GroupTestFaults {
+                force_group_operations_eperm: true,
+                member_snapshot: Some(std::sync::Arc::clone(&snapshot)),
+                telemetry: Some(std::sync::Arc::clone(&telemetry)),
+                ..GroupTestFaults::default()
+            },
+        )
+        .unwrap();
+        let member_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !member_pid_path.exists() || group.observe_leader_exit().unwrap().is_none() {
+            assert!(std::time::Instant::now() < member_deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let member_pid = std::fs::read_to_string(&member_pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let changed_uid = group.launched_uid.saturating_add(1);
+        *snapshot.lock().unwrap() = Ok(vec![
+            group_member(
+                group.pgid,
+                group.pgid,
+                group.launched_uid,
+                GroupMemberState::ExitedZombie,
+            ),
+            group_member(member_pid, group.pgid, changed_uid, GroupMemberState::Live),
+        ]);
+
+        let error = group
+            .shutdown(Duration::from_millis(20), Duration::from_millis(20))
+            .unwrap_err();
+        assert!(error.contains(&format!("pid={member_pid}")), "{error}");
+        assert!(error.contains("credentials changed"), "{error}");
+        assert!(
+            group.status.is_none(),
+            "leader witness was reaped with a live survivor"
+        );
+        assert!(telemetry.certificate.lock().unwrap().is_none());
+        assert_eq!(
+            telemetry
+                .post_reap_group_operations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(member_pid), None).is_ok(),
+            "retained member did not survive forced EPERM"
+        );
+        assert!(!unrelated_signal_marker.exists());
+        assert!(unrelated.try_wait().unwrap().is_none());
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(member_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(member_pid), None)
+            != Err(nix::errno::Errno::ESRCH)
+        {
+            assert!(
+                std::time::Instant::now() < gone_deadline,
+                "retained member was not reaped"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        *snapshot.lock().unwrap() = Ok(vec![group_member(
+            group.pgid,
+            group.pgid,
+            group.launched_uid,
+            GroupMemberState::ExitedZombie,
+        )]);
+        group
+            .shutdown(Duration::from_millis(20), Duration::from_millis(20))
+            .unwrap();
+        assert_cleanup_telemetry(group.pgid, &telemetry);
+        assert_eq!(
+            telemetry
+                .certificate
+                .lock()
+                .unwrap()
+                .unwrap()
+                .inspected_members,
+            1
+        );
+        assert!(!unrelated_signal_marker.exists());
+        assert!(unrelated.try_wait().unwrap().is_none());
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
     }
 
     #[test]
