@@ -208,8 +208,7 @@ files, and foreign paths are never unlinked.
 
 The separate `fpm/manifest.toml` prevents an older binary's INI reconcile from
 deleting FPM artifacts. Its persistent `.manifest.lock` is inert when no
-transaction is running. Live FPM-worker observation is not yet available and
-lands with PR-2 of todo #2343; PR-1 status remains `launch-probed` at most.
+transaction is running.
 
 **Observation labels** are exact about what was verified:
 
@@ -218,8 +217,22 @@ lands with PR-2 of todo #2343; PR-1 status remains `launch-probed` at most.
 - `launch-probed` — the binary was executed under the exact launch
   environment (`php -r 'echo ini_get(...)'` for CLI; `php-fpm -i` under the
   service env for Hearth's supervised FPM) and reported it
-- `live-observed` — reserved for a running FPM worker; live FPM-worker
-  observation is not yet available and lands with PR-2 of todo #2343
+- `live-observed` — a running Hearth-supervised FPM worker answered the
+  evidence-gated FastCGI probe
+
+The exact observation vocabulary is `configured`, `materialized`,
+`launch-probed`, and `live-observed`. For FPM, `live-observed` is available
+only for keyed Show/Status when external ownership is proven `Unowned`, the
+registered service is Running with Hearth-owned launch provenance, current
+conf/probe hashes match that launch, the conf was applied no later than the
+launch, the same current-user-owned Unix socket survives the request, the
+strict FastCGI/CGI/JSON response has the exact key and fresh nonce with clean
+EOF, the launch generation remains unchanged, and the responder PID belongs
+to the supervised process group. A file parse can never mint `live-observed`;
+user-managed or ambient FPM, stale config (`pending restart`), and any
+ownership/generation/hash/socket/protocol/PID miss preserve the lesser label
+and keep the command successful. After a daemon version mismatch, run
+`hearth daemon stop && hearth daemon start`.
 
 A value read from a file is never presented as the effective value of a
 running process.
@@ -249,8 +262,8 @@ Known limits, stated plainly:
   for that case use a Homebrew/Hearth build (verified compiled-in channel).
 - **Ambient Herd/Homebrew FPM** (not launched by Hearth): its launch context
   can never be authenticated. Hearth never writes on its behalf and never
-  executes it; use Hearth's supervised FPM for managed coverage (and, after
-  PR-2 of todo #2343, live-observed coverage).
+  executes it; use Hearth's supervised FPM for managed and `live-observed`
+  coverage.
 
 **Downgrade warning**: older Hearth binaries read this config but their next
 `config.save()` silently drops the `[php_ini]` tables — downgrading is

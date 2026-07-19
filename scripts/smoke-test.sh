@@ -705,7 +705,7 @@ else
     fail "S9c: foreign config changed or owned artifacts appeared"
 fi
 
-# ── S10. No privileged paths in any scenario output ──────────────
+# ── S10. No privileged paths + activated docs agree ──────────────
 info "S10: no privileged-path writes..."
 if $CLI php config --status 2>&1 | grep -q "usr/local.*Written"; then
     fail "S10: privileged path appears as written"
@@ -717,10 +717,15 @@ DOCS_AGREE=1
 for doc in README.md CHANGELOG.md CLAUDE.md; do
     grep -q "fpm/php-fpm.conf" "$doc" || DOCS_AGREE=0
     grep -q "fpm/manifest.toml" "$doc" || DOCS_AGREE=0
-    grep -q "PR-2 of todo #2343" "$doc" || DOCS_AGREE=0
+    grep -q 'The exact observation vocabulary is `configured`, `materialized`,' "$doc" || DOCS_AGREE=0
+    grep -q 'A file parse can never mint `live-observed`' "$doc" || DOCS_AGREE=0
+    grep -q 'hearth daemon stop && hearth daemon start' "$doc" || DOCS_AGREE=0
+    if grep -Eq 'not yet available|PR-2 of todo #2343' "$doc"; then
+        DOCS_AGREE=0
+    fi
 done
 if [ "$DOCS_AGREE" -eq 1 ]; then
-    pass "S10: README/CHANGELOG/CLAUDE agree on FPM artifacts and PR-2 deferral"
+    pass "S10: README/CHANGELOG/CLAUDE agree on activated labels and FPM caveats"
 else
     fail "S10: FPM documentation surfaces disagree"
 fi
@@ -750,6 +755,17 @@ elif [ "$REAL_FPM_STATUS" -eq 0 ]; then
     pass "S11: every verified candidate accepted; selected FPM served the Unix socket"
 else
     fail "S11: installed candidate matrix/start proof failed: $(echo "$REAL_FPM_OUTPUT" | tail -8 | tr '\n' ' ')"
+fi
+
+# ── S12. Real FPM live FastCGI effective-value round trip ─────────
+info "S12: real FPM live FastCGI effective-value proof..."
+if [ "$REAL_FPM_STATUS" -eq 0 ] && echo "$REAL_FPM_OUTPUT" | grep -q "SKIP: no real php-fpm"; then
+    pass "S12: SKIP recorded — no identity-verified real php-fpm candidates"
+elif [ "$REAL_FPM_STATUS" -eq 0 ] \
+    && echo "$REAL_FPM_OUTPUT" | grep -Eq 'real FPM live probe: memory_limit=.+, worker_pid=[1-9][0-9]*'; then
+    pass "S12: real FPM worker returned memory_limit + positive PID over strict FastCGI"
+else
+    fail "S12: real-FPM live probe proof missing: $(echo "$REAL_FPM_OUTPUT" | tail -8 | tr '\n' ' ')"
 fi
 
 echo ""
