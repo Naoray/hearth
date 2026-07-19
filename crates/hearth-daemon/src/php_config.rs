@@ -374,11 +374,15 @@ mod tests {
         match response {
             DaemonResponse::PhpConfigReport(outcome) => {
                 assert_eq!(outcome.persisted, Some(true));
-                // No supervisor FPM + no generated fpm config → launch-blocked,
-                // never a command failure.
+                // Set does not generate static FPM artifacts; missing config is
+                // launch-blocked with the explicit sync remediation, never a
+                // command failure.
                 match outcome.fpm {
                     FpmRestartOutcome::LaunchBlocked { ref reason } => {
-                        assert!(reason.contains("#2343"), "got: {reason}");
+                        assert!(
+                            reason.contains("run `hearth php config --sync`"),
+                            "got: {reason}"
+                        );
                     }
                     ref other => panic!("expected LaunchBlocked, got {other:?}"),
                 }

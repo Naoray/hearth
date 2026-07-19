@@ -155,7 +155,21 @@ fn blocked_report(reason: String) -> MaterializeReport {
 }
 
 fn ensure_private_dir(hearth_root: &Path, dir: &Path) -> Result<(), String> {
+    let existed = std::fs::symlink_metadata(dir).is_ok();
     ensure_hearth_channel_dir(hearth_root, dir).map_err(|error| error.to_string())?;
+    if existed {
+        let mode = std::fs::symlink_metadata(dir)
+            .map_err(|error| format!("could not inspect {}: {error}", dir.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o200 == 0 {
+            return Err(format!(
+                "{} is not owner-writable — restore write permission and run \
+                 `hearth php config --sync`",
+                dir.display()
+            ));
+        }
+    }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("could not secure {}: {error}", dir.display()))?;
     ensure_hearth_channel_dir(hearth_root, dir).map_err(|error| error.to_string())?;
