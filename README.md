@@ -1,14 +1,43 @@
-# Hearth 🔥
+# Hearth 🔥 — archived
+
+> **This project is archived and no longer maintained.** It is preserved as a
+> read-only historical record. Do not install it.
+>
+> **Use [Yerd](https://yerd.io) instead.** Yerd covers everything Hearth did —
+> sites, SSL, PHP version switching and per-site PHP, INI settings, databases,
+> mail capture, dump telemetry, and an MCP server for AI agents — plus a large
+> surface Hearth never reached: reverse proxies, wildcard domains, per-site web
+> roots, Cloudflare tunnels, LAN exposure, pcov coverage shims, `doctor fix`,
+> self-update, and a shipping GUI.
+
+## Why this was archived
+
+Hearth set out to be the best free, MIT-licensed, daemon-driven Laravel
+development environment for solo macOS developers and AI coding agents.
+[`docs/NORTH_STAR.md`](docs/NORTH_STAR.md) defined the success signal that
+mattered most:
+
+> Maintainer uses Hearth as their primary local Laravel stack for the full
+> sprint without falling back to other tooling.
+
+That signal failed. The maintainer migrated to Yerd, which had shipped a
+superset of Hearth's roadmap — including the Tauri GUI that was still parked in
+Hearth's PR #4 as unbuilt Phase 5 work. Hearth's own first decision principle
+states the conclusion plainly: *"if the maintainer doesn't use it, it isn't
+ready to ship."*
+
+Continuing would have meant building features to match another tool's
+checklist rather than because they were needed — explicitly listed in the North
+Star as an anti-signal. So it stops here, at v0.4.0, with the work intact and
+the reasoning on the record.
+
+Everything below documents Hearth as it stood at archival.
+
+---
 
 **Your complete Laravel development environment — one Rust daemon, zero friction.**
 
-Services, sites, SSL, PHP version switching, mail catching, dump server, and package setup. Install once, works immediately.
-
-```bash
-brew install naoray/tap/hearth
-hearth install    # first-time setup
-hearth start      # everything is running
-```
+Services, sites, SSL, PHP version switching, mail catching, dump server, and package setup.
 
 MIT licensed. No subscriptions. No paid tiers.
 
@@ -54,18 +83,17 @@ so you know which colliding service to stop.
 
 ## Install
 
-```bash
-brew tap naoray/tap
-brew install hearth
-hearth install
-```
-
-Or build from source:
+**Not available.** Hearth is archived and its Homebrew formula has been removed
+from `naoray/tap`. If you have it installed from a previous release, remove it:
 
 ```bash
-cargo install --path crates/hearth-cli
-cargo install --path crates/hearth-daemon
+hearth daemon stop
+brew uninstall hearth
+brew untap naoray/tap   # only if you use no other formulae from this tap
 ```
+
+Building from source still works for archaeological purposes
+(`cargo install --path crates/hearth-cli`), but nothing here is supported.
 
 ## Works alongside your existing setup
 
@@ -86,10 +114,14 @@ No more copy-pasting config snippets from docs. No more manually running workers
 
 ## Agent integration
 
-Hearth is designed to work with AI coding agents via [Scribe](https://github.com/Naoray/scribe) — a skill manager for agents. Install the Hearth skill and your agent can manage sites, switch PHP versions, check service status, and more through plain CLI calls. No embedded server required.
+Hearth served an in-process MCP server and shipped a [Scribe](https://github.com/Naoray/scribe)
+skill so agents could manage sites, switch PHP versions, and check service
+status through plain CLI calls.
+
+**Both are retired.** Use Yerd's MCP server instead:
 
 ```bash
-scribe install hearth
+claude mcp add --scope user yerd -- yerd mcp
 ```
 
 ## Architecture

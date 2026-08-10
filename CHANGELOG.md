@@ -2,7 +2,19 @@
 
 All notable changes to Hearth will be documented in this file.
 
-## [Unreleased]
+## [0.4.0] - 2026-08-10 — final release
+
+**Hearth is archived.** This is the last release. It exists to tag the PHP
+configuration and FastCGI observation work that had accumulated as unreleased
+since v0.3.1, so the repository freezes in a coherent state rather than with a
+dangling `[Unreleased]` section.
+
+See the [README](README.md#why-this-was-archived) for the reasoning. Use
+[Yerd](https://yerd.io) instead.
+
+### Deprecated
+- The entire project. No further releases, fixes, or support. The Homebrew
+  formula has been removed from `naoray/tap`.
 
 ### Added
 - **Global PHP configuration** (`hearth php config`): one canonical INI store

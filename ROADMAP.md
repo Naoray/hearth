@@ -1,4 +1,9 @@
-# Hearth — Roadmap
+# Hearth — Roadmap (archived)
+
+> **This roadmap is closed.** Hearth was archived at v0.4.0 on 2026-08-10 with
+> Phases 3–5 unfinished. Nothing below will be built. See the
+> [README](README.md#why-this-was-archived) for why, and use
+> [Yerd](https://yerd.io) instead.
 
 Source of truth for phase numbering. See [docs/NORTH_STAR.md](docs/NORTH_STAR.md) for product mission, constraints, and non-goals.
 
